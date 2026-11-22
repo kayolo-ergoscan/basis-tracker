@@ -390,12 +390,15 @@ impl TrackerBoxUpdater {
         );
 
         loop {
+            // `biased`: a shutdown that arrived during a cycle wins over a missed tick, so the
+            // updater never starts another cycle once it was asked to stop.
             tokio::select! {
-                _ = ticker.tick() => {}
+                biased;
                 _ = shutdown_rx.recv() => {
                     info!("Tracker box updater received shutdown signal, stopping");
                     return Ok(());
                 }
+                _ = ticker.tick() => {}
             }
 
             if let Some((tx_id, expected_digest)) = pending_tx.clone() {

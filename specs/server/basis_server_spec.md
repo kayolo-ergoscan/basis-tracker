@@ -26,6 +26,22 @@ The server uses an actor-like pattern with a dedicated tracker thread that proce
 - A blocking thread processes tracker commands
 - Results are returned via oneshot channels
 
+### Storage and Shutdown
+
+Every fjall directory under `data_dir` has exactly one opener per process (fjall takes no
+directory lock): `notes` the tracker thread, `scanner_metadata` and `reserves` the reserve
+scanner, `tracker_scanner_metadata` the tracker scanner at startup, `tracker_boxes` main
+(shared by the tracker scanner and the API), `acceptance_policies` main (the API). Each
+storage keeps its keyspace open, and every journal is fsynced each second
+(`fsync_ms = 1000`): a process crash loses no acknowledged write, a power loss at most about
+one second of writes.
+
+On SIGTERM or SIGINT the server stops accepting connections and lets open requests finish
+(TLS: at most 30 s; plain HTTP requests are bounded by the 30 s request timeout). The tracker
+box updater is told to stop and finishes its current cycle (waited for up to 30 s). Then the
+tracker thread finishes its current command and closes the note store, and the process exits
+with status 0.
+
 ## Dependencies
 
 - `axum`: Web framework for routing and HTTP handling
