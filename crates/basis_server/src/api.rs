@@ -3122,12 +3122,6 @@ pub async fn get_tracker_proof(
         }
     };
 
-    // Get tracker state digest from shared state
-    let tracker_state_digest = {
-        let tracker_state = state.shared_tracker_state.lock().await;
-        hex::encode(tracker_state.get_avl_root_digest())
-    };
-
     // Request tracker lookup proof from tracker thread
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
@@ -3169,6 +3163,12 @@ pub async fn get_tracker_proof(
     // Wait for response from tracker thread
     match response_rx.await {
         Ok(Ok(proof)) => {
+            // The digest the proof was made against: the tracker thread refreshes the live tree
+            // and publishes its digest before it generates a live proof (round 4, C3).
+            let tracker_state_digest = {
+                let tracker_state = state.shared_tracker_state.lock().await;
+                hex::encode(tracker_state.get_avl_root_digest())
+            };
             // Extract total debt from proof value
             let total_debt = if proof.value.len() == 8 {
                 let mut bytes = [0u8; 8];
@@ -4192,15 +4192,6 @@ pub async fn get_redemption_proof(
         );
     }
 
-    // Get the current tracker state digest from shared tracker state
-    let tracker_state_digest = {
-        // Get the current AVL root digest from shared tracker state
-        let shared_state = state.shared_tracker_state.lock().await;
-        let current_digest = shared_state.get_avl_root_digest();
-        drop(shared_state); // Release the lock early
-        hex::encode(current_digest)
-    };
-
     // Generate a real AVL proof for the note
     // Send command to tracker thread to generate the proof
     let (proof_response_tx, proof_response_rx) = tokio::sync::oneshot::channel();
@@ -4316,6 +4307,13 @@ pub async fn get_redemption_proof(
                 )),
             );
         }
+    };
+
+    // The digest the proof was made against: the tracker thread refreshes the live tree and
+    // publishes its digest before it generates a live proof (round 4, C3).
+    let tracker_state_digest = {
+        let shared_state = state.shared_tracker_state.lock().await;
+        hex::encode(shared_state.get_avl_root_digest())
     };
 
     // Get current blockchain height from scanner

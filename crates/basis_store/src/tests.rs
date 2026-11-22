@@ -856,6 +856,86 @@ mod confirmation_state_tests {
     /// on-chain state. A note posted after the last commitment changes the live
     /// tree digest but must not affect committed proofs for already-confirmed
     /// notes, and must itself be rejected until confirmed.
+    /// Round 4, C3: N notes cost one rebuild of the live tree, at the first read of its digest,
+    /// instead of one rebuild each. Every reader sees all notes: the digest equals that of a
+    /// tracker refreshed after every note, and live lookups and proofs cover the last note.
+    #[test]
+    fn many_notes_cost_one_live_tree_rebuild() {
+        let mut manager = make_manager();
+        let mut reference = make_manager();
+        let issuer_secret = [1u8; 32];
+        let issuer = issuer_pubkey(&issuer_secret);
+        let start = manager.tree_rebuild_count();
+
+        for i in 0..40u8 {
+            let recipient = [i + 2; 33];
+            let note = create_note(&issuer_secret, &recipient, 1_000 + i as u64, 1 + i as u64);
+            manager.add_note(&issuer, &note).unwrap();
+            reference.add_note(&issuer, &note).unwrap();
+            // The old behaviour: a rebuild after every note.
+            let _ = reference.get_state();
+        }
+        assert_eq!(
+            manager.tree_rebuild_count(),
+            start,
+            "adding notes rebuilds nothing"
+        );
+        assert!(reference.tree_rebuild_count() >= start + 40);
+
+        let digest = manager.get_state().avl_root_digest;
+        assert_eq!(manager.tree_rebuild_count(), start + 1, "one rebuild for 40 notes");
+        assert_eq!(digest, reference.get_state().avl_root_digest);
+        let _ = manager.get_state();
+        assert_eq!(manager.tree_rebuild_count(), start + 1, "a clean tree is not rebuilt");
+
+        // A later note: the next read of any kind (here a live lookup) rebuilds once more.
+        let last = create_note(&issuer_secret, &[0x60; 33], 7_000, 100);
+        manager.add_note(&issuer, &last).unwrap();
+        assert_eq!(
+            manager
+                .get_total_debt(&issuer, &[0x60; 33], &crate::DenomKey::Erg)
+                .unwrap(),
+            7_000
+        );
+        assert_eq!(manager.tree_rebuild_count(), start + 2);
+        assert!(manager
+            .generate_proof(&issuer, &[0x60; 33], &crate::DenomKey::Erg)
+            .is_ok());
+        assert_eq!(manager.tree_rebuild_count(), start + 2);
+    }
+
+    /// Round 4, C3: the updater reads the digest, builds and submits the update, then marks the
+    /// notes pending. A note posted in between is not in the submitted digest: it stays local,
+    /// and once the update confirms, committed proofs work for the notes that were committed.
+    #[test]
+    fn a_note_posted_while_the_update_is_built_stays_local() {
+        let mut manager = make_manager();
+        let issuer_secret = [1u8; 32];
+        let issuer = issuer_pubkey(&issuer_secret);
+        let (a, b) = ([2u8; 33], [3u8; 33]);
+        manager
+            .add_note(&issuer, &create_note(&issuer_secret, &a, 1_000, 1))
+            .unwrap();
+        let submitted = manager.get_state().avl_root_digest;
+        manager
+            .add_note(&issuer, &create_note(&issuer_secret, &b, 2_000, 2))
+            .unwrap();
+        assert_eq!(manager.mark_notes_pending(submitted, "tx1", 1).unwrap(), 1);
+        manager.confirm_pending_notes(submitted, "box1", 2).unwrap();
+
+        assert!(manager
+            .generate_committed_tracker_lookup_proof(&issuer, &a, &crate::DenomKey::Erg)
+            .is_ok());
+        let b_status = manager
+            .get_confirmation(&issuer, &b, &crate::DenomKey::Erg)
+            .unwrap()
+            .status;
+        assert_eq!(b_status, crate::NoteConfirmationStatus::LocalOnly);
+
+        // A digest whose values were never seen marks nothing.
+        assert_eq!(manager.mark_notes_pending([0x77; 33], "tx2", 3).unwrap(), 0);
+    }
+
     #[test]
     fn committed_proof_unaffected_by_later_unconfirmed_notes() {
         let mut manager = make_manager();

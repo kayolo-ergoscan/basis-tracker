@@ -464,6 +464,11 @@ pub type ExchangeAcceptanceCheckFn =
     Box<dyn FnOnce(ExchangeAcceptanceView) -> Result<(), String> + Send>;
 
 /// Tracker state manager with persistent AVL tree
+/// How many recent live digests keep the note values behind them (see
+/// `TrackerStateManager::mark_notes_pending`). The updater reads the digest, builds and submits
+/// the update, then marks the notes pending; two leave room for one more refresh in between.
+pub const RECENT_DIGEST_VALUES: usize = 2;
+
 pub struct TrackerStateManager {
     avl_state: basis_trees::BasisAvlTree,
     current_state: TrackerState,
@@ -496,12 +501,18 @@ pub struct TrackerStateManager {
     /// tracker box (issue #15 S6). `None` until an update confirms or the updater
     /// observes a matching on-chain digest after restart.
     confirmed_digest: Option<[u8; 33]>,
-    /// Set when a canonical tree rebuild failed after storage was committed
-    /// (issue #20): the live tree is then stale relative to storage, and
-    /// `update_state` retries the rebuild before refreshing the committed
-    /// digest. The old (valid) tree is kept in place meanwhile, so a
-    /// half-rebuilt tree is never committed.
+    /// Set when storage holds note values the live tree does not have yet: after every note
+    /// (round 4, C3: notes no longer rebuild the tree one by one) and when a canonical tree
+    /// rebuild failed after storage was committed (issue #20). `refresh_live_tree` rebuilds
+    /// once before a digest, proof or commit is read; the old (valid) tree is kept in place
+    /// meanwhile, so a half-rebuilt tree is never committed.
     tree_dirty: bool,
+    /// Number of full rebuilds of the live tree from storage (startup included).
+    tree_rebuilds: u64,
+    /// The (debt key, totalDebt) pairs behind the last [`RECENT_DIGEST_VALUES`] live digests,
+    /// newest last. `mark_notes_pending` records exactly the values of the digest the
+    /// updater submitted, not the values at the time it is called (follow-up review N2).
+    recent_values: Vec<([u8; 33], Vec<(NoteKeyBytes, u64)>)>,
     /// Test-only fault-injection hook: while set, `rebuild_tree_canonically`
     /// returns an error without touching the live tree (issue #20 tests).
     #[cfg(test)]
@@ -563,6 +574,8 @@ impl TrackerStateManager {
             confirmations: std::collections::HashMap::new(),
             confirmed_digest: None,
             tree_dirty: false,
+            tree_rebuilds: 0,
+            recent_values: Vec::new(),
             #[cfg(test)]
             fail_tree_rebuild: false,
         };
@@ -592,10 +605,12 @@ impl TrackerStateManager {
     pub fn rebuild_avl_tree(&mut self) -> Result<(), NoteError> {
         tracing::info!("Rebuilding AVL tree from stored notes...");
 
-        Self::populate_tree_from_storage(&self.storage, &mut self.avl_state)?;
+        let values = Self::populate_tree_from_storage(&self.storage, &mut self.avl_state)?;
+        self.tree_rebuilds += 1;
 
         self.update_state();
         let root_digest = self.current_state.avl_root_digest;
+        self.remember_values(root_digest, values);
         tracing::info!(
             "AVL tree rebuilt successfully with root digest: {}",
             hex::encode(root_digest)
@@ -607,10 +622,13 @@ impl TrackerStateManager {
     /// Apply all stored notes to `tree` in canonical (debt-key) order.
     /// Shared by `rebuild_avl_tree` (in-place, at startup) and
     /// `rebuild_tree_canonically` (into a fresh tree, swapped in on success).
+    ///
+    /// Returns the (debt key, totalDebt) pairs applied, in insertion order: the values behind
+    /// the resulting digest.
     fn populate_tree_from_storage(
         storage: &persistence::NoteStorage,
         tree: &mut basis_trees::BasisAvlTree,
-    ) -> Result<(), NoteError> {
+    ) -> Result<Vec<(NoteKeyBytes, u64)>, NoteError> {
         let mut notes_with_issuer = storage
             .get_all_notes_with_issuer()
             .map_err(|e| NoteError::StorageError(format!("Failed to get all notes: {:?}", e)))?;
@@ -626,17 +644,43 @@ impl TrackerStateManager {
             NoteKey::from_assets(issuer_pubkey, &note.recipient_pubkey, &note.denomination).to_bytes()
         });
 
+        let mut values = Vec::with_capacity(notes_with_issuer.len());
         for (issuer_pubkey, note) in &notes_with_issuer {
             let key =
                 NoteKey::from_assets(issuer_pubkey, &note.recipient_pubkey, &note.denomination);
             let key_bytes = key.to_bytes();
             let value_bytes = note.amount_collected.to_be_bytes().to_vec();
 
-            tree.update(key_bytes, value_bytes).map_err(|e| {
+            tree.update(key_bytes.clone(), value_bytes).map_err(|e| {
                 NoteError::StorageError(format!("AVL tree update failed during rebuild: {:?}", e))
             })?;
+            let mut key32 = [0u8; 32];
+            key32.copy_from_slice(&key_bytes);
+            values.push((key32, note.amount_collected));
         }
-        Ok(())
+        Ok(values)
+    }
+
+    /// Record the values behind `digest`, keeping the last [`RECENT_DIGEST_VALUES`] digests.
+    fn remember_values(&mut self, digest: [u8; 33], values: Vec<(NoteKeyBytes, u64)>) {
+        self.recent_values.retain(|(d, _)| *d != digest);
+        self.recent_values.push((digest, values));
+        let excess = self.recent_values.len().saturating_sub(RECENT_DIGEST_VALUES);
+        self.recent_values.drain(..excess);
+    }
+
+    /// Bring the live tree up to date with storage when notes arrived since the last rebuild:
+    /// one full rebuild however many notes there were. Every read of the live digest, of a
+    /// live proof and of the values to commit goes through here.
+    pub fn refresh_live_tree(&mut self) {
+        if self.tree_dirty {
+            self.update_state();
+        }
+    }
+
+    /// How many times the live tree was rebuilt from storage (startup included).
+    pub fn tree_rebuild_count(&self) -> u64 {
+        self.tree_rebuilds
     }
 
     /// Create a new tracker state manager with temporary storage (used in tests only)
@@ -732,6 +776,8 @@ impl TrackerStateManager {
             confirmations: std::collections::HashMap::new(),
             confirmed_digest: None,
             tree_dirty: false,
+            tree_rebuilds: 0,
+            recent_values: Vec::new(),
             #[cfg(test)]
             fail_tree_rebuild: false,
         };
@@ -840,29 +886,23 @@ impl TrackerStateManager {
         let key_bytes = key.to_bytes();
 
         // Persist FIRST (a single atomic batch inside store_note): a storage
-        // failure then leaves nothing changed anywhere. The in-memory tree is
-        // updated after, so a tree failure leaves storage merely AHEAD of the
-        // tree — the safe direction: the committed digest lacks a note the
-        // tracker cannot prove yet, which is indistinguishable from the normal
-        // "local, not yet committed" state, and the dirty flag makes
-        // update_state rebuild the tree from storage before the next commit.
-        // (The reverse order committed debt the tracker had no record of —
-        // issue #20 follow-up.)
+        // failure then leaves nothing changed anywhere. The live tree only
+        // learns about the note at the next refresh, so storage is AHEAD of the
+        // tree in between — the safe direction: the live digest lacks a note
+        // the tracker cannot prove yet, which is indistinguishable from the
+        // normal "local, not yet committed" state. (The reverse order committed
+        // debt the tracker had no record of — issue #20 follow-up.)
         self.storage.store_note(issuer_pubkey, &note_to_store)?;
         // The live tree is rebuilt in canonical (debt-key) order, not updated
         // in place: an in-place update keeps a raised edge where it was first
         // inserted, so the live digest (the one the box updater commits) would
         // stop matching any rebuild, and committed proofs would fail with
-        // "Committed tree digest mismatch". Each key's value is still its
-        // totalDebt as 8-byte big-endian (hash(A||B) -> totalDebt).
-        if let Err(e) = self.rebuild_tree_canonically() {
-            tracing::error!(
-                "Note stored but the live tree rebuild failed; the tree is stale and will be rebuilt from storage before the next digest update: {:?}",
-                e
-            );
-            return Err(e);
-        }
-        self.update_state();
+        // "Committed tree digest mismatch". A rebuild per note made N notes cost
+        // N full rebuilds (round 4, C3); the tree is marked dirty instead and
+        // rebuilt once by `refresh_live_tree` before a digest, proof or commit
+        // is read. Each key's value is still its totalDebt as 8-byte big-endian
+        // (hash(A||B) -> totalDebt).
+        self.tree_dirty = true;
 
         // Recompute the confirmation status for this note based on the
         // new local value versus the confirmed/pending values. The local
@@ -975,20 +1015,35 @@ impl TrackerStateManager {
     /// Mark every note whose local value differs from its confirmed value as
     /// `Pending`, recording the value that the in-flight update transaction will
     /// commit. Returns the number of notes transitioned to `Pending`.
+    ///
+    /// The values recorded are the ones behind `digest` (the digest the update transaction
+    /// commits), not the values at the time of the call: a note posted while the update was
+    /// being built is not in `digest` and stays `LocalOnly` (follow-up review N2). When the
+    /// values behind `digest` are no longer known (it is not among the last
+    /// [`RECENT_DIGEST_VALUES`] live digests), nothing is marked: the notes stay `LocalOnly`
+    /// and the next update commits them.
     pub fn mark_notes_pending(
         &mut self,
         digest: [u8; 33],
         tx_id: &str,
         submitted_height: u64,
     ) -> Result<usize, NoteError> {
-        let _ = (digest, submitted_height);
-        let notes = self.storage.get_all_notes_with_issuer()?;
+        let _ = submitted_height;
+        // No refresh here: a rebuild now could only push the submitted digest's values out.
+        let values = match self.recent_values.iter().find(|(d, _)| *d == digest) {
+            Some((_, values)) => values.clone(),
+            None => {
+                tracing::warn!(
+                    "Update tx {} commits digest {}, whose note values are no longer known; no note is marked pending (the next update commits them)",
+                    tx_id,
+                    hex::encode(digest)
+                );
+                return Ok(0);
+            }
+        };
         let mut count = 0usize;
 
-        for (issuer_pubkey, note) in &notes {
-            let key =
-                Self::confirmation_key(issuer_pubkey, &note.recipient_pubkey, &note.denomination);
-            let local_value = note.amount_collected;
+        for (key, local_value) in values {
             let entry = self
                 .confirmations
                 .entry(key)
@@ -1028,23 +1083,28 @@ impl TrackerStateManager {
         let mut count = 0usize;
 
         for key in keys {
-            let should_confirm = self
-                .confirmations
-                .get(&key)
-                .map(|c| c.status == NoteConfirmationStatus::Pending)
-                .unwrap_or(false);
-
-            if should_confirm {
-                if let Some(entry) = self.confirmations.get_mut(&key) {
-                    entry.confirmed_total_debt = entry.pending_total_debt;
-                    entry.pending_total_debt = None;
-                    entry.pending_tx_id = None;
-                    entry.confirmed_box_id = Some(box_id.to_string());
-                    entry.confirmed_height = Some(height);
-                    entry.status = NoteConfirmationStatus::Confirmed;
-                    let _ = self.storage.store_confirmation(&key, entry);
-                    count += 1;
+            // Every recorded pending value is what the confirming update committed, also when
+            // the note was paid again while the update was in flight (its status then went
+            // back to LocalOnly, but the chain holds the pending value: follow-up review N2).
+            if let Some(entry) = self.confirmations.get_mut(&key) {
+                if entry.pending_total_debt.is_none() {
+                    continue;
                 }
+                let local_is_pending = entry.status == NoteConfirmationStatus::Pending;
+                entry.confirmed_total_debt = entry.pending_total_debt;
+                entry.pending_total_debt = None;
+                entry.pending_tx_id = None;
+                entry.confirmed_box_id = Some(box_id.to_string());
+                entry.confirmed_height = Some(height);
+                // Pending meant "local == pending"; otherwise the local value moved on and is
+                // still to be committed.
+                entry.status = if local_is_pending {
+                    count += 1;
+                    NoteConfirmationStatus::Confirmed
+                } else {
+                    NoteConfirmationStatus::LocalOnly
+                };
+                let _ = self.storage.store_confirmation(&key, entry);
             }
         }
 
@@ -1108,6 +1168,7 @@ impl TrackerStateManager {
     ) -> Result<usize, NoteError> {
         self.confirmed_digest = Some(*confirmed_digest);
 
+        self.refresh_live_tree();
         if confirmed_digest != &self.current_state.avl_root_digest {
             return Ok(0);
         }
@@ -1211,20 +1272,12 @@ impl TrackerStateManager {
             Err(e) => return Err(e),
         }
 
-        // Persist FIRST, then rebuild the in-memory tree — same ordering and
-        // rationale as `add_note` (issue #20 follow-up): a storage failure
-        // leaves nothing changed; a tree failure leaves storage safely ahead
-        // and sets the dirty flag so the tree is rebuilt before the next
-        // digest update.
+        // Persist FIRST, then mark the live tree dirty — same ordering and
+        // rationale as `add_note` (issue #20 follow-up, round 4 C3): a storage
+        // failure leaves nothing changed; the tree is rebuilt once before the
+        // next digest, proof or commit is read.
         self.storage.store_note(issuer_pubkey, &note_to_store)?;
-        if let Err(e) = self.rebuild_tree_canonically() {
-            tracing::error!(
-                "Note update stored but the live tree rebuild failed; the tree is stale and will be rebuilt from storage before the next digest update: {:?}",
-                e
-            );
-            return Err(e);
-        }
-        self.update_state();
+        self.tree_dirty = true;
         Ok(())
     }
 
@@ -1483,9 +1536,12 @@ impl TrackerStateManager {
             NoteError::StorageError(format!("Failed to create fresh AVL tree: {:?}", e))
         })?;
         match Self::populate_tree_from_storage(&self.storage, &mut fresh) {
-            Ok(()) => {
+            Ok(values) => {
+                let digest = fresh.root_digest();
                 self.avl_state = fresh;
                 self.tree_dirty = false;
+                self.tree_rebuilds += 1;
+                self.remember_values(digest, values);
                 Ok(())
             }
             Err(e) => {
@@ -1890,11 +1946,12 @@ impl TrackerStateManager {
     /// from the AVL tree.
     /// Returns the cumulative debt amount (totalDebt) stored in the tracker's AVL tree
     pub fn get_total_debt(
-        &self,
+        &mut self,
         issuer_pubkey: &PubKey,
         recipient_pubkey: &PubKey,
         denomination: &DenomKey,
     ) -> Result<u64, NoteError> {
+        self.refresh_live_tree();
         let key = NoteKey::from_assets(issuer_pubkey, recipient_pubkey, denomination);
         let key_bytes = key.to_bytes();
 
@@ -2435,6 +2492,7 @@ impl TrackerStateManager {
         recipient_pubkey: &PubKey,
         denomination: &DenomKey,
     ) -> Result<NoteProof, NoteError> {
+        self.refresh_live_tree();
         let key = NoteKey::from_assets(issuer_pubkey, recipient_pubkey, denomination);
         let key_bytes = key.to_bytes();
 
@@ -2526,8 +2584,10 @@ impl TrackerStateManager {
             .as_millis() as u64;
     }
 
-    /// Get the current tracker state
-    pub fn get_state(&self) -> &TrackerState {
+    /// Get the current tracker state, the live tree refreshed first (see
+    /// [`Self::refresh_live_tree`]): its digest covers every stored note.
+    pub fn get_state(&mut self) -> &TrackerState {
+        self.refresh_live_tree();
         &self.current_state
     }
 }

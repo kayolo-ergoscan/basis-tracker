@@ -249,7 +249,14 @@ pub enum TrackerCommand {
             std::collections::HashMap<[u8; 32], basis_store::NoteConfirmation>,
         >,
     },
-    /// Mark all currently-local notes as pending for an in-flight update tx.
+    /// Bring the live tree up to date (one rebuild however many notes arrived since the last
+    /// one) and answer its digest: the digest the updater commits. Also refreshes the shared
+    /// digest that `/tracker/state` and the proof routes report.
+    RefreshDigest {
+        response_tx: tokio::sync::oneshot::Sender<[u8; 33]>,
+    },
+    /// Mark the notes behind `digest` (the digest the in-flight update tx commits) as pending
+    /// for it; notes posted after the digest was read stay local.
     MarkNotesPending {
         digest: [u8; 33],
         tx_id: String,

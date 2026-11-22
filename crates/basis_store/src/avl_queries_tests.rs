@@ -40,7 +40,7 @@ fn manager_with_note(amount: u64) -> (TrackerStateManager, [u8; 32], [u8; 33], [
 
 #[test]
 fn test_get_total_debt_returns_note_amount() {
-    let (manager, _, issuer, recipient) = manager_with_note(5_000_000);
+    let (mut manager, _, issuer, recipient) = manager_with_note(5_000_000);
 
     let debt = manager
         .get_total_debt(&issuer, &recipient, &crate::DenomKey::Erg)
@@ -54,7 +54,7 @@ fn test_get_total_debt_returns_note_amount() {
 
 #[test]
 fn test_get_total_debt_unknown_pair_is_error_not_zero() {
-    let manager = TrackerStateManager::new_with_temp_storage();
+    let mut manager = TrackerStateManager::new_with_temp_storage();
     let (_, issuer) = generate_keypair();
     let (_, recipient) = generate_keypair();
 

@@ -625,7 +625,10 @@ impl TrackerBoxUpdater {
                 }
             };
 
-            let current_digest = shared_state.get_avl_root_digest();
+            // The digest to commit comes from the tracker thread, which rebuilds the live tree
+            // once if notes arrived since the last rebuild (round 4, C3: notes no longer rebuild
+            // it one by one, so the shared digest is only as fresh as its last refresh).
+            let current_digest = Self::refreshed_digest(&shared_state, &cmd_tx).await;
             let tracker_pubkey = shared_state.get_tracker_pubkey();
 
             if current_digest == [0u8; 33] {
@@ -785,6 +788,29 @@ impl TrackerBoxUpdater {
                 }
             }
         }
+    }
+
+    /// The live digest to commit: asked from the tracker thread (`RefreshDigest`, which also
+    /// refreshes the shared digest), or the shared digest when there is no tracker thread to ask
+    /// (tests) or it does not answer.
+    async fn refreshed_digest(
+        shared_state: &SharedTrackerState,
+        cmd_tx: &Option<tokio::sync::mpsc::Sender<crate::TrackerCommand>>,
+    ) -> [u8; 33] {
+        if let Some(tx) = cmd_tx {
+            let (rtx, rrx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(crate::TrackerCommand::RefreshDigest { response_tx: rtx })
+                .await
+                .is_ok()
+            {
+                if let Ok(digest) = rrx.await {
+                    return digest;
+                }
+            }
+            warn!("The tracker thread did not answer RefreshDigest; using the shared digest");
+        }
+        shared_state.get_avl_root_digest()
     }
 
     /// Whether this cycle should recommit an unchanged digest (heartbeat): enabled, and the

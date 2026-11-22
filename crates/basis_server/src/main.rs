@@ -299,6 +299,7 @@ async fn main() {
         let tracker = TrackerStateManager::new(&data_dir_for_tracker_thread);
 
         // Update shared state with the rebuilt AVL root digest after initialization
+        let mut tracker = tracker;
         let initial_root = tracker.get_state().avl_root_digest;
         shared_state_for_tracker.set_avl_root_digest(initial_root);
         tracing::info!(
@@ -323,20 +324,17 @@ async fn main() {
                     note,
                     response_tx,
                 } => {
-                    // Get mutable access to the tracker for adding a note
+                    // The note is stored and the live tree marked dirty; it is rebuilt once
+                    // before the next digest, proof or commit is read (round 4, C3), so the
+                    // shared digest is not forced here: a rebuild per note made N notes cost N
+                    // full rebuilds.
                     let result = redemption_manager.tracker.add_note(&issuer_pubkey, &note);
-
-                    // Update shared state for tracker box updater if successful
-                    if result.is_ok() {
-                        // Update the shared AVL root digest to match the current tracker state
-                        let current_root = redemption_manager.tracker.get_state().avl_root_digest;
-                        shared_state_for_tracker.set_avl_root_digest(current_root);
-
-                        // Note: In a real implementation, we'd send this back to the async context to store
-                        // For now, we'll handle event storage in the async handler
-                    }
-
                     let _ = response_tx.send(result);
+                }
+                TrackerCommand::RefreshDigest { response_tx } => {
+                    let digest = redemption_manager.tracker.get_state().avl_root_digest;
+                    shared_state_for_tracker.set_avl_root_digest(digest);
+                    let _ = response_tx.send(digest);
                 }
                 TrackerCommand::GetNotesByIssuer {
                     issuer_pubkey,
@@ -498,6 +496,10 @@ async fn main() {
                     denomination,
                     response_tx,
                 } => {
+                    // Live proofs: refresh first and publish the digest they prove against,
+                    // which the proof routes report next to the proof.
+                    let digest = redemption_manager.tracker.get_state().avl_root_digest;
+                    shared_state_for_tracker.set_avl_root_digest(digest);
                     let result = redemption_manager.tracker.generate_proof(
                         &issuer_pubkey,
                         &recipient_pubkey,
@@ -511,6 +513,8 @@ async fn main() {
                     denomination,
                     response_tx,
                 } => {
+                    let digest = redemption_manager.tracker.get_state().avl_root_digest;
+                    shared_state_for_tracker.set_avl_root_digest(digest);
                     let result = redemption_manager.tracker.generate_tracker_lookup_proof(
                         &issuer_pubkey,
                         &recipient_pubkey,
