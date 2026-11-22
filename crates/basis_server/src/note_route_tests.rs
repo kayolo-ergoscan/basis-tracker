@@ -51,6 +51,9 @@ fn spawn_tracker_thread() -> tokio::sync::mpsc::Sender<TrackerCommand> {
                 } => {
                     let _ = response_tx.send(tracker.get_issuer_notes(&issuer_pubkey));
                 }
+                TrackerCommand::GetNotes { response_tx } => {
+                    let _ = response_tx.send(tracker.get_all_notes_with_issuer());
+                }
                 TrackerCommand::Shutdown => break,
                 _ => {}
             }
@@ -496,4 +499,81 @@ async fn reserves_by_issuer_matches_normalized_keys() {
         assert_eq!(reserves.len(), 1, "{path}");
         assert_eq!(reserves[0].box_id, "box-n");
     }
+}
+
+/// Round 5, item 5: `/reserves`, `/reserves/issuer/{pubkey}` and `/reserves/{box_id}` report
+/// each reserve's outstanding debt from the notes this tracker holds, in the reserve's
+/// denomination, and the ratio collateral / debt, `null` when nothing is owed.
+#[tokio::test]
+async fn reserves_report_the_notes_outstanding_debt_and_ratio() {
+    let state = state(DEFAULT_CAPS);
+    let token = [0x7c; 32];
+    let (a, b) = (issuer(), issuer());
+    for (owner, box_id, denomination) in [
+        (&a.key, "box-a-erg", None),
+        (&a.key, "box-a-token", Some(token)),
+        (&b.key, "box-b-erg", None),
+    ] {
+        add_reserve(&state, owner, box_id, denomination, TRACKER_NFT, 0).await;
+        state
+            .ergo_scanner
+            .lock()
+            .await
+            .reserve_storage()
+            .store_reserve(&reserve_info(owner, box_id, denomination, TRACKER_NFT, 0))
+            .unwrap();
+    }
+    let ts = now_ms() - 10_000;
+    for (to, amount, denomination) in [
+        (recipient(), 300_000_000, DenomKey::Erg),
+        (recipient(), 200_000_000, DenomKey::Erg),
+        (recipient(), 250, DenomKey::Token(token)),
+    ] {
+        let (status, error) = post(&state, note_request(&a, &to, amount, ts, denomination)).await;
+        assert_eq!(status, StatusCode::CREATED, "{error}");
+    }
+
+    let (status, body) = crate::reserve_api::get_all_reserves(axum::extract::State(state.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.0.error);
+    let all = serde_json::to_value(body.0.data.unwrap()).unwrap();
+    let by_box = |id: &str| {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["box_id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    // 1 ERG of collateral against 0.5 ERG owed: ratio 2.
+    assert_eq!(by_box("box-a-erg")["total_debt"], 500_000_000u64);
+    assert_eq!(by_box("box-a-erg")["collateralization_ratio"], 2.0);
+    // 1e9 token units against 250.
+    assert_eq!(by_box("box-a-token")["total_debt"], 250);
+    assert_eq!(by_box("box-a-token")["collateralization_ratio"], 4_000_000.0);
+    // Nothing owed: ratio null.
+    assert_eq!(by_box("box-b-erg")["total_debt"], 0);
+    assert!(by_box("box-b-erg")["collateralization_ratio"].is_null());
+
+    let (status, body) = crate::reserve_api::get_reserves_by_issuer(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(hex::encode(a.key)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.0.error);
+    let mine = body.0.data.unwrap();
+    assert_eq!(mine.len(), 2);
+    for reserve in &mine {
+        let expected = if reserve.box_id == "box-a-erg" { 500_000_000 } else { 250 };
+        assert_eq!(reserve.total_debt, expected, "{}", reserve.box_id);
+    }
+
+    let (status, body) = crate::reserve_api::get_reserve_by_box_id(
+        axum::extract::State(state.clone()),
+        axum::extract::Path("box-a-erg".to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let one = body.0.data.unwrap().unwrap();
+    assert_eq!(one.total_debt, 500_000_000);
+    assert_eq!(one.collateralization_ratio, Some(2.0));
 }

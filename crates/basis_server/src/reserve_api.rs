@@ -1,12 +1,122 @@
 //! API handlers for reserve-related endpoints
 
+use std::collections::HashMap;
+
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
+use basis_store::{DenomKey, ExtendedReserveInfo, IouNote, PubKey};
+
 use crate::{
     models::{success_response, ApiResponse},
-    AppState,
+    AppState, TrackerCommand,
 };
+
+/// Outstanding debt per (issuer, denomination) of the notes this tracker holds (round 5, item 5).
+type OutstandingDebts = HashMap<(PubKey, DenomKey), u64>;
+
+/// Add `note`'s outstanding debt (`amount_collected - amount_redeemed`) to its issuer's total in
+/// its denomination; totals saturate at `u64::MAX`.
+fn add_outstanding(debts: &mut OutstandingDebts, issuer: PubKey, note: &IouNote) {
+    let outstanding = note.amount_collected.saturating_sub(note.amount_redeemed);
+    let total = debts.entry((issuer, note.denomination)).or_insert(0);
+    *total = total.saturating_add(outstanding);
+}
+
+/// The outstanding debts of `issuer`'s notes, or of every note when `issuer` is `None`, read
+/// from the tracker thread.
+async fn outstanding_debts(
+    state: &AppState,
+    issuer: Option<PubKey>,
+) -> Result<OutstandingDebts, String> {
+    let mut debts = OutstandingDebts::new();
+    match issuer {
+        Some(issuer) => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state
+                .tx
+                .send(TrackerCommand::GetNotesByIssuer {
+                    issuer_pubkey: issuer,
+                    response_tx: tx,
+                })
+                .await
+                .map_err(|_| "tracker thread unavailable".to_string())?;
+            let notes = rx
+                .await
+                .map_err(|_| "tracker thread unavailable".to_string())?
+                .map_err(|e| format!("note lookup failed: {e:?}"))?;
+            for note in &notes {
+                add_outstanding(&mut debts, issuer, note);
+            }
+        }
+        None => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state
+                .tx
+                .send(TrackerCommand::GetNotes { response_tx: tx })
+                .await
+                .map_err(|_| "tracker thread unavailable".to_string())?;
+            let notes = rx
+                .await
+                .map_err(|_| "tracker thread unavailable".to_string())?
+                .map_err(|e| format!("note lookup failed: {e:?}"))?;
+            for (issuer, note) in &notes {
+                add_outstanding(&mut debts, *issuer, note);
+            }
+        }
+    }
+    Ok(debts)
+}
+
+/// The owner key of a stored reserve (lower-case hex, possibly double-hex-encoded or with the
+/// `07` register prefix), if it is a 33-byte key.
+fn owner_key(owner_pubkey: &str) -> Option<PubKey> {
+    let owner = decode_potentially_double_hex_encoded(owner_pubkey).to_ascii_lowercase();
+    hex::decode(basis_store::normalize_public_key(&owner))
+        .ok()
+        .and_then(|bytes| PubKey::try_from(bytes.as_slice()).ok())
+}
+
+/// The API view of a reserve, with its outstanding debt from `debts`.
+///
+/// `total_debt` is what the reserve's owner still owes in the reserve's denomination on the
+/// notes this tracker holds (`amount_collected - amount_redeemed`, summed); it is per (owner,
+/// denomination), not per box. `collateralization_ratio` is `collateral_amount / total_debt`,
+/// and `null` when nothing is owed.
+fn reserve_view(info: ExtendedReserveInfo, debts: &OutstandingDebts) -> SerializableReserveInfo {
+    let total_debt = match (owner_key(&info.owner_pubkey), info.denomination()) {
+        (Some(owner), Some(denomination)) => {
+            debts.get(&(owner, denomination)).copied().unwrap_or(0)
+        }
+        _ => 0,
+    };
+    let collateral_amount = info.base_info.collateral_amount;
+    let collateralization_ratio =
+        (total_debt > 0).then(|| collateral_amount as f64 / total_debt as f64);
+    SerializableReserveInfo {
+        owner_pubkey: decode_potentially_double_hex_encoded(&info.owner_pubkey),
+        box_id: info.box_id,
+        collateral_amount,
+        total_debt,
+        tracker_nft_id: info.base_info.tracker_nft_id,
+        reserve_token_id: info.base_info.reserve_token_id,
+        last_updated_height: info.base_info.last_updated_height,
+        last_updated_timestamp: info.last_updated_timestamp,
+        collateralization_ratio,
+        refund_initiation_height: info.base_info.refund_initiation_height,
+    }
+}
+
+/// 500 for a failed note read behind the reserves' debt.
+fn debt_read_failed<T>(e: String) -> (StatusCode, Json<ApiResponse<T>>) {
+    tracing::error!("Failed to read the notes behind the reserves' debt: {e}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(crate::models::error_response(
+            "Failed to read the notes behind the reserves' debt".to_string(),
+        )),
+    )
+}
 
 // Helper function to decode potentially double-hex-encoded strings
 fn decode_potentially_double_hex_encoded(hex_string: &str) -> String {
@@ -36,29 +146,24 @@ pub async fn get_all_reserves(
     tracing::debug!("Getting all reserves");
 
     // Get reserve storage from scanner and query database directly
-    let scanner = state.ergo_scanner.lock().await;
-    let reserve_storage = scanner.reserve_storage();
+    let stored = state
+        .ergo_scanner
+        .lock()
+        .await
+        .reserve_storage()
+        .get_all_reserves();
 
     // Get all reserves from database
-    match reserve_storage.get_all_reserves() {
+    match stored {
         Ok(all_reserves) => {
+            // Round 5 (item 5): the debt of each reserve comes from the notes this tracker holds.
+            let debts = match outstanding_debts(&state, None).await {
+                Ok(debts) => debts,
+                Err(e) => return debt_read_failed(e),
+            };
             let reserves: Vec<SerializableReserveInfo> = all_reserves
                 .into_iter()
-                .map(|info| {
-                    let collateralization_ratio = info.collateralization_ratio();
-                    SerializableReserveInfo {
-                        box_id: info.box_id,
-                        owner_pubkey: decode_potentially_double_hex_encoded(&info.owner_pubkey),
-                        collateral_amount: info.base_info.collateral_amount,
-                        total_debt: info.total_debt,
-                        tracker_nft_id: info.base_info.tracker_nft_id.clone(),
-                        reserve_token_id: info.base_info.reserve_token_id.clone(),
-                        last_updated_height: info.base_info.last_updated_height,
-                        last_updated_timestamp: info.last_updated_timestamp,
-                        collateralization_ratio,
-                        refund_initiation_height: info.base_info.refund_initiation_height,
-                    }
-                })
+                .map(|info| reserve_view(info, &debts))
                 .collect();
 
             tracing::info!("Returning {} reserves (from database)", reserves.len());
@@ -86,37 +191,38 @@ pub async fn get_reserves_by_issuer(
     tracing::debug!("Getting reserves for issuer: {}", pubkey_hex);
 
     // Get reserve storage from scanner and query database directly
-    let scanner = state.ergo_scanner.lock().await;
-    let reserve_storage = scanner.reserve_storage();
+    let stored = state
+        .ergo_scanner
+        .lock()
+        .await
+        .reserve_storage()
+        .get_all_reserves();
 
     // Round 4 (C10): compare normalized keys, so an upper-case or 07-prefixed path finds the
     // issuer's reserves (the stored key is lower-case hex without the prefix).
     let wanted = basis_store::normalize_public_key(&pubkey_hex.to_ascii_lowercase());
 
     // Get all reserves from database and filter by issuer
-    match reserve_storage.get_all_reserves() {
+    match stored {
         Ok(all_reserves) => {
-            let reserves: Vec<SerializableReserveInfo> = all_reserves
+            let mine: Vec<ExtendedReserveInfo> = all_reserves
                 .into_iter()
                 .filter(|reserve| {
                     basis_store::normalize_public_key(&reserve.owner_pubkey.to_ascii_lowercase())
                         == wanted
                 })
-                .map(|info| {
-                    let collateralization_ratio = info.collateralization_ratio();
-                    SerializableReserveInfo {
-                        box_id: info.box_id,
-                        owner_pubkey: decode_potentially_double_hex_encoded(&info.owner_pubkey),
-                        collateral_amount: info.base_info.collateral_amount,
-                        total_debt: info.total_debt,
-                        tracker_nft_id: info.base_info.tracker_nft_id.clone(),
-                        reserve_token_id: info.base_info.reserve_token_id.clone(),
-                        last_updated_height: info.base_info.last_updated_height,
-                        last_updated_timestamp: info.last_updated_timestamp,
-                        collateralization_ratio,
-                        refund_initiation_height: info.base_info.refund_initiation_height,
-                    }
-                })
+                .collect();
+            // Round 5 (item 5): the debt comes from the notes this tracker holds for the issuer.
+            let debts = match mine.first().and_then(|r| owner_key(&r.owner_pubkey)) {
+                Some(issuer) => match outstanding_debts(&state, Some(issuer)).await {
+                    Ok(debts) => debts,
+                    Err(e) => return debt_read_failed(e),
+                },
+                None => OutstandingDebts::new(),
+            };
+            let reserves: Vec<SerializableReserveInfo> = mine
+                .into_iter()
+                .map(|info| reserve_view(info, &debts))
                 .collect();
 
             tracing::info!(
@@ -151,25 +257,25 @@ pub async fn get_reserve_by_box_id(
     tracing::debug!("Getting reserve by box ID: {}", box_id);
 
     // Get reserve storage from scanner and query database directly
-    let scanner = state.ergo_scanner.lock().await;
-    let reserve_storage = scanner.reserve_storage();
+    let stored = state
+        .ergo_scanner
+        .lock()
+        .await
+        .reserve_storage()
+        .get_reserve(&box_id);
 
     // Get the specific reserve from database
-    match reserve_storage.get_reserve(&box_id) {
+    match stored {
         Ok(Some(reserve_info)) => {
-            let collateralization_ratio = reserve_info.collateralization_ratio();
-            let serializable_reserve = SerializableReserveInfo {
-                box_id: reserve_info.box_id,
-                owner_pubkey: decode_potentially_double_hex_encoded(&reserve_info.owner_pubkey),
-                collateral_amount: reserve_info.base_info.collateral_amount,
-                total_debt: reserve_info.total_debt,
-                tracker_nft_id: reserve_info.base_info.tracker_nft_id.clone(),
-                reserve_token_id: reserve_info.base_info.reserve_token_id.clone(),
-                last_updated_height: reserve_info.base_info.last_updated_height,
-                last_updated_timestamp: reserve_info.last_updated_timestamp,
-                collateralization_ratio,
-                refund_initiation_height: reserve_info.base_info.refund_initiation_height,
+            // Round 5 (item 5): the debt comes from the notes this tracker holds for the owner.
+            let debts = match owner_key(&reserve_info.owner_pubkey) {
+                Some(issuer) => match outstanding_debts(&state, Some(issuer)).await {
+                    Ok(debts) => debts,
+                    Err(e) => return debt_read_failed(e),
+                },
+                None => OutstandingDebts::new(),
             };
+            let serializable_reserve = reserve_view(reserve_info, &debts);
 
             tracing::info!("Successfully retrieved reserve with box ID: {}", box_id);
 
@@ -254,6 +360,9 @@ pub struct SerializableReserveInfo {
     pub box_id: String,
     pub owner_pubkey: String,
     pub collateral_amount: u64,
+    /// Outstanding debt of the owner in the reserve's denomination on the notes this tracker
+    /// holds: the sum of `amount_collected - amount_redeemed` (round 5). Per (owner,
+    /// denomination): two reserves of one owner in one denomination show the same debt.
     pub total_debt: u64,
     pub tracker_nft_id: String, // Tracker NFT ID from R6 register (hex-encoded serialized SColl(SByte) format following byte_array_register_serialization.md spec)
     /// Reserve token ID (hex-encoded) for token-backed reserves, or empty for ERG reserves.
@@ -261,6 +370,80 @@ pub struct SerializableReserveInfo {
     pub reserve_token_id: String,
     pub last_updated_height: u64,
     pub last_updated_timestamp: u64,
-    pub collateralization_ratio: f64,
+    /// `collateral_amount / total_debt`, `null` when `total_debt` is 0.
+    pub collateralization_ratio: Option<f64>,
     pub refund_initiation_height: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(to: u8, total: u64, redeemed: u64, denomination: DenomKey) -> IouNote {
+        IouNote {
+            recipient_pubkey: [to; 33],
+            amount_collected: total,
+            amount_redeemed: redeemed,
+            timestamp: 1,
+            signature: [0u8; 65],
+            tracker_nft_id: [0x5a; 32],
+            denomination,
+        }
+    }
+
+    fn reserve(owner: &PubKey, token: Option<[u8; 32]>, collateral: u64) -> ExtendedReserveInfo {
+        ExtendedReserveInfo {
+            base_info: basis_store::ReserveInfo {
+                collateral_amount: collateral,
+                last_updated_height: 1,
+                contract_address: String::new(),
+                tracker_nft_id: hex::encode([0x5a; 32]),
+                refund_initiation_height: 0,
+                reserve_token_id: token.map(hex::encode).unwrap_or_default(),
+            },
+            // Whatever the scanner stored: the view reports the notes' debt.
+            total_debt: 12345,
+            box_id: "box".to_string(),
+            owner_pubkey: hex::encode(owner),
+            last_updated_timestamp: 0,
+        }
+    }
+
+    /// Round 5, item 5: a reserve's debt is what its owner still owes in its denomination on
+    /// the notes this tracker holds (total minus redeemed, summed), and the ratio is the
+    /// collateral over that debt, `null` when nothing is owed.
+    #[test]
+    fn a_reserve_reports_its_owners_outstanding_debt_and_ratio() {
+        let (a, b) = ([0x02; 33], [0x03; 33]);
+        let token = [0x7c; 32];
+        let mut debts = OutstandingDebts::new();
+        add_outstanding(&mut debts, a, &note(1, 300, 100, DenomKey::Erg));
+        add_outstanding(&mut debts, a, &note(2, 400, 0, DenomKey::Erg));
+        add_outstanding(&mut debts, a, &note(3, 50, 50, DenomKey::Token(token)));
+        add_outstanding(&mut debts, b, &note(4, 10, 0, DenomKey::Erg));
+
+        let erg = reserve_view(reserve(&a, None, 1_200), &debts);
+        assert_eq!(erg.total_debt, 600, "200 + 400");
+        assert_eq!(erg.collateralization_ratio, Some(2.0));
+
+        // Fully redeemed: nothing owed, no ratio.
+        let tokens = reserve_view(reserve(&a, Some(token), 1_000), &debts);
+        assert_eq!(tokens.total_debt, 0);
+        assert_eq!(tokens.collateralization_ratio, None);
+        let json = serde_json::to_value(&tokens).unwrap();
+        assert!(json["collateralization_ratio"].is_null(), "{json}");
+        assert_eq!(json["total_debt"], 0);
+
+        // Another owner, and an owner stored with the register prefix.
+        let other = reserve_view(reserve(&b, None, 5), &debts);
+        assert_eq!(other.total_debt, 10);
+        assert_eq!(other.collateralization_ratio, Some(0.5));
+        let mut prefixed = reserve(&b, None, 5);
+        prefixed.owner_pubkey = format!("07{}", hex::encode(b));
+        assert_eq!(reserve_view(prefixed, &debts).total_debt, 10);
+
+        // Totals saturate instead of overflowing.
+        add_outstanding(&mut debts, b, &note(5, u64::MAX, 0, DenomKey::Erg));
+        assert_eq!(reserve_view(reserve(&b, None, 5), &debts).total_debt, u64::MAX);
+    }
 }

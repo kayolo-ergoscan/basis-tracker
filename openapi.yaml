@@ -2017,7 +2017,12 @@ components:
         total_debt:
           type: integer
           format: uint64
-          description: Total debt issued against this reserve
+          description: >-
+            Outstanding debt of the reserve's owner in the reserve's denomination
+            on the notes this tracker holds: the sum of `amount_collected -
+            amount_redeemed` over those notes (saturating at 2^64-1). It is per
+            (owner, denomination), not per box: two reserves of one owner in one
+            denomination show the same debt.
           example: 1200000000
         tracker_nft_id:
           type: string
@@ -2036,7 +2041,10 @@ components:
         collateralization_ratio:
           type: number
           format: float
-          description: Current collateralization ratio
+          nullable: true
+          description: >-
+            `collateral_amount / total_debt` (both in the reserve's unit), or
+            null when `total_debt` is 0
           example: 2.08
         refund_initiation_height:
           type: integer

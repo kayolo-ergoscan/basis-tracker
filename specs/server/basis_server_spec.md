@@ -96,6 +96,14 @@ fjall keyspace waits up to one fsync interval to close.
 - `GET /reserves` - Get all reserve information
 - `GET /reserves/issuer/{pubkey}` - Get reserves for a specific issuer
 - `GET /reserves/{box_id}` - Get a single reserve by its box id
+
+  In all three (round 5), `total_debt` is the outstanding debt of the reserve's owner in the
+  reserve's denomination on the notes this tracker holds: the sum of `amount_collected -
+  amount_redeemed` over the owner's notes in that denomination (ERG for an ERG reserve, the
+  reserve token otherwise), saturating at 2^64-1. It is per (owner, denomination), not per box,
+  so two reserves of one owner in one denomination (a state the redemption routes refuse) show
+  the same debt. `collateralization_ratio` is `collateral_amount / total_debt`, both in the
+  reserve's unit (nanoERG or raw token units), and `null` when `total_debt` is 0.
 - `GET /reserves/quarantined` - List reserve boxes rejected by admission control (see `specs/ergo/reserve_admission.md`)
 - `GET /key-status/{pubkey}` - Get status information for a public key
 - `POST /reserves/create` - Create a reserve creation payload for Ergo node's `/wallet/payment/send` API (the tracker only tracks the reserve if the creating transaction spends a P2PK input of the R4 owner key — `basis-cli reserve create --submit` guarantees this)
