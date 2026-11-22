@@ -23,46 +23,33 @@ fn add_outstanding(debts: &mut OutstandingDebts, issuer: PubKey, note: &IouNote)
     *total = total.saturating_add(outstanding);
 }
 
-/// The outstanding debts of `issuer`'s notes, or of every note when `issuer` is `None`, read
-/// from the tracker thread.
+/// The outstanding debts of the notes of `issuers`, read from the tracker thread through the
+/// issuer index (one `GetNotesByIssuer` per issuer). Round 5b (F11): never all notes. An
+/// issuer's notes are bounded by `server.notes_max_recipients_per_issuer` per denomination, and
+/// the issuers asked about are the owners of reserves the scanner tracks, so the work per
+/// request follows the reserves, not every note the tracker holds.
 async fn outstanding_debts(
     state: &AppState,
-    issuer: Option<PubKey>,
+    issuers: impl IntoIterator<Item = PubKey>,
 ) -> Result<OutstandingDebts, String> {
     let mut debts = OutstandingDebts::new();
-    match issuer {
-        Some(issuer) => {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            state
-                .tx
-                .send(TrackerCommand::GetNotesByIssuer {
-                    issuer_pubkey: issuer,
-                    response_tx: tx,
-                })
-                .await
-                .map_err(|_| "tracker thread unavailable".to_string())?;
-            let notes = rx
-                .await
-                .map_err(|_| "tracker thread unavailable".to_string())?
-                .map_err(|e| format!("note lookup failed: {e:?}"))?;
-            for note in &notes {
-                add_outstanding(&mut debts, issuer, note);
-            }
-        }
-        None => {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            state
-                .tx
-                .send(TrackerCommand::GetNotes { response_tx: tx })
-                .await
-                .map_err(|_| "tracker thread unavailable".to_string())?;
-            let notes = rx
-                .await
-                .map_err(|_| "tracker thread unavailable".to_string())?
-                .map_err(|e| format!("note lookup failed: {e:?}"))?;
-            for (issuer, note) in &notes {
-                add_outstanding(&mut debts, *issuer, note);
-            }
+    let issuers: std::collections::BTreeSet<PubKey> = issuers.into_iter().collect();
+    for issuer in issuers {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state
+            .tx
+            .send(TrackerCommand::GetNotesByIssuer {
+                issuer_pubkey: issuer,
+                response_tx: tx,
+            })
+            .await
+            .map_err(|_| "tracker thread unavailable".to_string())?;
+        let notes = rx
+            .await
+            .map_err(|_| "tracker thread unavailable".to_string())?
+            .map_err(|e| format!("note lookup failed: {e:?}"))?;
+        for note in &notes {
+            add_outstanding(&mut debts, issuer, note);
         }
     }
     Ok(debts)
@@ -82,7 +69,10 @@ fn owner_key(owner_pubkey: &str) -> Option<PubKey> {
 /// `total_debt` is what the reserve's owner still owes in the reserve's denomination on the
 /// notes this tracker holds (`amount_collected - amount_redeemed`, summed); it is per (owner,
 /// denomination), not per box. `collateralization_ratio` is `collateral_amount / total_debt`,
-/// and `null` when nothing is owed.
+/// and `null` when nothing is owed. A redemption submitted through `/redemption/submit` counts
+/// only once it is applied (mined, `[confirmation] min_depth` deep): while it is journaled,
+/// `total_debt` still includes it, and once its block is in, `collateral_amount` (the scanner's
+/// reserve box) may already be the smaller successor's (round 5b, F11).
 fn reserve_view(info: ExtendedReserveInfo, debts: &OutstandingDebts) -> SerializableReserveInfo {
     let total_debt = match (owner_key(&info.owner_pubkey), info.denomination()) {
         (Some(owner), Some(denomination)) => {
@@ -156,8 +146,12 @@ pub async fn get_all_reserves(
     // Get all reserves from database
     match stored {
         Ok(all_reserves) => {
-            // Round 5 (item 5): the debt of each reserve comes from the notes this tracker holds.
-            let debts = match outstanding_debts(&state, None).await {
+            // Round 5 (item 5): the debt of each reserve comes from the notes this tracker holds,
+            // read for the owners of these reserves only (round 5b, F11).
+            let owners = all_reserves
+                .iter()
+                .filter_map(|reserve| owner_key(&reserve.owner_pubkey));
+            let debts = match outstanding_debts(&state, owners).await {
                 Ok(debts) => debts,
                 Err(e) => return debt_read_failed(e),
             };
@@ -213,12 +207,10 @@ pub async fn get_reserves_by_issuer(
                 })
                 .collect();
             // Round 5 (item 5): the debt comes from the notes this tracker holds for the issuer.
-            let debts = match mine.first().and_then(|r| owner_key(&r.owner_pubkey)) {
-                Some(issuer) => match outstanding_debts(&state, Some(issuer)).await {
-                    Ok(debts) => debts,
-                    Err(e) => return debt_read_failed(e),
-                },
-                None => OutstandingDebts::new(),
+            let owners = mine.first().and_then(|r| owner_key(&r.owner_pubkey));
+            let debts = match outstanding_debts(&state, owners).await {
+                Ok(debts) => debts,
+                Err(e) => return debt_read_failed(e),
             };
             let reserves: Vec<SerializableReserveInfo> = mine
                 .into_iter()
@@ -268,12 +260,11 @@ pub async fn get_reserve_by_box_id(
     match stored {
         Ok(Some(reserve_info)) => {
             // Round 5 (item 5): the debt comes from the notes this tracker holds for the owner.
-            let debts = match owner_key(&reserve_info.owner_pubkey) {
-                Some(issuer) => match outstanding_debts(&state, Some(issuer)).await {
-                    Ok(debts) => debts,
-                    Err(e) => return debt_read_failed(e),
-                },
-                None => OutstandingDebts::new(),
+            let debts = match outstanding_debts(&state, owner_key(&reserve_info.owner_pubkey))
+                .await
+            {
+                Ok(debts) => debts,
+                Err(e) => return debt_read_failed(e),
             };
             let serializable_reserve = reserve_view(reserve_info, &debts);
 
@@ -362,7 +353,8 @@ pub struct SerializableReserveInfo {
     pub collateral_amount: u64,
     /// Outstanding debt of the owner in the reserve's denomination on the notes this tracker
     /// holds: the sum of `amount_collected - amount_redeemed` (round 5). Per (owner,
-    /// denomination): two reserves of one owner in one denomination show the same debt.
+    /// denomination): two reserves of one owner in one denomination show the same debt. A
+    /// journaled redemption (submitted, not yet applied) is still included (round 5b, F11).
     pub total_debt: u64,
     pub tracker_nft_id: String, // Tracker NFT ID from R6 register (hex-encoded serialized SColl(SByte) format following byte_array_register_serialization.md spec)
     /// Reserve token ID (hex-encoded) for token-backed reserves, or empty for ERG reserves.

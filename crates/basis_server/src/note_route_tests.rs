@@ -535,10 +535,37 @@ async fn reserves_by_issuer_matches_normalized_keys() {
 
 /// Round 5, item 5: `/reserves`, `/reserves/issuer/{pubkey}` and `/reserves/{box_id}` report
 /// each reserve's outstanding debt from the notes this tracker holds, in the reserve's
-/// denomination, and the ratio collateral / debt, `null` when nothing is owed.
+/// denomination, and the ratio collateral / debt, `null` when nothing is owed. Round 5b (F11):
+/// `/reserves` reads the notes of the reserves' owners through the issuer index, never every
+/// note (no `GetNotes`, no notes of an issuer without a reserve).
 #[tokio::test]
 async fn reserves_report_the_notes_outstanding_debt_and_ratio() {
-    let state = state(DEFAULT_CAPS);
+    let mut state = state(DEFAULT_CAPS);
+    // Count what the handlers ask the tracker thread.
+    let full_scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let issuers_read: Arc<Mutex<Vec<PubKey>>> = Arc::default();
+    {
+        let (counted_tx, mut counted_rx) = tokio::sync::mpsc::channel::<TrackerCommand>(100);
+        let inner = state.tx.clone();
+        let (scans, read) = (full_scans.clone(), issuers_read.clone());
+        tokio::spawn(async move {
+            while let Some(cmd) = counted_rx.recv().await {
+                match &cmd {
+                    TrackerCommand::GetNotes { .. } => {
+                        scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    TrackerCommand::GetNotesByIssuer { issuer_pubkey, .. } => {
+                        read.lock().unwrap().push(*issuer_pubkey);
+                    }
+                    _ => {}
+                }
+                if inner.send(cmd).await.is_err() {
+                    break;
+                }
+            }
+        });
+        state.tx = counted_tx;
+    }
     let token = [0x7c; 32];
     let (a, b) = (issuer(), issuer());
     for (owner, box_id, denomination) in [
@@ -565,8 +592,19 @@ async fn reserves_report_the_notes_outstanding_debt_and_ratio() {
         assert_eq!(status, StatusCode::CREATED, "{error}");
     }
 
+    issuers_read.lock().unwrap().clear();
     let (status, body) = crate::reserve_api::get_all_reserves(axum::extract::State(state.clone())).await;
     assert_eq!(status, StatusCode::OK, "{:?}", body.0.error);
+    assert_eq!(
+        full_scans.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no scan of every note"
+    );
+    let mut read = issuers_read.lock().unwrap().clone();
+    read.sort();
+    let mut owners = vec![a.key, b.key];
+    owners.sort();
+    assert_eq!(read, owners, "each owner once, nobody else");
     let all = serde_json::to_value(body.0.data.unwrap()).unwrap();
     let by_box = |id: &str| {
         all.as_array()
