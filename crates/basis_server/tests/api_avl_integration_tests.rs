@@ -292,7 +292,7 @@ mod api_avl_integration_tests {
 
     #[tokio::test]
     async fn test_tracker_state_manager_initial_empty_state() {
-        let tracker = TrackerStateManager::new_with_temp_storage();
+        let mut tracker = TrackerStateManager::new_with_temp_storage();
 
         // Verify initial state is properly initialized
         let initial_state = tracker.get_state();

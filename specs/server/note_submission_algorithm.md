@@ -22,6 +22,20 @@ This document describes the complete algorithm executed when a new or updated IO
 5. Validate and decode `issuer_pubkey` from hex to bytes
 6. Convert to fixed-size array (33 bytes) or return 400 BAD REQUEST if invalid
 
+### Step 2a: Reserve Requirement and Note Caps (round 4, C3)
+1. With `server.notes_require_reserve` (default `true`) the issuer must have exactly one
+   active reserve under this tracker in the note's denomination: tracked by the scanner, bound
+   to this tracker's NFT in R6 and not in refund. Otherwise 409 CONFLICT, and nothing is stored.
+2. Note admission is serialized from here to the tracker's answer, so concurrent requests
+   cannot overshoot a cap.
+3. A note to a new recipient when the issuer already has `server.notes_max_recipients_per_issuer`
+   (default 50) distinct recipients: 429 TOO MANY REQUESTS.
+4. More than `server.notes_max_updates_per_issuer_per_hour` (default 120) accepted notes of the
+   issuer in the last hour, or a new (issuer, recipient, denomination) edge when
+   `server.notes_max_new_edges_per_hour` (default 1000) new edges were created in the last hour
+   by all issuers together: 429 TOO MANY REQUESTS. A note the tracker refuses in Step 5 gives
+   its slot back.
+
 ### Step 3: IOU Note Creation
 1. Create a new `IouNote` struct with:
    - `recipient_pubkey`: Decoded recipient public key
@@ -45,7 +59,9 @@ This document describes the complete algorithm executed when a new or updated IO
    - Checks for valid timestamp (not in the future)
    - Validates amount does not cause overflow
    - Ensures sufficient collateralization if needed
-4. Updates the internal state with the new note
+4. Stores the note and marks the live tree dirty. The live tree is rebuilt once, however many
+   notes arrived, when its digest or a live proof is next read (box updater cycle, live proof
+   routes), not per note (round 4, C3)
 
 ### Step 6: Validation and Error Handling
 1. If `add_note` returns an error:

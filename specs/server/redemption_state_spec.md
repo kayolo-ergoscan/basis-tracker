@@ -459,14 +459,47 @@ order, and the client splices the proof into that exact transaction.
 ### POST /redemption/build
 
 Builds the unsigned redemption transaction, generates all AVL proofs, computes the
-tracker Schnorr signature (context var `#6`), selects the reserve and fee boxes, and
-signs the fee input(s).
+tracker Schnorr signature (context var `#6`), selects the reserve box and, for a token
+reserve, the fee boxes, and signs those fee input(s).
+
+**Recipient-signed requests (round 4).** Only the recipient can ask for a build. The request
+carries `request_timestamp` (ms since the Unix epoch) and `receiver_signature`: the
+recipient's 65-byte Basis Schnorr signature over
+
+```
+"basis-build-v1" ‖ trackerNftId (32) ‖ issuerKey (33) ‖ recipientKey (33)
+‖ denominationId (UTF-8 "erg" | "token:<64 lowercase hex>") ‖ amount (8, BE) ‖ request_timestamp (8, BE)
+```
+
+(131 bytes for ERG, 198 for a token; `basis_core::types::build_request_message`). The
+timestamp must lie within 120 s of the tracker's clock and rise strictly per recipient (kept
+in memory for 10 minutes; 409 on a replay). Request order: signature, timestamp record, note
+lookup, single-reserve check (409), committed tracker proof and reserve-tree lookup, then the
+**cheap checks** — `amount` ≤ committed total minus already redeemed (400), the issuer
+signature over the committed note (400), and for an ERG reserve `amount - fee` ≥ the minimum
+box value (400) — and only then the build budgets (per pair, per recipient; 429). No node
+request happens before all of these pass.
+
+**Fee out of the payout (ERG reserves).** The reserve contract checks only the reserve's own
+output and the receiver's signature for the released value (`contract/basis.es`: `redeemed =
+SELF.value - selfOut.value` must not exceed the debt delta, and `proveDlog(receiver)`); no
+other output is constrained. An ERG-reserve redemption therefore spends only the reserve box,
+with outputs `[reserve' (value - amount), recipient (amount - fee), miner fee]`, no change and
+no tracker input: the tracker signs no transaction input (`fee_paid_by: "recipient"`,
+`change_amount` 0, `change_address` ""). Token reserves must keep their ERG value, so they keep
+the tracker-paid fee inputs and their budgets (`fee_paid_by: "tracker"`).
+
+**Node requests.** A caller `tracker_box_id` is used only when it equals a tracker box id the
+tracker knows (live or last confirmed); any other value is ignored, so no caller input reaches a
+node URL. Before any tracker box is known (right after a start) the build answers 503. Node
+failures are logged; the client gets "the tracker could not read ... from its node; try again
+later" without the node's URL or answer.
 
 **Reserve selection:** smallest sufficient reserve that is unspent (`/utxo/byId`) and
 whose on-chain R5 digest equals the tracker's local reserve-tree digest. A mismatch
 means local state is stale and the reserve is skipped.
 
-**Fee inputs:** token-free boxes at `P2PK(tracker key)` from the public `byAddress` index. The
+**Fee inputs (token reserves only):** token-free boxes at `P2PK(tracker key)` from the public `byAddress` index. The
 tracker box ids the tracker knows (the data input, the live and the confirmed one) and the
 reserve box are never offered, whatever the index says they hold. Before signing, the tracker
 checks the boxes as the node returned their bytes (`/utxo/byIdBinary`), which is what the
@@ -479,11 +512,12 @@ NFT.
 (the newest of the last 10 headers), as the tracker's own commits are. Change below the
 minimum value of its box (360 nanoERG per serialized byte) cannot form a box and goes to the
 miner fee (`change_amount` 0, `fee` the configured fee plus that leftover). An ERG redemption
-whose amount is below the minimum value of the recipient's box is refused with 400. Before
-signing, the build also checks what it can without the reserve input's proof: inputs and
-outputs hold the same value, no output is below its minimum value, and every output is created
-at the signing height or below and no lower than any input. After signing, the fee input
-proofs are verified against the signing context.
+whose payout (`amount - fee`) is below the minimum value of the recipient's box is refused with
+400. Before returning (and, for a token reserve, before signing), the build checks what it can
+without the reserve input's proof: inputs and outputs hold the same value, no output is below
+its minimum value, every output is created at the signing height or below and no lower than any
+input, and an ERG build spends nothing but the reserve. After signing, the fee input proofs are
+verified against the signing context.
 
 **`new_already_redeemed`:** computed from the **reserve-tree lookup** (previous
 cumulative value for this reserve, `0` for a first redemption) plus the requested
@@ -495,7 +529,7 @@ tree entry; the on-chain contract only sees the spent reserve's tree.
 ```json
 {
   "unsigned_tx": { "...": "node-canonical unsigned tx (extension in Scala order)" },
-  "partial_tx": { "...": "fee-signed tx; reserve input proof empty" },
+  "partial_tx": { "...": "every proof but the reserve's; all empty for an ERG reserve" },
   "input_box_binaries": ["sigma-serialized boxes, tx-input order"],
   "data_box_binaries": ["tracker box"],
   "headers": ["last 10 block headers, newest first: PreHeader from headers[0]"],
@@ -511,13 +545,15 @@ note's `amount_collected`/`timestamp`/`tracker_nft_id`; request `amount`/`timest
 ignored for signing. The endpoint returns `404 Not Found` when there is no stored note for the
 (issuer, recipient) pair, `409 Conflict` when the issuer has more than one tracked reserve
 (fail-closed against per-reserve replay), and `429 Too Many Requests` when the per-(issuer,
-recipient) rate limit is exceeded — `server.redemption_build_max_per_pair_per_hour`, default 60
-per hour over a rolling window (the tracker funds the fee inputs, so unbounded building would
-drain its wallet). Builds that get as far as signing fee inputs also count against their issuer
-(`server.redemption_build_max_per_issuer_per_hour`, default 6) and against all builds together
-(`server.redemption_build_max_per_hour`, default 30), both per rolling hour and answered with
-`429` when reached; requests that fail before that do not use these budgets. The per-pair window
-forgets pairs with no build in the last hour and keeps at most 10 000 pairs.
+recipient) rate limit (`server.redemption_build_max_per_pair_per_hour`, default 60) or the
+per-recipient limit (`server.redemption_build_max_per_recipient_per_hour`, default 30) is
+exceeded, per hour over a rolling window. Only requests whose `receiver_signature` verifies and
+that pass the cheap checks are counted. Token-reserve builds that get as far as signing fee
+inputs also count against their issuer (`server.redemption_build_max_per_issuer_per_hour`,
+default 6) and against all such builds together (`server.redemption_build_max_per_hour`, default
+30), both per rolling hour and answered with `429` when reached; requests that fail before that,
+and ERG-reserve builds (no tracker input), do not use these budgets. The windows forget keys
+with no build in the last hour and keep at most 10 000 pairs and 10 000 recipients.
 
 **Fee floor:** commits and heartbeats pay from the same token-free boxes as the build's fee
 inputs. The build counts those boxes (the fee scan reads on until it has seen the build's cost
@@ -542,8 +578,10 @@ Broadcasts the fully-signed transaction via the node and then **syncs local stat
 ```
 
 **Build-binding (required):** the echoed `unsigned_tx` is hashed and must match a live, single-use
-pending entry recorded by `/redemption/build` (entries expire after 30 minutes). Unknown, expired,
-or already-used `unsigned_tx` → `409 Conflict`. The signed transaction's inputs must also contain
+pending entry recorded by `/redemption/build` (entries expire after 30 minutes). A newer build of
+the same note (issuer, recipient, denomination) replaces the entry, so only the newest build of a
+note can be submitted, and a build that is never submitted (a dry run) blocks nothing: builds
+only read tracker state. Unknown, expired, replaced or already-used `unsigned_tx` → `409 Conflict`. The signed transaction's inputs must also contain
 the build's reserve box, and the reserve output's R5 must match the stored expected digest —
 otherwise `400 Bad Request`. The caller-supplied `issuer_pubkey` / `recipient_pubkey` /
 `redeemed_amount` / `new_already_redeemed` fields are accepted for backward compatibility but

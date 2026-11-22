@@ -2318,7 +2318,7 @@ mod tests {
         registers.insert("R4".to_string(), format!("07{}", owner_pubkey));
         registers.insert("R5".to_string(), empty_reserve_tree_register());
         registers.insert("R6".to_string(), format!("0e20{}", nft_id));
-        registers.insert("R7".to_string(), "05000000000000000000".to_string());
+        registers.insert("R7".to_string(), "0500".to_string());
 
         let scan_box = ScanBox {
             box_id: "token_reserve_box".to_string(),

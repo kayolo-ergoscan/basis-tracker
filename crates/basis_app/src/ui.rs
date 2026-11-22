@@ -1414,7 +1414,20 @@ async fn tracker_assisted_redeem(
     let receiver_sk = SecretKey::dlog_from_bytes(&receiver_secret)
         .ok_or("invalid receiver dlog secret".to_string())?;
 
-    // Tracker builds the unsigned tx and signs the fee input(s).
+    // Tracker builds the unsigned tx (an ERG redemption pays the fee out of the payout; a token
+    // redemption gets tracker fee inputs, which it signs). Only the recipient may ask: the
+    // request carries the recipient's signature.
+    let request_timestamp = basis_cli_lib::verify::now_unix_ms();
+    let receiver_signature = basis_cli_lib::verify::sign_build_request(
+        &receiver_secret,
+        &tracker_nft_id,
+        &issuer_pk,
+        &recipient_pk,
+        &denomination,
+        amount,
+        request_timestamp,
+    )
+    .map_err(|e| format!("build request signature: {}", e))?;
     let build = app
         .client
         .redemption_build(basis_cli_lib::api::RedemptionBuildRequest {
@@ -1430,6 +1443,8 @@ async fn tracker_assisted_redeem(
             // Same denomination that signed the message above must scope the build;
             // empty lets the server fall back to ERG for multi-denomination pairs.
             denomination: denomination.denomination_id(),
+            request_timestamp,
+            receiver_signature,
         })
         .await
         .map_err(|e| format!("tracker build failed: {}", e))?;
@@ -1473,6 +1488,7 @@ async fn tracker_assisted_redeem(
         &recipient_pk,
         &denomination,
         amount,
+        basis_cli_lib::verify::MAX_PAYOUT_FEE_NANOERG,
     )
     .map_err(|e| format!("refusing to sign the tracker's redemption: {}", e))?;
 

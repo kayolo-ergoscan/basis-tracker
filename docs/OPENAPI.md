@@ -162,8 +162,8 @@ configured Ergo node wallet.
 - `POST /redeem` - Initiate redemption of an IOU note
 - `POST /redeem/complete` - Mark a redemption as completed locally (amounts are validated against the stored note state; a mismatch returns 400)
 - `POST /redemption/prepare` - Removed: always answers `410 Gone` with a JSON error (use `POST /tracker/signature` and `POST /redemption/build`)
-- `POST /redemption/build` - Build an unsigned redemption transaction and sign fee inputs (the tracker proof is generated against the last on-chain-confirmed tracker state; returns 400 if the note is not yet in the confirmed state)
-- `POST /redemption/submit` - Broadcast a fully-signed redemption transaction (note key and amounts are re-validated against stored state before broadcasting; a mismatch returns 400)
+- `POST /redemption/build` - Build an unsigned redemption transaction; recipient-signed (`request_timestamp`, `receiver_signature`). ERG reserves pay the miner fee out of the payout (only the reserve is spent, the tracker signs nothing); token reserves use tracker-signed fee inputs (the tracker proof is generated against the last on-chain-confirmed tracker state; returns 400 if the note is not yet in the confirmed state)
+- `POST /redemption/submit` - Broadcast a fully-signed redemption transaction (note key and amounts are re-validated against stored state before broadcasting; a mismatch returns 400; a node refusal returns 500 without the node's URL or answer). The build's pending entry is single-use, lives 30 minutes and is replaced by a newer build of the same note; unknown, expired or replaced entries return 409
 
 ### Proofs
 
@@ -173,7 +173,7 @@ configured Ergo node wallet.
 
 ### Tracker
 
-- `POST /tracker/signature` - Request a tracker Schnorr signature for redemption (signs the stored note's `total_debt`/`timestamp`; the request fields of the same names are legacy and ignored; returns 404 if no note is stored for the pair)
+- `POST /tracker/signature` - Request a tracker Schnorr signature for a normal redemption (signs the stored note's `total_debt`/`timestamp`; the request fields of the same names must match the stored note; returns 404 if no note is stored for the pair, 400 for `emergency: true`)
 - `GET /tracker/state` - Get local/confirmed/pending tracker state digests
 - `GET /tracker/pending-tx` - Get the in-flight tracker update transaction
 - `GET /tracker/latest-box-id` - Get the latest on-chain tracker box ID
@@ -327,14 +327,45 @@ curl -X POST http://localhost:3048/redemption/build \
     "issuer_pubkey": "010101010101010101010101010101010101010101010101010101010101010101",
     "recipient_pubkey": "020202020202020202020202020202020202020202020202020202020202020202",
     "amount": 500000000,
-    "timestamp": 1234567890000,
-    "issuer_signature": "030303..."
+    "issuer_signature": "030303...",
+    "denomination": "erg",
+    "request_timestamp": 1795000000000,
+    "receiver_signature": "040404..."
   }'
 ```
 
+Only the recipient can ask for a build. `receiver_signature` is the recipient's
+65-byte Basis Schnorr signature (the scheme notes use) over:
+
+```
+"basis-build-v1"            14 bytes, ASCII
+‖ tracker NFT id            32 bytes
+‖ issuer public key         33 bytes
+‖ recipient public key      33 bytes
+‖ denomination id           UTF-8: "erg" (3 bytes) or "token:<64 lowercase hex>" (70 bytes)
+‖ amount                    u64 big-endian
+‖ request_timestamp         u64 big-endian (ms since the Unix epoch)
+```
+
+That is 131 bytes for ERG and 198 for a token. `request_timestamp` must be
+within 120 s of the tracker's clock and greater than the recipient's previous
+build request (409 otherwise). The tracker checks the signature, then the
+committed outstanding debt (`amount` must not exceed committed total minus
+already redeemed), the issuer signature over the committed note, and, for an ERG
+reserve, that `amount - fee` is at least the minimum box value — all before any
+node request and before any build budget is counted.
+
+**Who pays the miner fee** (`fee_paid_by` in the response): an ERG-reserve
+redemption pays it out of the redeemed value. The transaction spends only the
+reserve box, its outputs are `[reserve', recipient (amount - fee), miner fee]`,
+there is no change output and the tracker signs nothing (`"recipient"`). A
+token-reserve redemption keeps tracker-signed fee inputs (`"tracker"`).
+
 The request's optional `change_address` field is deprecated and ignored:
 change is always paid to the tracker's own wallet (derived from the selected
-fee input, falling back to the configured change address).
+fee input, falling back to the configured change address). A caller
+`tracker_box_id` is used only when it equals a tracker box id the tracker
+knows; any other value is ignored. Errors never carry the node's URL or answer.
 
 The tracker AVL proof in the response is generated against the last
 on-chain-confirmed tracker state digest (not the live local tree), so it
@@ -372,8 +403,11 @@ curl -X POST http://localhost:3048/tracker/signature \
 ```
 
 The tracker always signs the stored note's cumulative `total_debt` and payment
-`timestamp`; the request fields of the same names are legacy and ignored. The
-acceptance policy is enforced for non-emergency requests before signing — it is
+`timestamp`; the request fields of the same names must match the stored note
+(409 otherwise). Only normal redemptions are signed: `"emergency": true` is
+refused with 400, because an emergency redemption (after the 3-day window) uses
+an empty context var #6 instead of a tracker signature. The
+acceptance policy is enforced before signing — it is
 evaluated against the issuer's tracked reserve of the note's denomination (409
 when that reserve is missing or not unique; a reserve of another currency is
 never consulted) — and the endpoint returns 404 when no note is stored for the
@@ -419,7 +453,7 @@ where:
 - `timestamp` is the note payment timestamp (8 bytes, big-endian)
 - `trackerNftId` is the tracker's NFT id (32 bytes), binding the signature to one specific tracker/contract — on-chain the contract reads it from the tracker box's `R6` register and appends it, so a signature made for one tracker cannot be replayed on another
 
-The same message format is used for both normal and emergency redemption. In an emergency redemption, the tracker signature is optional.
+The same message format is used for both normal and emergency redemption. An emergency redemption carries no tracker signature: context var #6 is an empty byte collection, and `POST /tracker/signature` refuses `emergency: true` with 400.
 
 ## Context Extension Variables
 

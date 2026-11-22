@@ -257,6 +257,10 @@ mod redemption_api_tests {
                     TrackerCommand::GetAllConfirmations { response_tx } => {
                         let _ = response_tx.send(redemption_manager.tracker.all_confirmations());
                     }
+                    TrackerCommand::RefreshDigest { response_tx } => {
+                        let _ = response_tx
+                            .send(redemption_manager.tracker.get_state().avl_root_digest);
+                    }
                     TrackerCommand::MarkNotesPending {
                         digest,
                         tx_id,
@@ -384,6 +388,11 @@ mod redemption_api_tests {
                 reserve_creation_max_erg_nano: 10_000_000_000,
                 reserve_creation_max_token_amount: 1_000_000_000,
                 redemption_build_max_per_pair_per_hour: 60,
+                redemption_build_max_per_recipient_per_hour: 30,
+                notes_require_reserve: false,
+                notes_max_recipients_per_issuer: 50,
+                notes_max_updates_per_issuer_per_hour: 120,
+                notes_max_new_edges_per_hour: 1000,
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -455,6 +464,7 @@ mod redemption_api_tests {
             redemption_build_rate: std::sync::Arc::new(
                 basis_server::redemption_build::BuildRateLimiter::new(),
             ),
+            note_limits: std::sync::Arc::new(basis_server::note_limits::NoteLimiter::new()),
         }
     }
 
@@ -467,6 +477,26 @@ mod redemption_api_tests {
         amount: u64,
         timestamp: u64,
     ) {
+        add_returned_test_note(
+            state,
+            issuer_secret,
+            issuer_pubkey,
+            recipient_pubkey,
+            amount,
+            timestamp,
+        )
+        .await;
+    }
+
+    /// `add_test_note` that returns the stored note.
+    async fn add_returned_test_note(
+        state: &AppState,
+        issuer_secret: &[u8; 32],
+        issuer_pubkey: &str,
+        recipient_pubkey: &str,
+        amount: u64,
+        timestamp: u64,
+    ) -> basis_store::IouNote {
         let recipient_bytes = hex::decode(recipient_pubkey).unwrap();
         let recipient_arr: [u8; 33] = recipient_bytes.try_into().unwrap();
 
@@ -486,13 +516,83 @@ mod redemption_api_tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let cmd = TrackerCommand::AddNote {
             issuer_pubkey: issuer_arr,
-            note,
+            note: note.clone(),
             response_tx,
         };
 
         state.tx.send(cmd).await.unwrap();
         let result = response_rx.await.unwrap();
         result.expect("add_test_note: AddNote failed");
+        note
+    }
+
+    /// Commit `notes` in the tracker's view, as the box updater does after a commit: the live
+    /// tree is canonical (debt-key order), so a fresh tracker holding the same notes has the
+    /// same digest, and reconciling with it marks the notes committed.
+    async fn commit_notes(state: &AppState, notes: &[(&str, &basis_store::IouNote)]) {
+        let mut shadow = basis_store::TrackerStateManager::new_with_temp_storage();
+        for (issuer_hex, note) in notes {
+            let issuer: [u8; 33] = hex::decode(issuer_hex).unwrap().try_into().unwrap();
+            shadow.add_note(&issuer, note).unwrap();
+        }
+        let digest = shadow.get_state().avl_root_digest;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        state
+            .tx
+            .send(TrackerCommand::ReconcileWithConfirmedDigest {
+                digest,
+                box_id: "committed".to_string(),
+                height: 1,
+                response_tx,
+            })
+            .await
+            .unwrap();
+        response_rx.await.unwrap().unwrap();
+    }
+
+    /// A `/redemption/build` request for (issuer, recipient), signed by the recipient now,
+    /// carrying the issuer's note signature.
+    fn signed_build_request(
+        state: &AppState,
+        issuer_hex: &str,
+        recipient_secret: &[u8; 32],
+        recipient_hex: &str,
+        amount: u64,
+        note: &basis_store::IouNote,
+    ) -> RedemptionBuildRequest {
+        let issuer: [u8; 33] = hex::decode(issuer_hex).unwrap().try_into().unwrap();
+        let recipient: [u8; 33] = hex::decode(recipient_hex).unwrap().try_into().unwrap();
+        let nft: [u8; 32] = hex::decode(state.config.ergo.tracker_nft_id.as_ref().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let request_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let message = basis_store::schnorr::build_request_message(
+            &nft,
+            &issuer,
+            &recipient,
+            &basis_store::DenomKey::Erg,
+            amount,
+            request_timestamp,
+        );
+        let signature =
+            basis_store::schnorr::schnorr_sign(&message, recipient_secret, &recipient).unwrap();
+        RedemptionBuildRequest {
+            issuer_pubkey: issuer_hex.to_string(),
+            recipient_pubkey: recipient_hex.to_string(),
+            amount,
+            timestamp: note.timestamp,
+            issuer_signature: hex::encode(note.signature),
+            emergency: false,
+            tracker_box_id: None,
+            change_address: None,
+            denomination: "erg".to_string(),
+            request_timestamp,
+            receiver_signature: hex::encode(signature),
+        }
     }
 
     /// Helper to store a reserve for the issuer in the scanner's reserve storage
@@ -859,56 +959,58 @@ mod redemption_api_tests {
 
     #[tokio::test]
     async fn test_build_redemption_rejected_when_would_violate_holder_policy() {
-        // Same ratio math as the /redeem case, scaled above the 1_000_000
-        // nanoERG minimum reserve remainder: C=1_900_000, D=2_500_000 (ratio
-        // 0.76), global min_ratio 0.75. Redeeming 400_000 moves the ratio to
-        // 1_500_000/2_100_000 = 0.714 < 0.75: newly violates the other holder's
-        // policy. Reserve selection requires the mock node to report the box
-        // unspent with R5 matching the tracker's reserve tree.
+        // Same ratio math as the /redeem case, in nanoERG large enough for an ERG redemption
+        // that pays the 0.001 ERG miner fee out of the payout: C=19_000_000, D=25_000_000
+        // (ratio 0.76), global min_ratio 0.75. Redeeming 4_000_000 moves the ratio to
+        // 15_000_000/21_000_000 = 0.714 < 0.75: newly violates the other holder's policy.
+        // Reserve selection requires the mock node to report the box unspent with R5 matching
+        // the tracker's reserve tree; the notes are committed (the build reads the committed
+        // total before any node request).
         let node_url =
-            spawn_mock_node_with_reserve_box(1_900_000, reserve_r5_matching_tracker()).await;
+            spawn_mock_node_with_reserve_box(19_000_000, reserve_r5_matching_tracker()).await;
         let state =
             create_mock_app_state_with_options(collateral_acceptance(0.75), true, &node_url).await;
 
         let (issuer_secret, issuer_pubkey) = generate_keypair();
         let issuer_hex = hex::encode(issuer_pubkey);
-        let (_redeemer_secret, redeemer_pubkey) = generate_keypair();
+        let (redeemer_secret, redeemer_pubkey) = generate_keypair();
         let redeemer_hex = hex::encode(redeemer_pubkey);
         let (_holder_secret, holder_pubkey) = generate_keypair();
         let holder_hex = hex::encode(holder_pubkey);
 
-        add_test_note(
+        let redeemer_note = add_returned_test_note(
             &state,
             &issuer_secret,
             &issuer_hex,
             &redeemer_hex,
-            1_000_000,
+            10_000_000,
             1000,
         )
         .await;
-        add_test_note(
+        let holder_note = add_returned_test_note(
             &state,
             &issuer_secret,
             &issuer_hex,
             &holder_hex,
-            1_500_000,
+            15_000_000,
             2000,
         )
         .await;
-        add_test_reserve(&state, &issuer_hex, 1_900_000).await;
+        commit_notes(
+            &state,
+            &[(&issuer_hex, &redeemer_note), (&issuer_hex, &holder_note)],
+        )
+        .await;
+        add_test_reserve(&state, &issuer_hex, 19_000_000).await;
 
-        let request = RedemptionBuildRequest {
-            issuer_pubkey: issuer_hex,
-            recipient_pubkey: redeemer_hex,
-            amount: 400_000,
-            timestamp: 1000,
-            issuer_signature: "01".repeat(65),
-            emergency: false,
-            tracker_box_id: None,
-            change_address: None,
-
-            denomination: String::new(),
-        };
+        let request = signed_build_request(
+            &state,
+            &issuer_hex,
+            &redeemer_secret,
+            &redeemer_hex,
+            4_000_000,
+            &redeemer_note,
+        );
 
         let response =
             build_redemption(axum::extract::State(state), axum::extract::Json(request)).await;
@@ -931,54 +1033,55 @@ mod redemption_api_tests {
 
     #[tokio::test]
     async fn test_build_redemption_rejected_when_not_oldest_note() {
-        // Distressed reserve: C=1_100_000, D=2_000_000 (ratio 0.55), global
+        // Distressed reserve: C=11_000_000, D=20_000_000 (ratio 0.55), global
         // min_ratio 1.0 — every holder's policy is already violated, so only
         // the oldest note may redeem. The redeemer's note (ts 2000) is newer
         // than the holder's (ts 1000).
         let node_url =
-            spawn_mock_node_with_reserve_box(1_100_000, reserve_r5_matching_tracker()).await;
+            spawn_mock_node_with_reserve_box(11_000_000, reserve_r5_matching_tracker()).await;
         let state =
             create_mock_app_state_with_options(collateral_acceptance(1.0), true, &node_url).await;
 
         let (issuer_secret, issuer_pubkey) = generate_keypair();
         let issuer_hex = hex::encode(issuer_pubkey);
-        let (_redeemer_secret, redeemer_pubkey) = generate_keypair();
+        let (redeemer_secret, redeemer_pubkey) = generate_keypair();
         let redeemer_hex = hex::encode(redeemer_pubkey);
         let (_holder_secret, holder_pubkey) = generate_keypair();
         let holder_hex = hex::encode(holder_pubkey);
 
-        add_test_note(
+        let redeemer_note = add_returned_test_note(
             &state,
             &issuer_secret,
             &issuer_hex,
             &redeemer_hex,
-            800_000,
+            8_000_000,
             2000,
         )
         .await;
-        add_test_note(
+        let holder_note = add_returned_test_note(
             &state,
             &issuer_secret,
             &issuer_hex,
             &holder_hex,
-            1_200_000,
+            12_000_000,
             1000,
         )
         .await;
-        add_test_reserve(&state, &issuer_hex, 1_100_000).await;
+        commit_notes(
+            &state,
+            &[(&issuer_hex, &redeemer_note), (&issuer_hex, &holder_note)],
+        )
+        .await;
+        add_test_reserve(&state, &issuer_hex, 11_000_000).await;
 
-        let request = RedemptionBuildRequest {
-            issuer_pubkey: issuer_hex,
-            recipient_pubkey: redeemer_hex,
-            amount: 100_000,
-            timestamp: 2000,
-            issuer_signature: "01".repeat(65),
-            emergency: false,
-            tracker_box_id: None,
-            change_address: None,
-
-            denomination: String::new(),
-        };
+        let request = signed_build_request(
+            &state,
+            &issuer_hex,
+            &redeemer_secret,
+            &redeemer_hex,
+            2_000_000,
+            &redeemer_note,
+        );
 
         let response =
             build_redemption(axum::extract::State(state), axum::extract::Json(request)).await;
@@ -1449,53 +1552,47 @@ mod redemption_api_tests {
         basis_store::schnorr::schnorr_verify(&signature, &message, &tracker_pubkey).unwrap();
     }
 
+    /// Round 4, C4: `emergency: true` is refused with 400 before any work. An emergency
+    /// redemption needs no tracker signature (empty var #6 after the time lock), and signing
+    /// one used to hand out a NORMAL signature with the acceptance-policy check skipped.
     #[tokio::test]
     async fn test_request_tracker_signature_emergency_flag() {
-        // Test that emergency flag is accepted in request
-        let state = create_mock_app_state().await;
-
-        let (issuer_secret, issuer_pubkey) = generate_keypair();
-        let (_recipient_secret, recipient_pubkey) = generate_keypair();
-        let issuer_hex = hex::encode(issuer_pubkey);
-        let recipient_hex = hex::encode(recipient_pubkey);
-        add_test_note(
-            &state,
-            &issuer_secret,
-            &issuer_hex,
-            &recipient_hex,
-            1000,
-            1000,
-        )
-        .await;
-
-        let request = TrackerSignatureRequest {
-            issuer_pubkey: issuer_hex,
-            recipient_pubkey: recipient_hex,
-            total_debt: 1000,
-            timestamp: 1234567890,
-            emergency: true, // Emergency flag
-
-            denomination: String::new(),
-        };
+        // A fully signable state: the refusal must not depend on a missing key or note.
+        let (tracker_secret, tracker_pubkey) = generate_keypair();
+        let state = state_with_tracker_key(&tracker_pubkey, Some(&tracker_secret)).await;
+        let mut request = signable_request(&state).await;
+        request.emergency = true;
 
         let response =
             request_tracker_signature(axum::extract::State(state), axum::extract::Json(request))
                 .await;
 
-        // The emergency flag should be accepted in the request structure
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
         let body = &response.1;
-        if !body.success {
-            let default_msg = "unknown".to_string();
-            let error_msg = body.error.as_ref().unwrap_or(&default_msg);
-            assert!(
-                error_msg.contains("tracker")
-                    || error_msg.contains("Tracker")
-                    || error_msg.contains("sign")
-                    || error_msg.contains("node"),
-                "Expected tracker/signing-related error for valid request structure, got: {}",
-                error_msg
-            );
-        }
+        assert!(!body.success);
+        assert!(body.data.is_none(), "no signature may be returned");
+        let error_msg = body.error.clone().unwrap_or_default();
+        assert!(
+            error_msg.contains("emergency"),
+            "expected the emergency refusal, got: {}",
+            error_msg
+        );
+    }
+
+    /// The same request without the flag is signed: the refusal is the flag alone.
+    #[tokio::test]
+    async fn test_request_tracker_signature_non_emergency_still_signs() {
+        let (tracker_secret, tracker_pubkey) = generate_keypair();
+        let state = state_with_tracker_key(&tracker_pubkey, Some(&tracker_secret)).await;
+        let request = signable_request(&state).await;
+        assert!(!request.emergency);
+
+        let response =
+            request_tracker_signature(axum::extract::State(state), axum::extract::Json(request))
+                .await;
+
+        assert_eq!(response.0, StatusCode::OK, "{:?}", response.1.error);
+        assert!(response.1.data.as_ref().unwrap().is_emergency.is_none());
     }
 
     /// Issue #15 S4: the tracker must not sign caller-chosen (issuer, recipient,

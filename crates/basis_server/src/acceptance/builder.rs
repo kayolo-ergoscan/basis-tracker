@@ -24,6 +24,10 @@ pub enum BuilderError {
     InvalidPublicKey(String),
     #[error("Invalid public key length: expected 33 bytes, got {0}")]
     InvalidPublicKeyLength(usize),
+    /// Round 4 (C1): a path from the root longer than this many predicates. Fails closed:
+    /// the tree is not built at all.
+    #[error("Predicate tree deeper than {0} levels")]
+    TooDeep(usize),
 }
 
 /// Builder for constructing predicate trees from configuration
@@ -31,11 +35,15 @@ pub struct PredicateBuilder {
     predicates: BTreeMap<String, Box<dyn NotePredicate>>,
     config_map: BTreeMap<String, PredicateConfig>,
     building: HashSet<String>,
+    /// The last predicate of the list: the root when none is named (the documented
+    /// convention, also used by the redemption-time evaluator).
+    last_name: Option<String>,
 }
 
 impl PredicateBuilder {
     /// Create a new builder from configuration
     pub fn new(config: AcceptanceConfig) -> Self {
+        let last_name = config.predicates.last().map(|p| p.name().to_string());
         let mut config_map = BTreeMap::new();
         for pred in config.predicates {
             config_map.insert(pred.name().to_string(), pred);
@@ -45,6 +53,7 @@ impl PredicateBuilder {
             predicates: BTreeMap::new(),
             config_map,
             building: HashSet::new(),
+            last_name,
         }
     }
 
@@ -57,20 +66,33 @@ impl PredicateBuilder {
             return Ok(None);
         }
 
-        // Find root predicate - use explicit root if specified,
-        // otherwise use the last predicate in the list
+        // Find root predicate - use explicit root if specified, otherwise the last predicate
+        // in the list (not the alphabetically last name: the redemption-time evaluator uses
+        // the list order, and both must evaluate the same root).
         let root_name = match root_name {
             Some(name) => name.to_string(),
-            None => self.config_map.keys().last().cloned().unwrap(),
+            None => self
+                .last_name
+                .clone()
+                .unwrap_or_else(|| self.config_map.keys().last().cloned().unwrap()),
         };
 
-        let root = self.build_predicate(&root_name)?;
+        let root = self.build_predicate(&root_name, 1)?;
 
         Ok(Some(root))
     }
 
-    /// Build a specific predicate by name
-    fn build_predicate(&mut self, name: &str) -> Result<Box<dyn NotePredicate>, BuilderError> {
+    /// Build a specific predicate by name; `depth` is its level below the root (the root is 1).
+    fn build_predicate(
+        &mut self,
+        name: &str,
+        depth: usize,
+    ) -> Result<Box<dyn NotePredicate>, BuilderError> {
+        // Round 4 (C1): fail closed on a deep tree before recursing any further.
+        if depth > super::validate::MAX_POLICY_DEPTH {
+            return Err(BuilderError::TooDeep(super::validate::MAX_POLICY_DEPTH));
+        }
+
         // Check if already built
         if let Some(_pred) = self.predicates.get(name) {
             // We need to clone here, but NotePredicate doesn't support Clone
@@ -119,21 +141,21 @@ impl PredicateBuilder {
                 name,
                 predicates: refs,
             } => {
-                let sub_preds = self.build_sub_predicates(&refs)?;
+                let sub_preds = self.build_sub_predicates(&refs, depth)?;
                 Ok(Box::new(AllOfPredicate::new(name, sub_preds)) as Box<dyn NotePredicate>)
             }
             PredicateConfig::AnyOf {
                 name,
                 predicates: refs,
             } => {
-                let sub_preds = self.build_sub_predicates(&refs)?;
+                let sub_preds = self.build_sub_predicates(&refs, depth)?;
                 Ok(Box::new(AnyOfPredicate::new(name, sub_preds)) as Box<dyn NotePredicate>)
             }
             PredicateConfig::Not {
                 name,
                 predicate: ref_name,
             } => {
-                let inner = self.build_predicate(&ref_name)?;
+                let inner = self.build_predicate(&ref_name, depth + 1)?;
                 Ok(Box::new(NotPredicate::new(name, inner)) as Box<dyn NotePredicate>)
             }
             PredicateConfig::NoPendingRefund { name } => {
@@ -152,14 +174,15 @@ impl PredicateBuilder {
         result
     }
 
-    /// Build multiple sub-predicates
+    /// Build the sub-predicates of a composite at `depth`
     fn build_sub_predicates(
         &mut self,
         refs: &[String],
+        depth: usize,
     ) -> Result<Vec<Box<dyn NotePredicate>>, BuilderError> {
         let mut result = Vec::with_capacity(refs.len());
         for ref_name in refs {
-            result.push(self.build_predicate(ref_name)?);
+            result.push(self.build_predicate(ref_name, depth + 1)?);
         }
         Ok(result)
     }
@@ -1052,6 +1075,55 @@ mod tests {
             format!("{}", err),
             "Invalid public key length: expected 33 bytes, got 5"
         );
+    }
+
+    /// Round 4 (C1): the builder refuses a tree deeper than MAX_POLICY_DEPTH (fails closed)
+    /// whatever reached it, and builds one exactly that deep.
+    #[test]
+    fn the_builder_refuses_a_tree_deeper_than_the_limit() {
+        let chain = |depth: usize| {
+            let mut predicates = Vec::new();
+            for i in 0..depth - 1 {
+                predicates.push(PredicateConfig::Not {
+                    name: format!("n{i}"),
+                    predicate: format!("n{}", i + 1),
+                });
+            }
+            predicates.push(PredicateConfig::NoPendingRefund {
+                name: format!("n{}", depth - 1),
+            });
+            AcceptanceConfig {
+                root: Some("n0".to_string()),
+                default: DefaultPolicy::Reject,
+                predicates,
+            }
+        };
+        let max = super::super::validate::MAX_POLICY_DEPTH;
+        assert!(build_predicate_tree(chain(max)).unwrap().is_some());
+        assert!(matches!(
+            build_predicate_tree(chain(max + 1)),
+            Err(BuilderError::TooDeep(m)) if m == max
+        ));
+    }
+
+    /// Without a named root the builder takes the last predicate of the list, like the
+    /// redemption-time evaluator, not the alphabetically last name.
+    #[test]
+    fn the_implicit_root_is_the_last_predicate_of_the_list() {
+        let config = AcceptanceConfig {
+            root: None,
+            default: DefaultPolicy::Reject,
+            predicates: vec![
+                PredicateConfig::NoPendingRefund {
+                    name: "zz_first".to_string(),
+                },
+                PredicateConfig::NoPendingRefund {
+                    name: "aa_last".to_string(),
+                },
+            ],
+        };
+        let root = build_predicate_tree(config).unwrap().unwrap();
+        assert_eq!(root.name(), "aa_last");
     }
 
     #[test]

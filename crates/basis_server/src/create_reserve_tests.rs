@@ -68,6 +68,11 @@ mod create_reserve_tests {
                 reserve_creation_max_erg_nano: 10_000_000_000,
                 reserve_creation_max_token_amount: 1_000_000_000,
                 redemption_build_max_per_pair_per_hour: 60,
+                redemption_build_max_per_recipient_per_hour: 30,
+                notes_require_reserve: false,
+                notes_max_recipients_per_issuer: 50,
+                notes_max_updates_per_issuer_per_hour: 120,
+                notes_max_new_edges_per_hour: 1000,
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -144,6 +149,7 @@ mod create_reserve_tests {
             redemption_build_rate: std::sync::Arc::new(
                 crate::redemption_build::BuildRateLimiter::new(),
             ),
+            note_limits: std::sync::Arc::new(crate::note_limits::NoteLimiter::new()),
         }
     }
 
@@ -259,6 +265,80 @@ mod create_reserve_tests {
                 );
                 assert!(reserve_response.fee > 0); // Should be the configured fee amount
             }
+        }
+    }
+
+    /// Every register of the payload is exactly one canonical sigma constant, in lowercase hex:
+    /// it parses, and serializing the parsed constant gives back the payload's bytes, with no
+    /// trailing bytes (R7 used to be `0500` followed by 8 zero bytes). Checked for an ERG and a
+    /// token reserve, with the owner key in upper case.
+    #[tokio::test]
+    async fn test_create_reserve_payload_registers_are_canonical_constants() {
+        use ergo_lib::ergotree_ir::mir::constant::Constant;
+        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+        let owner = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let reserve_nft = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let token_id = "a55b8735ed1a99e46c2c89f8994aacdf4b1109bdcf682f1e5b34479c6e392669";
+        let mut erg_request = request(reserve_nft);
+        erg_request.owner_pubkey = owner.to_uppercase();
+        let token_request = CreateReserveRequest {
+            nft_id: reserve_nft.to_string(),
+            owner_pubkey: owner.to_string(),
+            erg_amount: 10_000_000,
+            token_amount: 1000,
+            token_id: token_id.to_string(),
+        };
+
+        for (state, payload) in [
+            (create_test_app_state(), erg_request),
+            (create_token_test_app_state(), token_request),
+        ] {
+            let tracker_nft = state.config.ergo.tracker_nft_id.clone().unwrap();
+            let (status, body) = create_reserve_payload(State(state), Json(payload)).await;
+            assert_eq!(status, StatusCode::OK, "{body:?}");
+            let response = body.data.clone().unwrap();
+            let registers = &response.requests[0].registers;
+            let mut ids: Vec<&String> = registers.keys().collect();
+            ids.sort();
+            assert_eq!(ids, ["R4", "R5", "R6", "R7"]);
+
+            for (id, value) in registers {
+                assert_eq!(value, &value.to_lowercase(), "{id} must be lowercase hex");
+                let bytes = hex::decode(value).unwrap();
+                let constant = Constant::sigma_parse_bytes(&bytes)
+                    .unwrap_or_else(|e| panic!("{id} = {value} does not parse: {e}"));
+                assert_eq!(
+                    constant.sigma_serialize_bytes().unwrap(),
+                    bytes,
+                    "{id} = {value} must be exactly one constant, with no trailing bytes"
+                );
+            }
+            assert_eq!(registers["R4"], format!("07{owner}"));
+            assert_eq!(registers["R6"], format!("0e20{}", tracker_nft.to_lowercase()));
+            assert_eq!(registers["R7"], "0500");
+            assert_eq!(
+                Constant::sigma_parse_bytes(&hex::decode(&registers["R7"]).unwrap()).unwrap(),
+                Constant::from(0i64)
+            );
+        }
+    }
+
+    /// An owner key that is 33 bytes but not a compressed point (or is the identity) is refused:
+    /// R4 would lock the collateral under a key nobody, or everybody, can prove.
+    #[tokio::test]
+    async fn test_create_reserve_payload_rejects_an_owner_key_off_the_curve() {
+        let reserve_nft = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        for owner in [
+            format!("05{}", "11".repeat(32)),
+            "00".repeat(33),
+            format!("02{}", "ff".repeat(32)),
+        ] {
+            let mut payload = request(reserve_nft);
+            payload.owner_pubkey = owner.clone();
+            let (status, body) = create_reserve_payload(State(create_test_app_state()), Json(payload)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{owner}: {body:?}");
+            assert!(body.error.clone().unwrap().contains("owner_pubkey"), "{owner}: {body:?}");
         }
     }
 

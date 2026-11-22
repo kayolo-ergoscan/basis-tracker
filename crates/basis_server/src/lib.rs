@@ -7,6 +7,7 @@ pub mod authorization;
 pub mod config;
 pub mod local_wallet;
 pub mod models;
+pub mod note_limits;
 pub mod redemption_build;
 pub mod reserve_api;
 pub mod store;
@@ -14,6 +15,10 @@ pub mod tracker_box_updater;
 
 #[cfg(test)]
 mod create_reserve_tests;
+#[cfg(test)]
+mod note_route_tests;
+#[cfg(test)]
+mod redemption_build_e2e_tests;
 
 use tokio::sync::Mutex;
 
@@ -55,6 +60,8 @@ pub struct AppState {
     /// The tracker pays the fee inputs of every build out of its own wallet, so an unbounded
     /// caller could drain it one fee at a time (PR #16 M1).
     pub redemption_build_rate: std::sync::Arc<redemption_build::BuildRateLimiter>,
+    /// The `POST /notes` caps (`server.notes_max_*`) and their admission lock (round 4, C3).
+    pub note_limits: std::sync::Arc<note_limits::NoteLimiter>,
     // Note: tracker_scanner is not stored here due to Send trait bounds
     // Tracker box ID is fetched from tracker_storage directly
 }
@@ -247,7 +254,14 @@ pub enum TrackerCommand {
             std::collections::HashMap<[u8; 32], basis_store::NoteConfirmation>,
         >,
     },
-    /// Mark all currently-local notes as pending for an in-flight update tx.
+    /// Bring the live tree up to date (one rebuild however many notes arrived since the last
+    /// one) and answer its digest: the digest the updater commits. Also refreshes the shared
+    /// digest that `/tracker/state` and the proof routes report.
+    RefreshDigest {
+        response_tx: tokio::sync::oneshot::Sender<[u8; 33]>,
+    },
+    /// Mark the notes behind `digest` (the digest the in-flight update tx commits) as pending
+    /// for it; notes posted after the digest was read stay local.
     MarkNotesPending {
         digest: [u8; 33],
         tx_id: String,

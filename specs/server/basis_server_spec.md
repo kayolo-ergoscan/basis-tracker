@@ -60,7 +60,9 @@ fjall keyspace waits up to one fsync interval to close.
 ### Core Endpoints
 
 - `GET /` - Root endpoint returning "Hello, Basis Tracker API!"
-- `POST /notes` - Create a new IOU note
+- `POST /notes` - Create a new IOU note. With `server.notes_require_reserve` (default true) the
+  issuer needs one active reserve under this tracker in the note's denomination (409 otherwise);
+  `server.notes_max_*` caps answer 429 (see `docs/CONFIGURATION.md`)
 - `GET /notes` - Get all IOU notes in the system (Admin role)
 - `GET /notes/issuer/{pubkey}` - Get all notes issued by a public key
 - `GET /notes/recipient/{pubkey}` - Get all notes received by a public key
@@ -72,7 +74,11 @@ fjall keyspace waits up to one fsync interval to close.
 - `POST /tracker/signature` - Request tracker signature for redemption (real Schnorr signature generation)
 - `POST /redemption/prepare` - Prepare redemption with all necessary data (real AVL proofs + tracker signature)
 - `POST /redemption/build` - Tracker-assisted redemption step 1: build the unsigned redemption
-  transaction and sign the fee inputs
+  transaction for a recipient-signed request (`request_timestamp`, `receiver_signature` over
+  `"basis-build-v1" ‖ trackerNft ‖ issuer ‖ recipient ‖ denominationId ‖ amount ‖ timestamp`);
+  ERG reserves pay the miner fee out of the payout (only the reserve is spent, the tracker signs
+  nothing, `fee_paid_by: "recipient"`), token reserves use tracker-signed fee inputs
+  (`fee_paid_by: "tracker"`)
 - `POST /redemption/submit` - Tracker-assisted redemption step 2: broadcast a signed redemption
   transaction and sync local state
 - `GET /proof/redemption` - Get redemption-specific proof with tracker state digest
@@ -97,7 +103,11 @@ fjall keyspace waits up to one fsync interval to close.
 ### Acceptance Policy Endpoints
 
 - `POST /acceptance/check` - Check whether a hypothetical note would be accepted by the issuer's policy
-- `POST /acceptance/policy` - Upload or replace an acceptance policy
+- `POST /acceptance/policy` - Upload or replace an acceptance policy. Validated before it is
+  stored (round 4, C1): JSON at most 8 KiB, explicit `root`, unique names, a reference tree
+  in which every predicate is referenced once and reachable from the root, depth at most 8, at
+  most 32 predicates, 16 references per composite and 256 holders. Stored policies are
+  re-checked at startup and invalid ones dropped with a warning
 - `GET /acceptance/policy/{pubkey}` - Get the stored acceptance policy for a public key
 
 ### Configuration Endpoints
@@ -173,7 +183,8 @@ The `/tracker/signature` endpoint accepts requests with the following structure:
 - `recipient_pubkey`: Public key of the note recipient (hex-encoded, 33 bytes)
 - `total_debt`: Total cumulative debt amount in nanoERG — must equal the stored note's total debt (rejected with 409 otherwise)
 - `timestamp`: Payment timestamp of the note — must equal the stored note's timestamp (rejected with 409 otherwise)
-- `emergency`: Boolean indicating if this is an emergency redemption (tracker signature optional after 3 days)
+- `emergency`: must be `false` or omitted; `true` is refused with HTTP 400 (an emergency redemption
+  needs no tracker signature: after 3 days the contract accepts an empty context var #6)
 
 ### Tracker Signature Response Structure
 
@@ -182,7 +193,8 @@ The `/tracker/signature` endpoint returns responses with the following structure
 - `tracker_signature`: 65-byte Schnorr signature (hex-encoded, 130 characters) proving tracker authorization
 - `tracker_pubkey`: Tracker's public key (hex-encoded, 66 characters)
 - `message_signed`: The hex-encoded message that was signed
-  - Normal and emergency: `hash(issuerKey||recipientKey) || longToByteArray(totalDebt) || longToByteArray(timestamp) || trackerNftId` (80 bytes)
+  - `hash(issuerKey||recipientKey) || longToByteArray(totalDebt) || longToByteArray(timestamp) || trackerNftId` (80 bytes)
+- `is_emergency`: always `null` (kept for compatibility)
 
 ### Redemption Preparation Request Structure
 
@@ -332,12 +344,16 @@ Key configuration includes:
 - **`server.reserve_creation_max_erg_nano`** / **`server.reserve_creation_max_token_amount`**:
   caps on the collateral a single `/reserves/create` payload may lock (defaults 10 ERG and 1e9
   tokens); larger requests are rejected with HTTP 400.
-- **`server.redemption_build_max_per_pair_per_hour`**: per-(issuer, recipient) rate limit on
-  `POST /redemption/build` (default 60/hour, rolling window); excess requests get HTTP 429.
+- **`server.redemption_build_max_per_pair_per_hour`** / **`server.redemption_build_max_per_recipient_per_hour`**:
+  per-(issuer, recipient) and per-recipient rate limits on `POST /redemption/build` (defaults 60
+  and 30 per hour, rolling window); excess requests get HTTP 429. Only requests whose
+  `receiver_signature` verifies and that pass the cheap checks (committed outstanding debt,
+  issuer signature, minimum payout) are counted, so nobody but the recipient can spend them.
 - **`server.redemption_build_max_per_issuer_per_hour`** / **`server.redemption_build_max_per_hour`**:
-  per-issuer and total caps on the builds that get as far as signing fee inputs (defaults 6 and
-  30 per hour, rolling window); excess requests get HTTP 429. Requests that fail before signing
-  (no note, no reserve) do not use these budgets.
+  per-issuer and total caps on the builds that get as far as signing tracker fee inputs (token
+  reserves only; defaults 6 and 30 per hour, rolling window); excess requests get HTTP 429.
+  Requests that fail before signing (no note, no reserve) and ERG-reserve builds (the fee comes out
+  of the payout, no tracker input) do not use these budgets.
 - **`transaction.commit_reserve_nano`**: token-free nanoERG kept at the tracker address for
   commits and heartbeats (default 0.1 ERG; 0 disables). A build that would leave less there gets
   HTTP 503.

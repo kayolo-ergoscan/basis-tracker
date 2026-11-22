@@ -26,6 +26,27 @@ pub fn signing_message(
     )
 }
 
+/// Message the receiver signs to request a redemption build (`POST /redemption/build`):
+/// `"basis-build-v1" || trackerNftId(32) || issuer(33) || receiver(33) || denominationId (UTF-8)
+/// || amount(8 BE) || requestTimestamp(8 BE, ms)`. See [`basis_core::types::build_request_message`].
+pub fn build_request_message(
+    tracker_nft_id: &[u8; 32],
+    issuer_key: &PubKey,
+    receiver_key: &PubKey,
+    denomination: &crate::DenomKey,
+    amount: u64,
+    request_timestamp_ms: u64,
+) -> Vec<u8> {
+    basis_core::types::build_request_message(
+        tracker_nft_id,
+        issuer_key,
+        receiver_key,
+        denomination,
+        amount,
+        request_timestamp_ms,
+    )
+}
+
 /// Validate that a public key is a valid compressed secp256k1 point
 pub fn validate_public_key(pubkey: &PubKey) -> Result<(), NoteError> {
     match basis_core::impls::validate_public_key(pubkey) {

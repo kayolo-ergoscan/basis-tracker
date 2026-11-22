@@ -79,13 +79,33 @@ struct EvalEnv<'a> {
     holder_total_debt: u64,
 }
 
-/// Evaluate a single predicate by name against the environment.
+/// Evaluate a single predicate by name against the environment, `depth` levels below the
+/// root (the root is 1).
 ///
 /// `Collateralization` leaves are evaluated against the simulated collateral/debt
 /// values; all other leaf kinds are unaffected by someone else's redemption and are
 /// evaluated against their current values. Composite predicates preserve the
 /// AllOf/AnyOf/Not semantics of the runtime predicates.
-fn eval_predicate(configs: &BTreeMap<String, &PredicateConfig>, name: &str, env: &EvalEnv) -> bool {
+///
+/// `None` when the tree is invalid: a missing reference, or deeper than
+/// `validate::MAX_POLICY_DEPTH` (round 4, C1). `None` propagates to the top, where
+/// [`eval_config`] rejects: inside the tree a `Not` would turn a failure into an accept. For
+/// the same reason every child of a composite is evaluated, so no short circuit hides an
+/// invalid sibling.
+fn eval_predicate(
+    configs: &BTreeMap<String, &PredicateConfig>,
+    name: &str,
+    env: &EvalEnv,
+    depth: usize,
+) -> Option<bool> {
+    if depth > super::validate::MAX_POLICY_DEPTH {
+        tracing::warn!(
+            "Redemption policy check: predicate tree deeper than {} levels at '{}'",
+            super::validate::MAX_POLICY_DEPTH,
+            name
+        );
+        return None;
+    }
     let config = match configs.get(name) {
         Some(c) => c,
         None => {
@@ -93,42 +113,38 @@ fn eval_predicate(configs: &BTreeMap<String, &PredicateConfig>, name: &str, env:
                 "Redemption policy check: missing predicate reference '{}'",
                 name
             );
-            return false;
+            return None;
         }
     };
+    let children = |refs: &[String]| -> Option<Vec<bool>> {
+        refs.iter()
+            .map(|p| eval_predicate(configs, p, env, depth + 1))
+            .collect()
+    };
 
-    match config {
+    Some(match config {
         PredicateConfig::Whitelist {
             holders, max_debt, ..
         } => {
-            if !holders_contain(holders, env.issuer_pubkey) {
-                return false;
-            }
-            if let Some(max) = max_debt {
-                if env.holder_total_debt > *max {
-                    return false;
+            holders_contain(holders, env.issuer_pubkey)
+                && match max_debt {
+                    Some(max) => env.holder_total_debt <= *max,
+                    None => true,
                 }
-            }
-            true
         }
         PredicateConfig::Blacklist { holders, .. } => !holders_contain(holders, env.issuer_pubkey),
         PredicateConfig::Collateralization { min_ratio, .. } => {
-            if env.debt == 0 {
-                // No debt means fully collateralized (same as CollateralizationPredicate)
-                return true;
-            }
-            let ratio = env.collateral as f64 / env.debt as f64;
-            ratio >= *min_ratio
+            // No debt means fully collateralized (same as CollateralizationPredicate)
+            env.debt == 0 || env.collateral as f64 / env.debt as f64 >= *min_ratio
         }
-        PredicateConfig::AllOf { predicates, .. } => {
-            predicates.iter().all(|p| eval_predicate(configs, p, env))
+        PredicateConfig::AllOf { predicates, .. } => children(predicates)?.into_iter().all(|v| v),
+        // An empty any_of rejects.
+        PredicateConfig::AnyOf { predicates, .. } => children(predicates)?.into_iter().any(|v| v),
+        PredicateConfig::Not { predicate, .. } => {
+            !eval_predicate(configs, predicate, env, depth + 1)?
         }
-        PredicateConfig::AnyOf { predicates, .. } => {
-            !predicates.is_empty() && predicates.iter().any(|p| eval_predicate(configs, p, env))
-        }
-        PredicateConfig::Not { predicate, .. } => !eval_predicate(configs, predicate, env),
         PredicateConfig::NoPendingRefund { .. } => !env.refund_pending,
-    }
+    })
 }
 
 /// Evaluate an `AcceptanceConfig` tree against the environment
@@ -154,7 +170,8 @@ fn eval_config(config: &AcceptanceConfig, env: &EvalEnv) -> bool {
             .unwrap_or_default(),
     };
 
-    eval_predicate(&configs, &root_name, env)
+    // Round 4 (C1): an invalid tree rejects, as a corrupt stored policy does.
+    eval_predicate(&configs, &root_name, env, 1).unwrap_or(false)
 }
 
 /// The effective policy resolved for a holder
@@ -1265,6 +1282,63 @@ mod tests {
             !resolved.acceptable(&relaxed_env()),
             "a corrupt stored policy must fail closed even when the global default is Accept"
         );
+    }
+
+    /// Round 4 (C1): a stored policy deeper than MAX_POLICY_DEPTH (one stored before the
+    /// validation existed) rejects instead of recursing, and a `Not` above the failure does
+    /// not turn it into an accept.
+    #[test]
+    fn a_too_deep_stored_policy_fails_closed_even_under_not() {
+        let store = test_storage();
+        let global = global_config_with_default(DefaultPolicy::Accept);
+        let depth = super::super::validate::MAX_POLICY_DEPTH + 1;
+        // n0 = not(n1), ..., the last a no_pending_refund leaf (true in relaxed_env): an odd
+        // number of `not`s above it would accept if the guard answered `false` in place.
+        let mut predicates = Vec::new();
+        for i in 0..depth - 1 {
+            predicates.push(format!(
+                r#"{{"type":"not","name":"n{i}","predicate":"n{}"}}"#,
+                i + 1
+            ));
+        }
+        predicates.push(format!(r#"{{"type":"no_pending_refund","name":"n{}"}}"#, depth - 1));
+        let policy = format!(r#"{{"root":"n0","predicates":[{}]}}"#, predicates.join(","));
+        store
+            .storage
+            .store_policy(&test_pubkey(HOLDER_A), &policy, "sig")
+            .expect("store deep policy");
+
+        let resolved = resolve_effective_policy(&store.storage, &test_pubkey(HOLDER_A), &global);
+        assert!(!resolved.acceptable(&relaxed_env()));
+
+        // A cycle (rejected at upload, but stored before) ends at the guard too.
+        store
+            .storage
+            .store_policy(
+                &test_pubkey(HOLDER_A),
+                r#"{"root":"a","predicates":[{"type":"not","name":"a","predicate":"a"}]}"#,
+                "sig",
+            )
+            .expect("store cyclic policy");
+        let resolved = resolve_effective_policy(&store.storage, &test_pubkey(HOLDER_A), &global);
+        assert!(!resolved.acceptable(&relaxed_env()));
+    }
+
+    /// A missing reference under `not` rejects instead of accepting.
+    #[test]
+    fn a_missing_reference_under_not_fails_closed() {
+        let store = test_storage();
+        let global = global_config_with_default(DefaultPolicy::Accept);
+        store
+            .storage
+            .store_policy(
+                &test_pubkey(HOLDER_A),
+                r#"{"root":"a","predicates":[{"type":"not","name":"a","predicate":"gone"}]}"#,
+                "sig",
+            )
+            .expect("store policy");
+        let resolved = resolve_effective_policy(&store.storage, &test_pubkey(HOLDER_A), &global);
+        assert!(!resolved.acceptable(&relaxed_env()));
     }
 
     #[test]

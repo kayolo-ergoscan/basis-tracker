@@ -113,7 +113,7 @@ A redemption transaction has the following structure:
           "R4": "0703issuer_pubkey_hex...",
           "R5": "hex_encoded_updated_avl_tree_root_digest",
           "R6": "0e20tracker_nft_id_hex",
-          "R7": "05000000000000000000"
+          "R7": "0500"
         }
       },
       {
@@ -216,7 +216,7 @@ A redemption transaction has the following structure:
         "R4": "02d1b60084a5af8dc3e006802a36dddfd09684eaf90164a5ad978b6e9b97eb328b",
         "R5": "b2c3d4e5f6789012345678901234567890123456789012345678901234567890",
         "R6": "69c5d7a4df2e72252b0015d981876fe338ca240d5576d4e731dfd848ae18fe2b",
-        "R7": "05000000000000000000"
+        "R7": "0500"
       }
     }
   ],
@@ -262,7 +262,7 @@ A redemption transaction has the following structure:
         "R4": "02d1b60084a5af8dc3e006802a36dddfd09684eaf90164a5ad978b6e9b97eb328b",
         "R5": "c3d4e5f678901234567890123456789012345678901234567890123456789012",
         "R6": "69c5d7a4df2e72252b0015d981876fe338ca240d5576d4e731dfd848ae18fe2b",
-        "R7": "05000000000000000000"
+        "R7": "0500"
       }
     }
   ],

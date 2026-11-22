@@ -89,12 +89,19 @@ pub async fn get_reserves_by_issuer(
     let scanner = state.ergo_scanner.lock().await;
     let reserve_storage = scanner.reserve_storage();
 
+    // Round 4 (C10): compare normalized keys, so an upper-case or 07-prefixed path finds the
+    // issuer's reserves (the stored key is lower-case hex without the prefix).
+    let wanted = basis_store::normalize_public_key(&pubkey_hex.to_ascii_lowercase());
+
     // Get all reserves from database and filter by issuer
     match reserve_storage.get_all_reserves() {
         Ok(all_reserves) => {
             let reserves: Vec<SerializableReserveInfo> = all_reserves
                 .into_iter()
-                .filter(|reserve| reserve.owner_pubkey == pubkey_hex)
+                .filter(|reserve| {
+                    basis_store::normalize_public_key(&reserve.owner_pubkey.to_ascii_lowercase())
+                        == wanted
+                })
                 .map(|info| {
                     let collateralization_ratio = info.collateralization_ratio();
                     SerializableReserveInfo {

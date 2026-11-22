@@ -58,11 +58,15 @@ pub struct ServerConfig {
     /// token-reserve mode. Default: 1_000_000_000.
     #[serde(default = "default_reserve_creation_max_token_amount")]
     pub reserve_creation_max_token_amount: u64,
-    /// Maximum `/redemption/build` calls per (issuer, recipient) pair per hour.
-    /// Bounds the fee cost a self-redeeming user can impose on the tracker
-    /// wallet (the tracker pays the fee inputs). Default: 60.
+    /// Maximum `/redemption/build` calls per (issuer, recipient) pair per hour. Counted only
+    /// for requests the recipient signed (`receiver_signature`) that pass the cheap checks, so
+    /// nobody else can use up a pair's budget. Default: 60.
     #[serde(default = "default_redemption_build_max_per_pair_per_hour")]
     pub redemption_build_max_per_pair_per_hour: u32,
+    /// Maximum `/redemption/build` calls per verified recipient per hour, all issuers
+    /// together. Counted with the per-pair cap. Default: 30.
+    #[serde(default = "default_redemption_build_max_per_recipient_per_hour")]
+    pub redemption_build_max_per_recipient_per_hour: u32,
     /// Maximum `/redemption/build` calls per issuer per hour that get as far as signing fee
     /// inputs. Default: 6.
     #[serde(default = "default_redemption_build_max_per_issuer_per_hour")]
@@ -71,6 +75,24 @@ pub struct ServerConfig {
     /// signing fee inputs. Default: 30.
     #[serde(default = "default_redemption_build_max_per_hour")]
     pub redemption_build_max_per_hour: u32,
+    /// `POST /notes` accepts a note only when its issuer has an active reserve under this
+    /// tracker: tracked, bound to this tracker's NFT, in the note's denomination, the only one
+    /// there, and not in refund (409 otherwise). Default: true. `false` allows credit without a
+    /// reserve.
+    #[serde(default = "default_notes_require_reserve")]
+    pub notes_require_reserve: bool,
+    /// Maximum distinct recipients of one issuer; a note to a new recipient beyond it gets 429.
+    /// Default: 50.
+    #[serde(default = "default_notes_max_recipients_per_issuer")]
+    pub notes_max_recipients_per_issuer: u32,
+    /// Maximum accepted notes (new or raised) of one issuer per rolling hour; 429 beyond.
+    /// Default: 120.
+    #[serde(default = "default_notes_max_updates_per_issuer_per_hour")]
+    pub notes_max_updates_per_issuer_per_hour: u32,
+    /// Maximum new (issuer, recipient, denomination) edges per rolling hour, all issuers
+    /// together; 429 beyond. Default: 1000.
+    #[serde(default = "default_notes_max_new_edges_per_hour")]
+    pub notes_max_new_edges_per_hour: u32,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -87,8 +109,13 @@ impl std::fmt::Debug for ServerConfig {
             reserve_creation_max_erg_nano,
             reserve_creation_max_token_amount,
             redemption_build_max_per_pair_per_hour,
+            redemption_build_max_per_recipient_per_hour,
             redemption_build_max_per_issuer_per_hour,
             redemption_build_max_per_hour,
+            notes_require_reserve,
+            notes_max_recipients_per_issuer,
+            notes_max_updates_per_issuer_per_hour,
+            notes_max_new_edges_per_hour,
         } = self;
         f.debug_struct("ServerConfig")
             .field("host", host)
@@ -113,6 +140,10 @@ impl std::fmt::Debug for ServerConfig {
                 redemption_build_max_per_pair_per_hour,
             )
             .field(
+                "redemption_build_max_per_recipient_per_hour",
+                redemption_build_max_per_recipient_per_hour,
+            )
+            .field(
                 "redemption_build_max_per_issuer_per_hour",
                 redemption_build_max_per_issuer_per_hour,
             )
@@ -120,6 +151,16 @@ impl std::fmt::Debug for ServerConfig {
                 "redemption_build_max_per_hour",
                 redemption_build_max_per_hour,
             )
+            .field("notes_require_reserve", notes_require_reserve)
+            .field(
+                "notes_max_recipients_per_issuer",
+                notes_max_recipients_per_issuer,
+            )
+            .field(
+                "notes_max_updates_per_issuer_per_hour",
+                notes_max_updates_per_issuer_per_hour,
+            )
+            .field("notes_max_new_edges_per_hour", notes_max_new_edges_per_hour)
             .finish()
     }
 }
@@ -134,6 +175,27 @@ fn default_reserve_creation_max_token_amount() -> u64 {
 
 fn default_redemption_build_max_per_pair_per_hour() -> u32 {
     60
+}
+
+/// Default `[server] redemption_build_max_per_recipient_per_hour`.
+pub fn default_redemption_build_max_per_recipient_per_hour() -> u32 {
+    30
+}
+
+pub fn default_notes_require_reserve() -> bool {
+    true
+}
+
+pub fn default_notes_max_recipients_per_issuer() -> u32 {
+    50
+}
+
+pub fn default_notes_max_updates_per_issuer_per_hour() -> u32 {
+    120
+}
+
+pub fn default_notes_max_new_edges_per_hour() -> u32 {
+    1000
 }
 
 /// Default `[server] redemption_build_max_per_issuer_per_hour`.
@@ -1208,6 +1270,12 @@ mod tests {
                 reserve_creation_max_token_amount: default_reserve_creation_max_token_amount(),
                 redemption_build_max_per_pair_per_hour:
                     default_redemption_build_max_per_pair_per_hour(),
+                redemption_build_max_per_recipient_per_hour:
+                    default_redemption_build_max_per_recipient_per_hour(),
+                notes_require_reserve: default_notes_require_reserve(),
+                notes_max_recipients_per_issuer: default_notes_max_recipients_per_issuer(),
+                notes_max_updates_per_issuer_per_hour: default_notes_max_updates_per_issuer_per_hour(),
+                notes_max_new_edges_per_hour: default_notes_max_new_edges_per_hour(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1302,6 +1370,12 @@ mod tests {
                 reserve_creation_max_token_amount: default_reserve_creation_max_token_amount(),
                 redemption_build_max_per_pair_per_hour:
                     default_redemption_build_max_per_pair_per_hour(),
+                redemption_build_max_per_recipient_per_hour:
+                    default_redemption_build_max_per_recipient_per_hour(),
+                notes_require_reserve: default_notes_require_reserve(),
+                notes_max_recipients_per_issuer: default_notes_max_recipients_per_issuer(),
+                notes_max_updates_per_issuer_per_hour: default_notes_max_updates_per_issuer_per_hour(),
+                notes_max_new_edges_per_hour: default_notes_max_new_edges_per_hour(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1452,6 +1526,12 @@ mod tests {
                 reserve_creation_max_token_amount: default_reserve_creation_max_token_amount(),
                 redemption_build_max_per_pair_per_hour:
                     default_redemption_build_max_per_pair_per_hour(),
+                redemption_build_max_per_recipient_per_hour:
+                    default_redemption_build_max_per_recipient_per_hour(),
+                notes_require_reserve: default_notes_require_reserve(),
+                notes_max_recipients_per_issuer: default_notes_max_recipients_per_issuer(),
+                notes_max_updates_per_issuer_per_hour: default_notes_max_updates_per_issuer_per_hour(),
+                notes_max_new_edges_per_hour: default_notes_max_new_edges_per_hour(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },

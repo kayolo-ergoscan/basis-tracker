@@ -32,6 +32,7 @@ use ergo_lib::chain::ergo_state_context::ErgoStateContext;
 use ergo_lib::chain::transaction::unsigned::UnsignedTransaction;
 use ergo_lib::chain::transaction::Transaction;
 use ergo_lib::ergo_chain_types::Header;
+use ergo_lib::ergotree_interpreter::sigma_protocol::prover::ProofBytes;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::wallet::secret_key::SecretKey;
@@ -60,16 +61,19 @@ pub struct RedemptionBuildRequest {
     pub issuer_pubkey: String,
     pub recipient_pubkey: String,
     pub amount: u64,
-    /// Legacy field, ignored by the server: the stored note's payment timestamp
-    /// is used for the signature, context extension, and reserve tree value
+    /// Legacy field, ignored by the server (and optional): the stored note's payment
+    /// timestamp is used for the signature, context extension, and reserve tree value
     /// (issue #15 S4 — never sign caller-supplied values).
+    #[serde(default)]
     pub timestamp: u64,
     /// Issuer's 65-byte Schnorr signature (hex) over
     /// `signing_message(issuer || receiver || totalDebt || timestamp)`.
     pub issuer_signature: String,
     #[serde(default)]
     pub emergency: bool,
-    /// Optional tracker box id; fetched from storage if omitted.
+    /// Optional tracker box id. Used only when it equals a tracker box id the tracker itself
+    /// knows (its live or last confirmed box); any other value is ignored, so caller input
+    /// never reaches a node request.
     #[serde(default)]
     pub tracker_box_id: Option<String>,
     /// Deprecated and ignored. Change always goes to the owner of the tracker's
@@ -81,6 +85,17 @@ pub struct RedemptionBuildRequest {
     /// resolution: the pair's existing note's denomination when unambiguous, else "erg".
     #[serde(default)]
     pub denomination: String,
+    /// REQUIRED. When the recipient signed this request, in milliseconds since the Unix epoch.
+    /// Must be within [`BUILD_REQUEST_MAX_SKEW_MS`] of the tracker's clock and greater than the
+    /// recipient's previous build request.
+    #[serde(default)]
+    pub request_timestamp: u64,
+    /// REQUIRED. The recipient's 65-byte Basis Schnorr signature (hex) over
+    /// [`basis_store::schnorr::build_request_message`]`(tracker NFT, issuer, recipient,
+    /// denomination, amount, request_timestamp)`. Only the recipient can ask for a build, so
+    /// nobody else can spend the pair's build budget.
+    #[serde(default)]
+    pub receiver_signature: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,7 +128,16 @@ pub struct RedemptionBuildResponse {
     /// `/redemption/submit` so the tracker can sync its local reserve tree with the value
     /// that was actually proven on-chain.
     pub new_already_redeemed: u64,
+    /// Who pays the miner fee: `"recipient"` (ERG reserves: the fee comes out of the payout,
+    /// the transaction spends only the reserve and the tracker signs nothing) or `"tracker"`
+    /// (token reserves: tracker fee inputs, signed in `partial_tx`).
+    pub fee_paid_by: String,
 }
+
+/// `fee_paid_by` of an ERG-reserve build: the miner fee comes out of the payout.
+pub const FEE_PAID_BY_RECIPIENT: &str = "recipient";
+/// `fee_paid_by` of a token-reserve build: the tracker's fee inputs pay the fee.
+pub const FEE_PAID_BY_TRACKER: &str = "tracker";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RedemptionSubmitRequest {
@@ -333,7 +357,9 @@ fn parse_broadcast_tx_id(body: &str) -> String {
 /// How long a pending redemption entry stays usable after `/redemption/build`.
 ///
 /// Generous enough for a client to sign and submit, short enough that a captured build
-/// response is not a standing capability.
+/// response is not a standing capability. A newer build for the same (issuer, recipient,
+/// denomination) replaces the entry earlier (see [`PendingRedemptionRegistry::record`]), so a
+/// build that is never submitted (a dry run) neither waits out this time nor blocks the next.
 pub const PENDING_REDEMPTION_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Largest number of outstanding pending entries. Each entry is small and the map is pruned
@@ -391,6 +417,13 @@ pub struct PendingRedemption {
 }
 
 impl PendingRedemption {
+    /// Whether `other` redeems the same note: the same (issuer, recipient, denomination).
+    fn redeems_same_note(&self, other: &PendingRedemption) -> bool {
+        self.issuer_pubkey.eq_ignore_ascii_case(&other.issuer_pubkey)
+            && self.recipient_pubkey.eq_ignore_ascii_case(&other.recipient_pubkey)
+            && self.denomination == other.denomination
+    }
+
     /// Create an entry stamped with the current time.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -431,11 +464,18 @@ impl PendingRedemptionRegistry {
 
     /// Record a pending redemption for `fingerprint`, valid for [`PENDING_REDEMPTION_TTL`].
     ///
+    /// The entry REPLACES any pending entry for the same (issuer, recipient, denomination): only
+    /// the newest build of a note can be submitted. Only the recipient can ask for a build (its
+    /// signature is checked first), so nobody else can retire a recipient's build this way, and a
+    /// build that is never submitted (a dry run, a lost response) does not hold a slot or block
+    /// the next build for the pair.
+    ///
     /// Returns false when the registry is full, which the caller should surface as a
     /// "try again" rather than silently dropping the entry.
     pub fn record(&self, fingerprint: UnsignedTxFingerprint, entry: PendingRedemption) -> bool {
         let mut entries = self.lock();
         Self::prune(&mut entries);
+        entries.retain(|fp, pending| *fp == fingerprint || !pending.redeems_same_note(&entry));
         if entries.len() >= MAX_PENDING_REDEMPTIONS && !entries.contains_key(&fingerprint) {
             return false;
         }
@@ -580,17 +620,30 @@ const BUILD_WINDOW_SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// bounded, and the per-issuer and total caps still bound what builds cost the tracker.
 const MAX_TRACKED_BUILD_PAIRS: usize = 10_000;
 
-/// Rolling one-hour limits for `/redemption/build`.
+/// Most recipients whose last `request_timestamp` is kept, and most recipients the
+/// per-recipient window keeps. When the timestamp table is full of recipients seen within
+/// [`BUILD_REQUEST_TIMESTAMP_RETENTION`], new recipients are refused (429) rather than an
+/// entry evicted, so a flood cannot reopen a replay window for someone else's request.
+const MAX_TRACKED_BUILD_RECIPIENTS: usize = 10_000;
+/// How long the last accepted `request_timestamp` of a recipient is kept. Anything older than
+/// twice [`BUILD_REQUEST_MAX_SKEW_MS`] fails the clock check anyway, so a replay of a forgotten
+/// request is still refused.
+pub const BUILD_REQUEST_TIMESTAMP_RETENTION: Duration = Duration::from_secs(600);
+/// How far `request_timestamp` of a build request may be from the tracker's clock, either way.
+pub const BUILD_REQUEST_MAX_SKEW_MS: u64 = 120_000;
+
+/// Rolling one-hour limits for `/redemption/build`, plus the recipients' request timestamps.
 ///
-/// The tracker pays the fee inputs of every build out of its own wallet, so an unbounded
-/// caller could drain it one fee at a time with self-redemption builds:
-/// - every attempt counts against its (issuer, recipient) pair
-///   (`server.redemption_build_max_per_pair_per_hour`, [`Self::check_and_record`]);
-/// - a build about to sign fee inputs also counts against its issuer
-///   (`server.redemption_build_max_per_issuer_per_hour`) and against all builds together
+/// Every limit counts only requests the recipient signed (`receiver_signature`) that passed the
+/// cheap local checks (the note is committed and covers the amount), so nobody else can use up
+/// a pair's or a recipient's budget, and junk never costs a node request:
+/// - every such build counts against its (issuer, recipient) pair
+///   (`server.redemption_build_max_per_pair_per_hour`) and its recipient
+///   (`server.redemption_build_max_per_recipient_per_hour`), [`Self::check_and_record`];
+/// - a build about to sign tracker fee inputs (token reserves; ERG redemptions pay the fee out
+///   of the payout and sign nothing) also counts against its issuer
+///   (`server.redemption_build_max_per_issuer_per_hour`) and against all such builds together
 ///   (`server.redemption_build_max_per_hour`), [`Self::check_and_record_fee_signing`].
-///   Requests that fail before that point (no note, no reserve) use neither budget, so they
-///   cannot lock everyone else out.
 ///
 /// Keys with no attempt in the last hour are dropped, so the maps stay bounded.
 #[derive(Debug, Default)]
@@ -601,8 +654,11 @@ pub struct BuildRateLimiter {
 #[derive(Debug, Default)]
 struct BuildWindows {
     pairs: HashMap<(String, String), Vec<Instant>>,
+    recipients: HashMap<String, Vec<Instant>>,
     issuers: HashMap<String, Vec<Instant>>,
     all: Vec<Instant>,
+    /// Last accepted `request_timestamp` of each recipient, and when it was accepted.
+    request_timestamps: HashMap<String, (u64, Instant)>,
     swept_at: Option<Instant>,
 }
 
@@ -618,11 +674,18 @@ impl BuildWindows {
             keep_recent(attempts, now);
             !attempts.is_empty()
         });
+        self.recipients.retain(|_, attempts| {
+            keep_recent(attempts, now);
+            !attempts.is_empty()
+        });
         self.issuers.retain(|_, attempts| {
             keep_recent(attempts, now);
             !attempts.is_empty()
         });
         keep_recent(&mut self.all, now);
+        self.request_timestamps.retain(|_, (_, accepted_at)| {
+            now.duration_since(*accepted_at) < BUILD_REQUEST_TIMESTAMP_RETENTION
+        });
         self.swept_at = Some(now);
     }
 
@@ -672,13 +735,64 @@ impl BuildRateLimiter {
         self.windows.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record a build attempt for `(issuer, recipient)`; returns Err when the pair has reached
-    /// `max_per_hour` builds within the last rolling hour.
+    /// Accept `request_timestamp` as the newest build request of `recipient`: Err (409) when it
+    /// is not greater than the recipient's previous accepted one, so a captured request cannot
+    /// be replayed, or (429) when the table is full of recipients seen in the last
+    /// [`BUILD_REQUEST_TIMESTAMP_RETENTION`]. Call it only after the signature verified.
+    pub fn check_and_record_request_timestamp(
+        &self,
+        recipient: &str,
+        request_timestamp: u64,
+    ) -> Result<(), (StatusCode, String)> {
+        let mut windows = self.lock();
+        let now = Instant::now();
+        windows.sweep_when_due(now);
+        let fresh = |accepted_at: &Instant| {
+            now.duration_since(*accepted_at) < BUILD_REQUEST_TIMESTAMP_RETENTION
+        };
+        match windows.request_timestamps.get(recipient) {
+            Some((previous, accepted_at)) if fresh(accepted_at) => {
+                if request_timestamp <= *previous {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!(
+                            "request_timestamp {request_timestamp} is not greater than this \
+                             recipient's previous build request ({previous}): sign every build \
+                             request with a new, later timestamp"
+                        ),
+                    ));
+                }
+            }
+            Some(_) => {}
+            None => {
+                if windows.request_timestamps.len() >= MAX_TRACKED_BUILD_RECIPIENTS {
+                    windows.sweep(now);
+                    if windows.request_timestamps.len() >= MAX_TRACKED_BUILD_RECIPIENTS {
+                        return Err((
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "too many recipients asked for redemption builds in the last \
+                             minutes; try again shortly"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        windows
+            .request_timestamps
+            .insert(recipient.to_string(), (request_timestamp, now));
+        Ok(())
+    }
+
+    /// Record a verified build for `(issuer, recipient)`; returns Err, recording nothing, when
+    /// the pair has reached `max_per_pair` or the recipient `max_per_recipient` builds within the
+    /// last rolling hour.
     pub fn check_and_record(
         &self,
         issuer: &str,
         recipient: &str,
-        max_per_hour: u32,
+        max_per_pair: u32,
+        max_per_recipient: u32,
     ) -> Result<(), String> {
         let mut windows = self.lock();
         let now = Instant::now();
@@ -697,16 +811,48 @@ impl BuildRateLimiter {
                 }
             }
         }
-        let attempts = windows.pairs.entry(key).or_default();
-        keep_recent(attempts, now);
-        if attempts.len() >= max_per_hour as usize {
+        if !windows.recipients.contains_key(recipient)
+            && windows.recipients.len() >= MAX_TRACKED_BUILD_RECIPIENTS
+        {
+            windows.sweep(now);
+            if windows.recipients.len() >= MAX_TRACKED_BUILD_RECIPIENTS {
+                let stalest = windows
+                    .recipients
+                    .iter()
+                    .min_by_key(|(_, attempts)| attempts.last().copied())
+                    .map(|(recipient, _)| recipient.clone());
+                if let Some(stalest) = stalest {
+                    windows.recipients.remove(&stalest);
+                }
+            }
+        }
+        let pair_builds = windows.pairs.get_mut(&key).map_or(0, |attempts| {
+            keep_recent(attempts, now);
+            attempts.len()
+        });
+        if pair_builds >= max_per_pair as usize {
             return Err(format!(
                 "rate limit exceeded: at most {} redemption builds per hour per \
                  (issuer, recipient) pair",
-                max_per_hour
+                max_per_pair
             ));
         }
-        attempts.push(now);
+        let recipient_builds = windows.recipients.get_mut(recipient).map_or(0, |attempts| {
+            keep_recent(attempts, now);
+            attempts.len()
+        });
+        if recipient_builds >= max_per_recipient as usize {
+            return Err(format!(
+                "rate limit exceeded: at most {} redemption builds per hour per recipient",
+                max_per_recipient
+            ));
+        }
+        windows.pairs.entry(key).or_default().push(now);
+        windows
+            .recipients
+            .entry(recipient.to_string())
+            .or_default()
+            .push(now);
         Ok(())
     }
 
@@ -803,15 +949,18 @@ fn select_fee_inputs(
     None
 }
 
-/// Checks a redemption before the tracker signs its fee inputs with its own key.
+/// Checks a built redemption before it is returned, and before the tracker signs any fee input
+/// with its own key.
 ///
 /// The fee inputs were picked from the address index (`byAddress`), which can be stale or
 /// wrong. These checks read the boxes as the node returned their bytes (`/utxo/byIdBinary`),
 /// which is what the transaction spends, so a wrong index entry (for the tracker box above
 /// all) can never get the tracker to sign away a token such as its own NFT:
 /// - `input_boxes` are exactly the boxes `unsigned` spends, in order;
-/// - every fee input (every input after the reserve, input 0) is locked by `P2PK(tracker key)`
-///   (`tracker_tree_hex`) and holds no token;
+/// - with `tracker_tree_hex` (a token redemption, whose fee the tracker pays), every fee input
+///   (every input after the reserve, input 0) is locked by `P2PK(tracker key)` and holds no
+///   token; without it (an ERG redemption, whose fee comes out of the payout) the reserve is the
+///   only input;
 /// - the transaction moves every input token to the outputs with the same total and creates
 ///   none ([`crate::local_wallet::check_tokens_preserved`]);
 ///
@@ -820,10 +969,10 @@ fn select_fee_inputs(
 /// - no output is below its minimum value (360 nanoERG per serialized byte);
 /// - every output is created at `height` (the signing context's) or below, and no lower than
 ///   any input.
-fn check_before_fee_signing(
+fn check_built_redemption(
     unsigned: &UnsignedTransaction,
     input_boxes: &[ErgoBox],
-    tracker_tree_hex: &str,
+    tracker_tree_hex: Option<&str>,
     height: u32,
 ) -> Result<(), String> {
     if input_boxes.len() != unsigned.inputs.len() {
@@ -842,13 +991,19 @@ fn check_before_fee_signing(
             ));
         }
     }
+    if tracker_tree_hex.is_none() && input_boxes.len() > 1 {
+        return Err(format!(
+            "an ERG redemption spends only the reserve, but this one has {} inputs",
+            input_boxes.len()
+        ));
+    }
     for (i, fee_box) in input_boxes.iter().enumerate().skip(1) {
         let id = String::from(fee_box.box_id());
         let tree = fee_box
             .ergo_tree
             .sigma_serialize_bytes()
             .map_err(|e| format!("fee input {i} ({id}) script: {e}"))?;
-        if !hex::encode(tree).eq_ignore_ascii_case(tracker_tree_hex) {
+        if !tracker_tree_hex.is_some_and(|t| hex::encode(tree).eq_ignore_ascii_case(t)) {
             return Err(format!(
                 "fee input {i} ({id}) is not locked by P2PK(tracker key)"
             ));
@@ -985,6 +1140,86 @@ fn api_err<T>(status: StatusCode, msg: impl Into<String>) -> ApiResult<T> {
     Err((status, Json(error_response(msg.into()))))
 }
 
+/// A node request of a build failed. SECURITY (round 4, C2): the client learns only what was
+/// being read; the node's URL, status and body go to the log.
+fn node_err<T>(what: &str, detail: impl std::fmt::Display) -> ApiResult<T> {
+    tracing::warn!("redemption build: node request for {what} failed: {detail}");
+    api_err(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("the tracker could not read {what} from its node; try again later"),
+    )
+}
+
+/// Height used by the cheap minimum-value check, before the node gives the real one: the
+/// largest a creation height can encode to, so the bound is never below the real minimum.
+const CHEAP_CHECK_HEIGHT: u32 = i32::MAX as u32;
+
+/// Milliseconds since the Unix epoch, by the tracker's clock.
+pub(crate) fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Check the recipient's signature over a build request (round 4, C2).
+///
+/// The recipient signs [`basis_store::schnorr::build_request_message`] over the tracker NFT,
+/// the issuer, the recipient, the denomination, the amount and `request_timestamp`, with the
+/// same Basis Schnorr scheme as notes. The timestamp must be within
+/// [`BUILD_REQUEST_MAX_SKEW_MS`] of `now_ms`; that it rises per recipient is checked by
+/// [`BuildRateLimiter::check_and_record_request_timestamp`] after this.
+fn verify_build_request_signature(
+    payload: &RedemptionBuildRequest,
+    tracker_nft_id: &[u8; 32],
+    recipient_pk: &basis_store::PubKey,
+    issuer_pk: &basis_store::PubKey,
+    denomination: &basis_store::DenomKey,
+    now_ms: u64,
+) -> Result<(), (StatusCode, String)> {
+    let bad = |msg: String| Err((StatusCode::BAD_REQUEST, msg));
+    if payload.receiver_signature.trim().is_empty() || payload.request_timestamp == 0 {
+        return bad(
+            "receiver_signature and request_timestamp are required: the recipient signs every \
+             build request (message \"basis-build-v1\" || tracker NFT || issuer || recipient || \
+             denomination id || amount || request_timestamp)"
+                .to_string(),
+        );
+    }
+    let signature: [u8; 65] = match hex::decode(payload.receiver_signature.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(sig) => sig,
+        None => return bad("receiver_signature must be 65-byte hex".to_string()),
+    };
+    if payload.request_timestamp.abs_diff(now_ms) > BUILD_REQUEST_MAX_SKEW_MS {
+        return bad(format!(
+            "request_timestamp {} is more than {} s away from the tracker's clock ({now_ms} ms); \
+             sign the request again with the current time",
+            payload.request_timestamp,
+            BUILD_REQUEST_MAX_SKEW_MS / 1000
+        ));
+    }
+    let message = basis_store::schnorr::build_request_message(
+        tracker_nft_id,
+        issuer_pk,
+        recipient_pk,
+        denomination,
+        payload.amount,
+        payload.request_timestamp,
+    );
+    if basis_store::schnorr::schnorr_verify(&signature, &message, recipient_pk).is_err() {
+        return bad(format!(
+            "receiver_signature does not verify: the recipient must sign this request for \
+             denomination {} (message \"basis-build-v1\" || tracker NFT || issuer || recipient \
+             || denomination id || amount || request_timestamp)",
+            denomination.denomination_id()
+        ));
+    }
+    Ok(())
+}
+
 // ----- handlers -----
 
 /// Build the unsigned redemption transaction and sign the fee input(s) locally.
@@ -1073,31 +1308,63 @@ async fn build_redemption_inner(
         }
     };
 
-    // M1: bound the fee cost a pair can impose on the tracker wallet — the tracker pays the
-    // fee inputs of every build, so an unbounded pair could drain it one fee at a time.
-    if let Err(msg) = state.redemption_build_rate.check_and_record(
-        &hex::encode(issuer_pk),
-        &hex::encode(recipient_pk),
-        state.config.server.redemption_build_max_per_pair_per_hour,
-    ) {
-        return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
+    if payload.amount == 0 {
+        return api_err(StatusCode::BAD_REQUEST, "amount must be positive");
     }
-    // The per-issuer and total caps count builds that sign fee inputs (recorded right before
-    // signing); once one is reached, stop here, before any node request.
-    if let Err(msg) = state.redemption_build_rate.check_fee_signing(
-        &hex::encode(issuer_pk),
-        state.config.server.redemption_build_max_per_issuer_per_hour,
-        state.config.server.redemption_build_max_per_hour,
+
+    // The tracker NFT binds the recipient's request signature, like every redemption
+    // signature, to this tracker.
+    let tracker_nft_id = match &state.config.ergo.tracker_nft_id {
+        Some(id) if !id.is_empty() => id.clone(),
+        _ => {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tracker NFT id not configured",
+            )
+        }
+    };
+    let tracker_nft_bytes: [u8; 32] = match hex::decode(&tracker_nft_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(b) => b,
+        None => {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tracker NFT id is not 32-byte hex",
+            )
+        }
+    };
+
+    // SECURITY (round 4, C2): only the recipient may ask for a build. Their signature over the
+    // request is checked first, before any budget is counted or the node is asked, so nobody
+    // else can use up a pair's builds or make the tracker work for them, and a captured request
+    // cannot be replayed (the timestamp must rise).
+    if let Err((status, msg)) = verify_build_request_signature(
+        payload,
+        &tracker_nft_bytes,
+        &recipient_pk,
+        &issuer_pk,
+        &denomination,
+        now_unix_ms(),
     ) {
-        return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
+        return api_err(status, msg);
+    }
+    if let Err((status, msg)) = state
+        .redemption_build_rate
+        .check_and_record_request_timestamp(&hex::encode(recipient_pk), payload.request_timestamp)
+    {
+        return api_err(status, msg);
     }
 
     let recipient_address = match pubkey_to_address(&payload.recipient_pubkey) {
         Ok(a) => a,
         Err(e) => return api_err(StatusCode::BAD_REQUEST, format!("recipient address: {e}")),
     };
-
-    let chain_node = NodeClient::chain(state);
+    let recipient_ergo_tree = match address_to_ergo_tree(&recipient_address) {
+        Ok(t) => t,
+        Err(e) => return api_err(StatusCode::BAD_REQUEST, format!("recipient tree: {e}")),
+    };
 
     // Look up the note to confirm it exists. The stored note's payment
     // timestamp is authoritative for the tracker signature, context var #4, and
@@ -1149,6 +1416,225 @@ async fn build_redemption_inner(
     {
         return api_err(StatusCode::CONFLICT, msg);
     }
+
+    // Tracker lookup proof (context var #8) + authoritative total debt.
+    // The proof is generated against the COMMITTED on-chain tracker state (the
+    // latest confirmed tracker box digest), not the live local tree: any note
+    // posted after the last commitment would otherwise change the digest and
+    // break every redemption (issue #15 S6). The total debt is the value
+    // committed on-chain for this note.
+    let (tracker_lookup_proof, total_debt) = {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state
+            .tx
+            .send(TrackerCommand::GetCommittedTrackerLookupProof {
+                issuer_pubkey,
+                recipient_pubkey,
+                denomination,
+                response_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tracker thread unavailable",
+            );
+        }
+        match rx.await {
+            Ok(Ok(proof)) => {
+                let total_debt = if proof.value.len() == 8 {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&proof.value);
+                    u64::from_be_bytes(b)
+                } else {
+                    0
+                };
+                (proof.proof, total_debt)
+            }
+            Ok(Err(basis_store::NoteError::NoteNotConfirmed)) => {
+                return api_err(
+                    StatusCode::BAD_REQUEST,
+                    "note is not committed on-chain yet; wait for the next tracker box update",
+                )
+            }
+            Ok(Err(basis_store::NoteError::StaleCommittedDebt { committed, local })) => {
+                return api_err(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "the committed tracker state for this note ({}) is ahead of its current total ({}) because a consented debt decrease (exchange) has not been committed yet; building a redemption now would over-redeem. Retry after the next tracker box update (issue #17)",
+                        committed, local
+                    ),
+                )
+            }
+            Ok(Err(e)) => {
+                return api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("tracker proof: {e:?}"),
+                )
+            }
+            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "tracker unavailable"),
+        }
+    };
+
+    // Reserve lookup proof (context var #7) and the `already_redeemed` value the reserve tree
+    // holds for this note.
+    let (reserve_lookup_proof, already_redeemed) = {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state
+            .tx
+            .send(TrackerCommand::GetReserveLookupProof {
+                issuer_pubkey,
+                recipient_pubkey,
+                denomination,
+                response_tx: tx,
+            })
+            .await
+            .is_err()
+        {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tracker thread unavailable",
+            );
+        }
+        let lookup = match rx.await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                return api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("reserve lookup proof: {e:?}"),
+                )
+            }
+            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "tracker unavailable"),
+        };
+        let already_redeemed = if lookup.value.len() == 16 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&lookup.value[8..16]);
+            u64::from_be_bytes(b)
+        } else if lookup.value.len() == 8 {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&lookup.value);
+            u64::from_be_bytes(b)
+        } else {
+            0
+        };
+        (lookup.proof, already_redeemed)
+    };
+    let is_first_redemption = already_redeemed == 0;
+    let new_already_redeemed = match already_redeemed.checked_add(payload.amount) {
+        Some(v) => v,
+        None => {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                "cumulative redeemed amount overflows u64",
+            )
+        }
+    };
+
+    // Cheap checks (round 4, C2), before any budget or node request: a build that cannot
+    // succeed on-chain stops here.
+    // 1. The contract releases at most `totalDebt - redeemedDebt` (basis.es `debtDelta`).
+    let outstanding = total_debt.saturating_sub(already_redeemed);
+    if payload.amount > outstanding {
+        return api_err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "amount {} exceeds the committed outstanding debt of this note: {outstanding} \
+                 (committed total {total_debt} minus {already_redeemed} already redeemed)",
+                payload.amount
+            ),
+        );
+    }
+    // 2. The recipient's box must be worth at least its minimum value. An ERG redemption pays
+    //    the miner fee out of the payout, so that box holds `amount - fee`. (A token redemption
+    //    gives the recipient a fixed 0.001 ERG box, always above the minimum.)
+    let token_denomination = matches!(denomination, basis_store::DenomKey::Token(_));
+    let fee = state.config.transaction_fee();
+    if !token_denomination {
+        let payout = match payload.amount.checked_sub(fee) {
+            Some(v) if v > 0 => v,
+            _ => {
+                return api_err(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "amount {} nanoERG does not cover the {fee} nanoERG miner fee, which an \
+                         ERG redemption pays out of the payout",
+                        payload.amount
+                    ),
+                )
+            }
+        };
+        match plain_box_min_value(&recipient_ergo_tree, payout, CHEAP_CHECK_HEIGHT) {
+            Ok(min) if payout < min => {
+                return api_err(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "the recipient's box would hold {payout} nanoERG (amount {} minus the \
+                         {fee} nanoERG miner fee), below its minimum value ({min} nanoERG)",
+                        payload.amount
+                    ),
+                )
+            }
+            Ok(_) => {}
+            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        }
+    }
+    // 3. The issuer signature (context var #2) must verify over the message the contract checks:
+    //    the committed total debt (var #3) and the note's timestamp (var #4).
+    let issuer_signature: [u8; 65] = match hex::decode(payload.issuer_signature.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(sig) => sig,
+        None => {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                "issuer_signature must be 65-byte hex",
+            )
+        }
+    };
+    let issuer_message = basis_store::schnorr::signing_message(
+        &issuer_pk,
+        &recipient_pk,
+        &note.denomination,
+        total_debt,
+        note.timestamp,
+        &note.tracker_nft_id,
+    );
+    if basis_store::schnorr::schnorr_verify(&issuer_signature, &issuer_message, &issuer_pk).is_err()
+    {
+        return api_err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "issuer_signature does not verify over the committed total debt ({total_debt}) \
+                 and the note's timestamp ({}): send the issuer's note signature for that total",
+                note.timestamp
+            ),
+        );
+    }
+
+    // Budgets (round 4, C2): counted per verified recipient, only for requests that passed every
+    // check above. Builds that sign tracker fee inputs (token reserves) also have a per-issuer and
+    // a total budget, recorded right before signing; once one is used up, stop before the node.
+    if let Err(msg) = state.redemption_build_rate.check_and_record(
+        &hex::encode(issuer_pk),
+        &hex::encode(recipient_pk),
+        state.config.server.redemption_build_max_per_pair_per_hour,
+        state.config.server.redemption_build_max_per_recipient_per_hour,
+    ) {
+        return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
+    }
+    if token_denomination {
+        if let Err(msg) = state.redemption_build_rate.check_fee_signing(
+            &hex::encode(issuer_pk),
+            state.config.server.redemption_build_max_per_issuer_per_hour,
+            state.config.server.redemption_build_max_per_hour,
+        ) {
+            return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
+        }
+    }
+
+    let chain_node = NodeClient::chain(state);
 
     // Select the smallest reserve that covers the redemption, leaves a valid remainder, is actually
     // unspent on-chain, AND whose on-chain R5 (reserve AVL tree) matches the tracker's current
@@ -1364,145 +1850,35 @@ async fn build_redemption_inner(
             .flatten()
             .collect()
     };
+    // SECURITY (round 4, C2): a caller's `tracker_box_id` is used only when it is one of the
+    // tracker boxes the tracker knows itself, so caller input never reaches a node URL.
     let tracker_box_id = match (&payload.tracker_box_id, known_tracker_box_ids.first()) {
-        (Some(id), _) => id.clone(),
-        (None, Some(id)) => id.clone(),
-        (None, None) => {
+        (_, None) => {
             return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "no tracker box in live state",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the tracker box is not known yet (the tracker has just started); retry shortly",
             )
         }
+        (Some(requested), Some(default)) => {
+            match known_tracker_box_ids
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(requested.trim()))
+            {
+                Some(known) => known.clone(),
+                None => {
+                    tracing::warn!(
+                        "ignoring a caller tracker_box_id that is not a known tracker box: {:?}",
+                        requested.chars().take(80).collect::<String>()
+                    );
+                    default.clone()
+                }
+            }
+        }
+        (None, Some(default)) => default.clone(),
     };
 
-    let tracker_nft_id = match &state.config.ergo.tracker_nft_id {
-        Some(id) if !id.is_empty() => id.clone(),
-        _ => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "tracker NFT id not configured",
-            )
-        }
-    };
-
-    // Tracker lookup proof (context var #8) + authoritative total debt.
-    // The proof is generated against the COMMITTED on-chain tracker state (the
-    // latest confirmed tracker box digest), not the live local tree: any note
-    // posted after the last commitment would otherwise change the digest and
-    // break every redemption (issue #15 S6). The total debt is the value
-    // committed on-chain for this note.
-    let (tracker_lookup_proof, total_debt) = {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if state
-            .tx
-            .send(TrackerCommand::GetCommittedTrackerLookupProof {
-                issuer_pubkey,
-                recipient_pubkey,
-                denomination,
-                response_tx: tx,
-            })
-            .await
-            .is_err()
-        {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "tracker thread unavailable",
-            );
-        }
-        match rx.await {
-            Ok(Ok(proof)) => {
-                let total_debt = if proof.value.len() == 8 {
-                    let mut b = [0u8; 8];
-                    b.copy_from_slice(&proof.value);
-                    u64::from_be_bytes(b)
-                } else {
-                    0
-                };
-                (proof.proof, total_debt)
-            }
-            Ok(Err(basis_store::NoteError::NoteNotConfirmed)) => {
-                return api_err(
-                    StatusCode::BAD_REQUEST,
-                    "note is not committed on-chain yet; wait for the next tracker box update",
-                )
-            }
-            Ok(Err(basis_store::NoteError::StaleCommittedDebt { committed, local })) => {
-                return api_err(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "the committed tracker state for this note ({}) is ahead of its current total ({}) because a consented debt decrease (exchange) has not been committed yet; building a redemption now would over-redeem. Retry after the next tracker box update (issue #17)",
-                        committed, local
-                    ),
-                )
-            }
-            Ok(Err(e)) => {
-                return api_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("tracker proof: {e:?}"),
-                )
-            }
-            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "tracker unavailable"),
-        }
-    };
-
-    // Reserve proofs (insert #5, lookup #7, new R5 digest) plus the cumulative
-    // `already_redeemed` value placed into the reserve tree by this redemption.
-    let (
-        reserve_lookup_proof,
-        insert_proof,
-        new_reserve_digest,
-        is_first_redemption,
-        new_already_redeemed,
-    ) = {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if state
-            .tx
-            .send(TrackerCommand::GetReserveLookupProof {
-                issuer_pubkey,
-                recipient_pubkey,
-                denomination,
-                response_tx: tx,
-            })
-            .await
-            .is_err()
-        {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "tracker thread unavailable",
-            );
-        }
-        let lookup = match rx.await {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                return api_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("reserve lookup proof: {e:?}"),
-                )
-            }
-            Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "tracker unavailable"),
-        };
-        let already_redeemed = if lookup.value.len() == 16 {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&lookup.value[8..16]);
-            u64::from_be_bytes(b)
-        } else if lookup.value.len() == 8 {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&lookup.value);
-            u64::from_be_bytes(b)
-        } else {
-            0
-        };
-        let is_first = already_redeemed == 0;
-        let new_already_redeemed = match already_redeemed.checked_add(payload.amount) {
-            Some(v) => v,
-            None => {
-                return api_err(
-                    StatusCode::BAD_REQUEST,
-                    "cumulative redeemed amount overflows u64",
-                )
-            }
-        };
-
+    // Reserve insert proof (context var #5) and the new reserve tree digest (output R5).
+    let (insert_proof, new_reserve_digest) = {
         let (itx, irx) = tokio::sync::oneshot::channel();
         if state
             .tx
@@ -1522,7 +1898,7 @@ async fn build_redemption_inner(
                 "tracker thread unavailable",
             );
         }
-        let (insert_bytes, new_digest) = match irx.await {
+        match irx.await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 return api_err(
@@ -1531,24 +1907,6 @@ async fn build_redemption_inner(
                 )
             }
             Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "tracker unavailable"),
-        };
-        (
-            lookup.proof,
-            insert_bytes,
-            new_digest,
-            is_first,
-            new_already_redeemed,
-        )
-    };
-
-    // Issuer signature (context var #2) supplied by the caller.
-    let issuer_signature = match hex::decode(payload.issuer_signature.trim()) {
-        Ok(b) if b.len() == 65 => b,
-        _ => {
-            return api_err(
-                StatusCode::BAD_REQUEST,
-                "issuer_signature must be 65-byte hex",
-            )
         }
     };
 
@@ -1595,18 +1953,13 @@ async fn build_redemption_inner(
     // be minutes old, below the creation height of a fee box from the latest commit.
     let state_context = match chain_node.state_context().await {
         Ok(context) => context,
-        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("headers: {e}")),
+        Err(e) => return node_err("the last block headers", e),
     };
     let current_height = state_context.pre_header.height;
 
     let reserve_box = match chain_node.box_details(&reserve_box_id).await {
         Ok(b) => b,
-        Err(e) => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("reserve box: {e}"),
-            )
-        }
+        Err(e) => return node_err("the reserve box", e),
     };
     let reserve_nft_id = reserve_box
         .assets
@@ -1616,65 +1969,85 @@ async fn build_redemption_inner(
 
     // Token-backed reserves preserve the reserve's ERG value and move reserve tokens.
     let is_token_reserve = !reserve_token_id.is_empty();
+    if is_token_reserve != token_denomination {
+        return api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the selected reserve does not hold the note's denomination",
+        );
+    }
+    // SECURITY (round 4, C2): an ERG redemption pays the miner fee out of the payout. The
+    // reserve releases `amount`, the recipient's box gets `amount - fee` and the fee box `fee`;
+    // the transaction spends only the reserve, so the tracker signs nothing and spends nothing.
+    // contract/basis.es allows it: the redeem path bounds only what leaves the reserve
+    // (`redeemed = SELF.value - selfOut.value`, `redeemed <= debtDelta`, basis.es:382-385) and
+    // requires `proveDlog(receiver)` (basis.es:426), so the receiver signs these outputs; no
+    // output other than the reserve's own is checked. A token reserve must keep its ERG value
+    // (basis-token.es), so token redemptions still take the fee and the recipient's box value
+    // from tracker fee inputs, under the fee-signing budgets.
+    let fee_from_payout = !is_token_reserve;
 
-    let fee = state.config.transaction_fee();
-    // For token reserves the fee inputs must also fund the recipient's min-value ERG box.
-    let fee_input_required = if is_token_reserve {
-        fee.saturating_add(TOKEN_RECIPIENT_MIN_VALUE_NANOERG)
+    // Fee inputs (token reserves only) are signed below with the tracker secret, so they come
+    // from the tracker's own P2PK address (public byAddress index, token-free boxes only).
+    let (fee_boxes, fee_total, fee_funds_seen, tracker_tree_hex) = if fee_from_payout {
+        (Vec::new(), 0u64, 0u64, None)
     } else {
-        fee
-    };
-    // Fee inputs are signed below with the tracker secret, so they come from the tracker's own
-    // P2PK address (public byAddress index, token-free boxes only).
-    let tracker_pubkey_for_fees = match state.config.tracker_public_key_bytes() {
-        Ok(Some(p)) => p,
-        _ => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "tracker public key not configured",
-            )
-        }
-    };
-    // Never a fee input: the tracker box (it holds the tracker NFT) and the reserve box, even if
-    // the address index lists one of them as a plain box. The parsed boxes are checked again
-    // before signing (`check_before_fee_signing`).
-    let fee_exclusions: Vec<&str> = known_tracker_box_ids
-        .iter()
-        .map(String::as_str)
-        .chain([tracker_box_id.as_str(), reserve_box_id.as_str()])
-        .collect();
-    // The scan reads on until it has counted the reserve kept for commits on top of what this
-    // build spends, so the fee floor below can be checked from the boxes it returns.
-    let commit_reserve = state.config.transaction.commit_reserve_nano;
-    let scan_enough = fee_input_required
-        .saturating_add(commit_reserve)
-        .saturating_add(FEE_FLOOR_SCAN_MARGIN);
-    let wallet_boxes = match chain_node
-        .tracker_fee_boxes(&tracker_pubkey_for_fees, scan_enough, &fee_exclusions)
-        .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("tracker fee boxes: {e}"),
-            )
-        }
-    };
-    let (fee_boxes, fee_total) =
-        match select_fee_inputs(&wallet_boxes, fee_input_required, &reserve_box_id) {
-            Some(v) => v,
-            None => {
+        // The fee inputs must also fund the recipient's min-value ERG box.
+        let fee_input_required = fee.saturating_add(TOKEN_RECIPIENT_MIN_VALUE_NANOERG);
+        let tracker_pubkey_for_fees = match state.config.tracker_public_key_bytes() {
+            Ok(Some(p)) => p,
+            _ => {
                 return api_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!(
-                        "no token-free boxes at the tracker address covering {fee_input_required} nanoERG fee"
-                    ),
+                    "tracker public key not configured",
                 )
             }
         };
+        // Never a fee input: the tracker box (it holds the tracker NFT) and the reserve box,
+        // even if the address index lists one of them as a plain box. The parsed boxes are
+        // checked again before signing (`check_built_redemption`).
+        let fee_exclusions: Vec<&str> = known_tracker_box_ids
+            .iter()
+            .map(String::as_str)
+            .chain([tracker_box_id.as_str(), reserve_box_id.as_str()])
+            .collect();
+        // The scan reads on until it has counted the reserve kept for commits on top of what
+        // this build spends, so the fee floor below can be checked from the boxes it returns.
+        let commit_reserve = state.config.transaction.commit_reserve_nano;
+        let scan_enough = fee_input_required
+            .saturating_add(commit_reserve)
+            .saturating_add(FEE_FLOOR_SCAN_MARGIN);
+        let wallet_boxes = match chain_node
+            .tracker_fee_boxes(&tracker_pubkey_for_fees, scan_enough, &fee_exclusions)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => return node_err("the tracker's fee boxes", e),
+        };
+        let (fee_boxes, fee_total) =
+            match select_fee_inputs(&wallet_boxes, fee_input_required, &reserve_box_id) {
+                Some(v) => v,
+                None => {
+                    return api_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "no token-free boxes at the tracker address covering {fee_input_required} nanoERG fee"
+                        ),
+                    )
+                }
+            };
+        let fee_funds_seen = wallet_boxes
+            .iter()
+            .fold(0u64, |acc, b| acc.saturating_add(b.value));
+        (
+            fee_boxes,
+            fee_total,
+            fee_funds_seen,
+            Some(crate::local_wallet::p2pk_tree_hex(&tracker_pubkey_for_fees)),
+        )
+    };
 
-    // Change address: the owner of the first selected fee box (which we sign), else config/recipient.
+    // Change address (token reserves): the owner of the first selected fee box (which we sign),
+    // else config/recipient.
     // SECURITY: change always goes back to the tracker's own address.
     //
     // The fee inputs come from the TRACKER's address (`select_fee_inputs` over byAddress boxes)
@@ -1684,20 +2057,22 @@ async fn build_redemption_inner(
     //
     // `change_address` is still accepted on the wire for compatibility, but it is IGNORED. The
     // configured change address wins; the fee box's own tree is the fallback when nothing is set.
-    let change_address = match &payload.change_address {
-        Some(a) => {
+    // An ERG redemption has no change (no fee inputs): its change address is empty.
+    let change_address = match (fee_boxes.first(), &payload.change_address) {
+        (None, _) => String::new(),
+        (Some(first_fee_box), Some(a)) => {
             tracing::warn!(
-                "Ignoring caller-supplied change_address ({}): redemption change always returns to \
-                 the tracker's configured address.",
-                a
+                "Ignoring caller-supplied change_address ({:?}): redemption change always returns \
+                 to the tracker's configured address.",
+                a.chars().take(120).collect::<String>()
             );
             state
                 .config
                 .get_change_address()
-                .or_else(|_| ergo_tree_to_p2pk_address(&fee_boxes[0].ergo_tree))
+                .or_else(|_| ergo_tree_to_p2pk_address(&first_fee_box.ergo_tree))
                 .unwrap_or_else(|_| recipient_address.clone())
         }
-        None => ergo_tree_to_p2pk_address(&fee_boxes[0].ergo_tree)
+        (Some(first_fee_box), None) => ergo_tree_to_p2pk_address(&first_fee_box.ergo_tree)
             .or_else(|_| state.config.get_change_address().map_err(|e| e.to_string()))
             .unwrap_or_else(|_| recipient_address.clone()),
     };
@@ -1788,17 +2163,17 @@ async fn build_redemption_inner(
             )
         }
     }
-    let recipient_ergo_tree = match address_to_ergo_tree(&recipient_address) {
-        Ok(t) => t,
-        Err(e) => return api_err(StatusCode::BAD_REQUEST, format!("recipient tree: {e}")),
-    };
-    let change_ergo_tree = match address_to_ergo_tree(&change_address) {
-        Ok(t) => t,
-        Err(e) => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("change tree: {e}"),
-            )
+    let change_ergo_tree = if change_address.is_empty() {
+        None
+    } else {
+        match address_to_ergo_tree(&change_address) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                return api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("change tree: {e}"),
+                )
+            }
         }
     };
 
@@ -1856,25 +2231,27 @@ async fn build_redemption_inner(
             );
         }
         let reserve_assets = json!([{ "tokenId": reserve_nft_id, "amount": 1 }]);
+        // The fee comes out of the payout; the cheap checks above made sure `amount > fee`.
         (
             reserve_output_value,
             reserve_assets,
-            payload.amount,
+            payload.amount - fee,
             json!([]),
-            fee_total.saturating_sub(fee),
+            0,
         )
     };
 
     // The node rejects an output below its minimum value (360 nanoERG per serialized byte).
-    // The recipient of an ERG redemption gets `amount` itself, so a smaller amount is refused.
+    // The recipient of an ERG redemption gets `amount - fee`, so a smaller payout is refused
+    // (checked at the real height; the cheap check above used a height bound).
     if !is_token_reserve {
         match plain_box_min_value(&recipient_ergo_tree, recipient_output_value, current_height) {
             Ok(min) if recipient_output_value < min => {
                 return api_err(
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "amount {recipient_output_value} nanoERG is below the minimum value of \
-                         the recipient's box ({min} nanoERG)"
+                        "the recipient's box would hold {recipient_output_value} nanoERG, below \
+                         its minimum value ({min} nanoERG)"
                     ),
                 )
             }
@@ -1884,29 +2261,30 @@ async fn build_redemption_inner(
     }
     // Change that cannot form a box goes to the miner fee, as in the tracker's own commits: a
     // fee box worth the fee plus 1 nanoERG no longer makes the build fail or the node reject it.
-    let (fee, change_amount) =
-        match fee_and_change(fee, change_amount, &change_ergo_tree, current_height) {
+    let (fee, change_amount) = match &change_ergo_tree {
+        Some(change_tree) => match fee_and_change(fee, change_amount, change_tree, current_height) {
             Ok(v) => v,
             Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
-        };
+        },
+        None => (fee, 0),
+    };
 
     // Commits and heartbeats pay from the same token-free boxes: never leave less than
     // `[transaction] commit_reserve_nano` there.
-    let tracker_tree_hex = crate::local_wallet::p2pk_tree_hex(&tracker_pubkey_for_fees);
-    let fee_funds_seen = wallet_boxes
-        .iter()
-        .fold(0u64, |acc, b| acc.saturating_add(b.value));
-    let change_back = if change_ergo_tree.eq_ignore_ascii_case(&tracker_tree_hex) {
-        change_amount
-    } else {
-        0
-    };
-    if let Some(msg) = fee_floor_refusal(fee_funds_seen, fee_total, change_back, commit_reserve) {
-        tracing::warn!("Refusing a redemption build: {msg}");
-        return api_err(StatusCode::SERVICE_UNAVAILABLE, msg);
+    if let Some(tracker_tree_hex) = &tracker_tree_hex {
+        let change_back = match &change_ergo_tree {
+            Some(t) if t.eq_ignore_ascii_case(tracker_tree_hex) => change_amount,
+            _ => 0,
+        };
+        let commit_reserve = state.config.transaction.commit_reserve_nano;
+        if let Some(msg) = fee_floor_refusal(fee_funds_seen, fee_total, change_back, commit_reserve)
+        {
+            tracing::warn!("Refusing a redemption build: {msg}");
+            return api_err(StatusCode::SERVICE_UNAVAILABLE, msg);
+        }
     }
 
-    // Inputs: reserve (index 0) then fee inputs.
+    // Inputs: reserve (index 0) then fee inputs (token reserves only).
     let mut inputs = vec![json!({ "boxId": reserve_box_id, "extension": context_extension })];
     for fb in &fee_boxes {
         inputs.push(json!({ "boxId": fb.box_id, "extension": json!({}) }));
@@ -1940,10 +2318,10 @@ async fn build_redemption_inner(
             "additionalRegisters": {}
         }),
     ];
-    if change_amount > 0 {
+    if let (Some(change_tree), true) = (&change_ergo_tree, change_amount > 0) {
         outputs.push(json!({
             "value": change_amount,
-            "ergoTree": change_ergo_tree,
+            "ergoTree": change_tree,
             "creationHeight": current_height,
             "assets": [],
             "additionalRegisters": {}
@@ -1959,35 +2337,20 @@ async fn build_redemption_inner(
     // Reorder reserve-input extension into Scala ContextExtension order before parsing.
     reorder_reserve_extension_scala(&mut unsigned_tx);
 
-    // Parse boxes for local fee signing.
+    // The boxes as the node serializes them: what the transaction spends and reads.
     let reserve_box_binary = match chain_node.box_binary(&reserve_box_id).await {
         Ok(b) => b,
-        Err(e) => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("reserve bin: {e}"),
-            )
-        }
+        Err(e) => return node_err("the reserve box bytes", e),
     };
     let tracker_box_binary = match chain_node.box_binary(&tracker_box_id).await {
         Ok(b) => b,
-        Err(e) => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("tracker bin: {e}"),
-            )
-        }
+        Err(e) => return node_err("the tracker box bytes", e),
     };
     let mut fee_binaries = Vec::with_capacity(fee_boxes.len());
     for fb in &fee_boxes {
         match chain_node.box_binary(&fb.box_id).await {
             Ok(b) => fee_binaries.push(b),
-            Err(e) => {
-                return api_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("fee bin {}: {e}", fb.box_id),
-                )
-            }
+            Err(e) => return node_err("a fee box's bytes", e),
         }
     }
 
@@ -2027,83 +2390,109 @@ async fn build_redemption_inner(
     input_boxes.extend(fee_eboxes);
     let data_boxes = vec![tracker_ebox];
 
-    if let Err(e) =
-        check_before_fee_signing(&unsigned, &input_boxes, &tracker_tree_hex, current_height)
-    {
-        tracing::error!("Refusing to sign the fee inputs of redemption {built_tx_id}: {e}");
+    if let Err(e) = check_built_redemption(
+        &unsigned,
+        &input_boxes,
+        tracker_tree_hex.as_deref(),
+        current_height,
+    ) {
+        tracing::error!("Refusing redemption build {built_tx_id}: {e}");
         return api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("refusing to sign the fee inputs: {e}"),
+            format!("refusing the built redemption: {e}"),
         );
-    }
-    if let Err(msg) = state.redemption_build_rate.check_and_record_fee_signing(
-        &hex::encode(issuer_pk),
-        state.config.server.redemption_build_max_per_issuer_per_hour,
-        state.config.server.redemption_build_max_per_hour,
-    ) {
-        return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
 
     let pre_header = state_context.pre_header.clone();
     let headers_array = state_context.headers.clone();
 
-    // Sign the fee input(s) locally with the tracker secret.
-    let fee_secret = match state.config.tracker_secret_key_bytes() {
-        Some(s) => s,
-        None => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "tracker secret key not configured",
-            )
-        }
-    };
-    let fee_sk = match SecretKey::dlog_from_bytes(&fee_secret) {
-        Some(sk) => sk,
-        None => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "invalid tracker dlog secret",
-            )
-        }
-    };
-
-    let n_inputs = unsigned.inputs.len();
-    let mut partial: Option<ergo_lib::chain::transaction::Transaction> = None;
-    for fee_idx in 1..n_inputs {
-        match add_input_proof(
-            &unsigned,
-            partial.as_ref(),
-            &input_boxes,
-            &data_boxes,
-            &pre_header,
-            &headers_array,
-            fee_idx,
-            &fee_sk,
+    let partial: Transaction = if fee_from_payout {
+        // Nothing to sign: the only input is the reserve, which the recipient proves. The
+        // partial transaction carries the context extension and empty proofs, the base the
+        // client splices the reserve proof into.
+        match Transaction::from_unsigned_tx(
+            unsigned.clone(),
+            vec![ProofBytes::Empty; unsigned.inputs.len()],
         ) {
-            Ok(tx) => partial = Some(tx),
+            Ok(tx) => tx,
             Err(e) => {
                 return api_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("fee input {fee_idx} signing: {e:?}"),
+                    format!("partial tx: {e}"),
                 )
             }
         }
-    }
+    } else {
+        if let Err(msg) = state.redemption_build_rate.check_and_record_fee_signing(
+            &hex::encode(issuer_pk),
+            state.config.server.redemption_build_max_per_issuer_per_hour,
+            state.config.server.redemption_build_max_per_hour,
+        ) {
+            return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
+        }
 
-    if let Some(ref tx) = partial {
-        if let Err(e) = verify_fee_input_proofs(tx, &input_boxes, &data_boxes, &state_context) {
+        // Sign the fee input(s) locally with the tracker secret.
+        let fee_secret = match state.config.tracker_secret_key_bytes() {
+            Some(s) => s,
+            None => {
+                return api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "tracker secret key not configured",
+                )
+            }
+        };
+        let fee_sk = match SecretKey::dlog_from_bytes(&fee_secret) {
+            Some(sk) => sk,
+            None => {
+                return api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid tracker dlog secret",
+                )
+            }
+        };
+
+        let n_inputs = unsigned.inputs.len();
+        let mut partial: Option<Transaction> = None;
+        for fee_idx in 1..n_inputs {
+            match add_input_proof(
+                &unsigned,
+                partial.as_ref(),
+                &input_boxes,
+                &data_boxes,
+                &pre_header,
+                &headers_array,
+                fee_idx,
+                &fee_sk,
+            ) {
+                Ok(tx) => partial = Some(tx),
+                Err(e) => {
+                    return api_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("fee input {fee_idx} signing: {e:?}"),
+                    )
+                }
+            }
+        }
+        let partial = match partial {
+            Some(tx) => tx,
+            None => {
+                return api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "a token redemption has no fee input to sign",
+                )
+            }
+        };
+        if let Err(e) = verify_fee_input_proofs(&partial, &input_boxes, &data_boxes, &state_context)
+        {
             tracing::error!("Fee inputs of redemption {built_tx_id} do not verify: {e}");
             return api_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("fee input proofs do not verify: {e}"),
             );
         }
-    }
-
-    let partial_tx = match partial {
-        Some(ref tx) => serde_json::to_value(tx).unwrap_or(Value::Null),
-        None => unsigned_tx.clone(), // no fee inputs (fee covered by reserve? not expected)
+        partial
     };
+    let partial_tx = serde_json::to_value(&partial).unwrap_or(Value::Null);
 
     let mut input_box_binaries = vec![reserve_box_binary];
     input_box_binaries.extend(fee_binaries);
@@ -2125,6 +2514,12 @@ async fn build_redemption_inner(
         is_first_redemption,
         fee,
         new_already_redeemed,
+        fee_paid_by: if fee_from_payout {
+            FEE_PAID_BY_RECIPIENT
+        } else {
+            FEE_PAID_BY_TRACKER
+        }
+        .to_string(),
     };
 
     // SECURITY (PR #16 B6): bind the future /redemption/submit to this exact build. The submit
@@ -2146,8 +2541,8 @@ async fn build_redemption_inner(
         PendingRedemption::new(
             built_tx_id,
             response.reserve_box_id.clone(),
-            payload.issuer_pubkey.clone(),
-            payload.recipient_pubkey.clone(),
+            hex::encode(issuer_pk),
+            hex::encode(recipient_pk),
             payload.amount,
             new_already_redeemed,
             new_reserve_digest.clone(),
@@ -2233,10 +2628,19 @@ pub async fn submit_redemption(
     let tx_id = match node.broadcast(&payload.signed_tx).await {
         Ok(tx_id) => tx_id,
         Err(e) => {
+            // SECURITY (round 4, C2): the node's URL and answer stay in the log.
+            tracing::warn!(
+                "redemption {} broadcast failed: {e}",
+                pending.unsigned_tx_id
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(error_response(format!("broadcast failed: {e}"))),
-            )
+                Json(error_response(format!(
+                    "the node did not accept redemption {}; build it again with \
+                     POST /redemption/build",
+                    pending.unsigned_tx_id
+                ))),
+            );
         }
     };
 
@@ -2482,6 +2886,55 @@ mod tests {
         assert_eq!(entry.new_already_redeemed, 2_000);
     }
 
+    /// A newer build of the same note (issuer, recipient, denomination; keys in any case)
+    /// replaces the pending entry: the older one is refused like an expired one (409). Builds
+    /// of other notes are kept.
+    #[test]
+    fn a_new_build_replaces_the_pending_entry_of_the_same_note() {
+        let registry = PendingRedemptionRegistry::new();
+        let (first_fp, first_signed) = recorded(&registry);
+
+        // Another note of the same issuer (another recipient), and the same pair in a token.
+        let other_recipient = PendingRedemption {
+            recipient_pubkey: "cc".repeat(33),
+            ..pending_entry(&built_redemption().0)
+        };
+        assert!(registry.record([1u8; 32], other_recipient));
+        let token = PendingRedemption {
+            denomination: basis_store::DenomKey::Token([0x33; 32]),
+            ..pending_entry(&built_redemption().0)
+        };
+        assert!(registry.record([2u8; 32], token));
+        assert_eq!(registry.len(), 3);
+
+        // A second build of the first note, keys in upper case.
+        let (second_unsigned, second_signed) = tx_pair(
+            &[RESERVE_BOX, FUNDING_BOX],
+            vec![
+                output(P2PK_TREE, 8_000_000_000, Some(&[0x11; 33])),
+                output(P2PK_TREE, 2_000_000_000, None),
+            ],
+        );
+        let second_fp = unsigned_tx_fingerprint(&second_unsigned).unwrap();
+        assert_ne!(second_fp, first_fp);
+        let second = PendingRedemption {
+            issuer_pubkey: "AA".repeat(33),
+            recipient_pubkey: "BB".repeat(33),
+            ..pending_entry(&second_unsigned)
+        };
+        assert!(registry.record(second_fp, second));
+        assert_eq!(registry.len(), 3, "replaced, not added");
+
+        let err = registry
+            .validate_and_consume(&first_fp, &first_signed)
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(registry
+            .validate_and_consume(&second_fp, &second_signed)
+            .is_ok());
+        assert_eq!(registry.len(), 2, "the other notes' entries are untouched");
+    }
+
     #[test]
     fn pending_entry_unknown_fingerprint_is_conflict() {
         let registry = PendingRedemptionRegistry::new();
@@ -2600,14 +3053,14 @@ mod tests {
     #[test]
     fn build_rate_limiter_allows_up_to_limit_then_rejects() {
         let limiter = BuildRateLimiter::new();
-        assert!(limiter.check_and_record("issuer", "recipient", 2).is_ok());
-        assert!(limiter.check_and_record("issuer", "recipient", 2).is_ok());
+        assert!(limiter.check_and_record("issuer", "recipient", 2, u32::MAX).is_ok());
+        assert!(limiter.check_and_record("issuer", "recipient", 2, u32::MAX).is_ok());
         let err = limiter
-            .check_and_record("issuer", "recipient", 2)
+            .check_and_record("issuer", "recipient", 2, u32::MAX)
             .unwrap_err();
         assert!(err.contains("rate limit exceeded"), "got: {err}");
         // A different pair is unaffected.
-        assert!(limiter.check_and_record("issuer", "other", 2).is_ok());
+        assert!(limiter.check_and_record("issuer", "other", 2, u32::MAX).is_ok());
     }
 
     #[test]
@@ -2620,7 +3073,7 @@ mod tests {
                 vec![Instant::now() - Duration::from_secs(3601)],
             );
         }
-        assert!(limiter.check_and_record("issuer", "recipient", 1).is_ok());
+        assert!(limiter.check_and_record("issuer", "recipient", 1, u32::MAX).is_ok());
     }
 
     fn an_hour_ago() -> Instant {
@@ -2640,7 +3093,7 @@ mod tests {
                     .insert((format!("old-{i}"), "r".to_string()), vec![an_hour_ago()]);
             }
         }
-        limiter.check_and_record("issuer", "recipient", 5).unwrap();
+        limiter.check_and_record("issuer", "recipient", 5, u32::MAX).unwrap();
         assert_eq!(limiter.windows.lock().unwrap().pairs.len(), 1, "swept");
 
         // Fill the window with pairs that built within the hour.
@@ -2655,7 +3108,7 @@ mod tests {
             }
             assert_eq!(windows.pairs.len(), MAX_TRACKED_BUILD_PAIRS);
         }
-        limiter.check_and_record("new", "pair", 5).unwrap();
+        limiter.check_and_record("new", "pair", 5, u32::MAX).unwrap();
         let windows = limiter.windows.lock().unwrap();
         assert_eq!(windows.pairs.len(), MAX_TRACKED_BUILD_PAIRS);
         assert!(!windows
@@ -2706,6 +3159,67 @@ mod tests {
         limiter.check_and_record_fee_signing("c", 2, 3).unwrap();
     }
 
+    /// The per-recipient budget spans issuers; a refusal records nothing.
+    #[test]
+    fn build_budget_per_recipient_spans_issuers() {
+        let limiter = BuildRateLimiter::new();
+        limiter.check_and_record("i1", "r", 5, 2).unwrap();
+        limiter.check_and_record("i2", "r", 5, 2).unwrap();
+        let err = limiter.check_and_record("i3", "r", 5, 2).unwrap_err();
+        assert!(err.contains("per recipient"), "{err}");
+        // Another recipient is unaffected, and the refusal recorded nothing for the pair.
+        limiter.check_and_record("i3", "other", 5, 2).unwrap();
+        assert!(!limiter
+            .windows
+            .lock()
+            .unwrap()
+            .pairs
+            .contains_key(&("i3".to_string(), "r".to_string())));
+    }
+
+    /// Request timestamps rise strictly per recipient; a forgotten entry (older than the
+    /// retention) accepts any timestamp, which the clock window then bounds.
+    #[test]
+    fn request_timestamps_rise_per_recipient() {
+        let limiter = BuildRateLimiter::new();
+        limiter.check_and_record_request_timestamp("r", 100).unwrap();
+        let (status, msg) = limiter
+            .check_and_record_request_timestamp("r", 100)
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(msg.contains("not greater"), "{msg}");
+        assert!(limiter.check_and_record_request_timestamp("r", 99).is_err());
+        limiter.check_and_record_request_timestamp("r", 101).unwrap();
+        // Recipients are independent.
+        limiter.check_and_record_request_timestamp("s", 1).unwrap();
+
+        {
+            let mut windows = limiter.windows.lock().unwrap();
+            let old = Instant::now() - BUILD_REQUEST_TIMESTAMP_RETENTION - Duration::from_secs(1);
+            windows.request_timestamps.insert("r".to_string(), (101, old));
+        }
+        limiter.check_and_record_request_timestamp("r", 50).unwrap();
+    }
+
+    /// A full table of fresh recipients refuses new ones (429) instead of evicting an entry.
+    #[test]
+    fn request_timestamp_table_is_bounded() {
+        let limiter = BuildRateLimiter::new();
+        {
+            let mut windows = limiter.windows.lock().unwrap();
+            let now = Instant::now();
+            for i in 0..MAX_TRACKED_BUILD_RECIPIENTS {
+                windows.request_timestamps.insert(format!("r-{i}"), (1, now));
+            }
+        }
+        let (status, _) = limiter
+            .check_and_record_request_timestamp("new", 1)
+            .unwrap_err();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        // A known recipient still moves on.
+        limiter.check_and_record_request_timestamp("r-0", 2).unwrap();
+    }
+
     /// Per-pair attempts (builds that may still fail before fee signing) do not use the
     /// issuer's or the total budget.
     #[test]
@@ -2713,7 +3227,7 @@ mod tests {
         let limiter = BuildRateLimiter::new();
         for i in 0..50 {
             limiter
-                .check_and_record("issuer", &format!("recipient-{i}"), 60)
+                .check_and_record("issuer", &format!("recipient-{i}"), 60, u32::MAX)
                 .unwrap();
         }
         limiter
@@ -2931,7 +3445,7 @@ mod tests {
         let fx = fee_signing_fixture(&[(RESERVE_NFT, 1)]);
         let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
         let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
-        check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap();
+        check_built_redemption(&unsigned, &inputs, Some(&fx.tracker_tree_hex), HEIGHT).unwrap();
     }
 
     /// A stale or wrong index entry offered the tracker box as a plain fee box. Its bytes hold the
@@ -2945,7 +3459,7 @@ mod tests {
                 &[&fx.reserve, &fx.tracker_box],
                 fx.outputs(&fx.tracker_box, nft_in_change),
             );
-            let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT)
+            let err = check_built_redemption(&unsigned, &inputs, Some(&fx.tracker_tree_hex), HEIGHT)
                 .unwrap_err();
             assert!(err.contains("fee input 1"), "{err}");
             assert!(err.contains("holds tokens"), "{err}");
@@ -2960,7 +3474,7 @@ mod tests {
         let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
         let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
         let err =
-            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap_err();
+            check_built_redemption(&unsigned, &inputs, Some(&fx.tracker_tree_hex), HEIGHT).unwrap_err();
         assert!(err.contains("would be burned"), "{err}");
 
         // The reserve output carries an NFT the reserve does not hold.
@@ -2968,7 +3482,7 @@ mod tests {
         let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
         let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
         let err =
-            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap_err();
+            check_built_redemption(&unsigned, &inputs, Some(&fx.tracker_tree_hex), HEIGHT).unwrap_err();
         assert!(err.contains("in no input"), "{err}");
     }
 
@@ -2988,14 +3502,14 @@ mod tests {
         let unsigned = unsigned_spending(&[&fx.reserve, &foreign], fx.outputs(&foreign, &[]));
         let inputs = vec![fx.reserve.clone(), foreign.clone()];
         let err =
-            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap_err();
+            check_built_redemption(&unsigned, &inputs, Some(&fx.tracker_tree_hex), HEIGHT).unwrap_err();
         assert!(err.contains("not locked by P2PK(tracker key)"), "{err}");
 
         // The node's bytes are another box than the one the transaction spends.
         let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
         let inputs = vec![fx.reserve.clone(), foreign];
         let err =
-            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap_err();
+            check_built_redemption(&unsigned, &inputs, Some(&fx.tracker_tree_hex), HEIGHT).unwrap_err();
         assert!(err.contains("input 1 spends box"), "{err}");
     }
 
@@ -3006,7 +3520,7 @@ mod tests {
         let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
         let check = |outputs: Vec<Value>, height: u32| {
             let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], outputs);
-            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, height)
+            check_built_redemption(&unsigned, &inputs, Some(&fx.tracker_tree_hex), height)
         };
 
         // Value created out of nothing.
@@ -3031,7 +3545,7 @@ mod tests {
         );
         let late_inputs = vec![fx.reserve.clone(), late_fee_box];
         let err =
-            check_before_fee_signing(&unsigned, &late_inputs, &fx.tracker_tree_hex, HEIGHT + 1)
+            check_built_redemption(&unsigned, &late_inputs, Some(&fx.tracker_tree_hex), HEIGHT + 1)
                 .unwrap_err();
         assert!(err.contains("outside 123401..=123401"), "{err}");
 
@@ -3042,7 +3556,7 @@ mod tests {
             fx.outputs(&dust_fee_box, &[]),
         );
         let dust_inputs = vec![fx.reserve.clone(), dust_fee_box];
-        let err = check_before_fee_signing(&unsigned, &dust_inputs, &fx.tracker_tree_hex, HEIGHT)
+        let err = check_built_redemption(&unsigned, &dust_inputs, Some(&fx.tracker_tree_hex), HEIGHT)
             .unwrap_err();
         assert!(
             err.contains("output 3 holds 1 nanoERG, below its minimum value"),

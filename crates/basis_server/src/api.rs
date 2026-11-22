@@ -219,6 +219,100 @@ pub async fn create_note(
         }
     };
 
+    // Round 4 (C3): a note needs its issuer's active reserve under this tracker, in the note's
+    // denomination (`server.notes_require_reserve`, default true). Without one the note could
+    // never be redeemed, and anyone could grow the tree for free.
+    if state.config.server.notes_require_reserve {
+        if let Err((status, message)) =
+            require_active_issuer_reserve(&state, &hex::encode(issuer_pubkey), &denomination).await
+        {
+            return (status, Json(crate::models::error_response(message)));
+        }
+    }
+
+    // Round 4 (C3): the note caps (429). Admission is serialized from the checks to the
+    // tracker's answer, so concurrent notes cannot overshoot a cap.
+    let _admission = state.note_limits.admit().await;
+    let issuer_notes = {
+        let (notes_tx, notes_rx) = tokio::sync::oneshot::channel();
+        if state
+            .tx
+            .send(crate::TrackerCommand::GetNotesByIssuer {
+                issuer_pubkey,
+                response_tx: notes_tx,
+            })
+            .await
+            .is_err()
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::models::error_response(
+                    "Tracker thread unavailable".to_string(),
+                )),
+            );
+        }
+        match notes_rx.await {
+            Ok(Ok(notes)) => notes,
+            Ok(Err(e)) => {
+                tracing::error!("Failed to read the issuer's notes: {:?}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(crate::models::error_response(
+                        "could not read the issuer's notes".to_string(),
+                    )),
+                );
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(crate::models::error_response(
+                        "Tracker thread unavailable".to_string(),
+                    )),
+                )
+            }
+        }
+    };
+    let is_new_edge = !issuer_notes
+        .iter()
+        .any(|n| n.recipient_pubkey == recipient_pubkey && n.denomination == denomination);
+    if !issuer_notes
+        .iter()
+        .any(|n| n.recipient_pubkey == recipient_pubkey)
+    {
+        let mut recipients: Vec<&PubKey> =
+            issuer_notes.iter().map(|n| &n.recipient_pubkey).collect();
+        recipients.sort();
+        recipients.dedup();
+        let max = state.config.server.notes_max_recipients_per_issuer;
+        if recipients.len() >= max as usize {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(crate::models::error_response(format!(
+                    "issuer {} already has {} recipients, the most this tracker accepts per \
+                     issuer (server.notes_max_recipients_per_issuer = {}); notes to existing \
+                     recipients are still accepted",
+                    hex::encode(issuer_pubkey),
+                    recipients.len(),
+                    max
+                ))),
+            );
+        }
+    }
+    let slot = match state.note_limits.try_record(
+        &issuer_pubkey,
+        is_new_edge,
+        state.config.server.notes_max_updates_per_issuer_per_hour,
+        state.config.server.notes_max_new_edges_per_hour,
+    ) {
+        Ok(slot) => slot,
+        Err(message) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(crate::models::error_response(message)),
+            )
+        }
+    };
+
     // Create the IOU note
     let note = IouNote::new(
         recipient_pubkey,
@@ -243,6 +337,7 @@ pub async fn create_note(
         .await
     {
         tracing::error!("Failed to send to tracker thread: {:?}", e);
+        state.note_limits.release(slot);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(crate::models::error_response(
@@ -251,8 +346,12 @@ pub async fn create_note(
         );
     }
 
-    // Wait for response from tracker thread
-    match response_rx.await {
+    // Wait for response from tracker thread. A note the tracker refuses gives its cap slot back.
+    let answer = response_rx.await;
+    if !matches!(answer, Ok(Ok(()))) {
+        state.note_limits.release(slot);
+    }
+    match answer {
         Ok(Ok(())) => {
             tracing::info!(
                 "Successfully created note from {} to {}",
@@ -1852,18 +1951,22 @@ pub async fn upload_policy(
     let mut signature: Signature = [0u8; 65];
     signature.copy_from_slice(&signature_bytes);
 
-    // Parse policy JSON to validate structure
+    // Round 4 (C1): validate the policy completely before anything is stored: at most 8 KiB,
+    // an explicit root, unique names, a reference tree reachable from the root, depth <= 8,
+    // <= 32 predicates, <= 16 references per composite, <= 256 holders, valid holder keys.
     let policy_config: basis_core::acceptance::AcceptanceConfig =
-        match parse_acceptance_policy_json(&payload.policy_json) {
+        match crate::acceptance::validate::parse_and_validate_policy_json(&payload.policy_json) {
             Ok(config) => config,
             Err(e) => {
+                let message = if e.is_json_error() {
+                    format!("Invalid policy JSON: {}", e)
+                } else {
+                    format!("Invalid policy structure: {}", e)
+                };
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(crate::models::error_response(format!(
-                        "Invalid policy JSON: {}",
-                        e
-                    ))),
-                )
+                    Json(crate::models::error_response(message)),
+                );
             }
         };
 
@@ -1930,27 +2033,14 @@ pub async fn upload_policy(
         }
     }
 
-    // Build a new predicate tree from the uploaded policy for validation
-    match crate::acceptance::builder::build_predicate_tree(policy_config) {
-        Ok(Some(predicate)) => {
-            tracing::info!(
-                "Built predicate tree from uploaded policy: '{}'",
-                predicate.name()
-            );
-        }
-        Ok(None) => {
-            tracing::info!("Empty policy uploaded for {}", payload.recipient_pubkey);
-        }
-        Err(e) => {
-            tracing::warn!("Failed to build predicate tree from uploaded policy: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(crate::models::error_response(format!(
-                    "Invalid policy structure: {}",
-                    e
-                ))),
-            );
-        }
+    match policy_config.root.as_deref() {
+        Some(root) => tracing::info!(
+            "Stored policy for {}: root '{}', {} predicates",
+            payload.recipient_pubkey,
+            root,
+            policy_config.predicates.len()
+        ),
+        None => tracing::info!("Empty policy uploaded for {}", payload.recipient_pubkey),
     }
 
     let response = UploadPolicyResponse {
@@ -2097,6 +2187,13 @@ pub async fn get_events(
     )
 }
 
+/// Sum debts with overflow checking (`None` when the sum passes `u64::MAX`).
+pub(crate) fn checked_debt_sum(debts: impl IntoIterator<Item = u64>) -> Option<u64> {
+    debts
+        .into_iter()
+        .try_fold(0u64, |total, debt| total.checked_add(debt))
+}
+
 // Get key status information
 #[axum::debug_handler]
 pub async fn get_key_status(
@@ -2213,7 +2310,20 @@ pub async fn get_key_status(
     let mut breakdown: Vec<KeyStatusDenomination> = Vec::new();
     for denom in denom_ids {
         let denom_notes: Vec<_> = notes.iter().filter(|n| n.denomination == denom).collect();
-        let total_debt: u64 = denom_notes.iter().map(|n| n.outstanding_debt()).sum();
+        // Round 4 (C10): a checked sum. Each note is below 2^63, but an issuer's notes together
+        // can pass u64::MAX: `sum()` then panicked (this workspace builds release with
+        // overflow-checks = true), so the issuer's /key-status never answered; without the
+        // checks it would wrap and report a huge debt as a small one. Saturate instead: the
+        // ratio then reads as undercollateralized, which is the truth.
+        let total_debt = checked_debt_sum(denom_notes.iter().map(|n| n.outstanding_debt()))
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "issuer {} owes more than u64::MAX in denomination {}; reporting u64::MAX",
+                    pubkey_hex,
+                    denom.denomination_id()
+                );
+                u64::MAX
+            });
 
         let denom_reserves: Vec<_> = matching_reserves
             .iter()
@@ -3122,12 +3232,6 @@ pub async fn get_tracker_proof(
         }
     };
 
-    // Get tracker state digest from shared state
-    let tracker_state_digest = {
-        let tracker_state = state.shared_tracker_state.lock().await;
-        hex::encode(tracker_state.get_avl_root_digest())
-    };
-
     // Request tracker lookup proof from tracker thread
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
@@ -3169,6 +3273,12 @@ pub async fn get_tracker_proof(
     // Wait for response from tracker thread
     match response_rx.await {
         Ok(Ok(proof)) => {
+            // The digest the proof was made against: the tracker thread refreshes the live tree
+            // and publishes its digest before it generates a live proof (round 4, C3).
+            let tracker_state_digest = {
+                let tracker_state = state.shared_tracker_state.lock().await;
+                hex::encode(tracker_state.get_avl_root_digest())
+            };
             // Extract total debt from proof value
             let total_debt = if proof.value.len() == 8 {
                 let mut bytes = [0u8; 8];
@@ -3509,6 +3619,80 @@ pub(crate) async fn ensure_single_issuer_reserve(
     Ok(matching_boxes.pop())
 }
 
+/// Round 4 (C3, `server.notes_require_reserve`): the issuer must have an ACTIVE reserve under
+/// this tracker in `denomination` before a note is accepted: exactly one tracked reserve there
+/// (the same view `ensure_single_issuer_reserve` gives the redemption routes), bound to this
+/// tracker's NFT in R6, and not in refund. Every failure is a 409 with the reason.
+pub(crate) async fn require_active_issuer_reserve(
+    state: &AppState,
+    issuer_pubkey_hex: &str,
+    denomination: &basis_store::DenomKey,
+) -> Result<(), (StatusCode, String)> {
+    let box_id = match ensure_single_issuer_reserve(state, issuer_pubkey_hex, denomination).await {
+        Ok(Some(box_id)) => box_id,
+        Ok(None) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "issuer {} has no reserve under this tracker in denomination {}; a note is \
+                     accepted only when its issuer has an active reserve here \
+                     (server.notes_require_reserve)",
+                    issuer_pubkey_hex,
+                    denomination.denomination_id()
+                ),
+            ))
+        }
+        Err(conflict) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("{conflict} New notes of this issuer are not accepted until then."),
+            ))
+        }
+    };
+    let reserve = match state.reserve_tracker.lock().await.get_reserve(&box_id) {
+        Ok(reserve) => reserve,
+        // Spent between the two reads.
+        Err(_) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "the reserve {} of issuer {} is no longer tracked; try again",
+                    box_id, issuer_pubkey_hex
+                ),
+            ))
+        }
+    };
+    if let Some(nft) = state
+        .config
+        .ergo
+        .tracker_nft_id
+        .as_deref()
+        .filter(|nft| !nft.is_empty())
+    {
+        if !reserve.base_info.tracker_nft_id.eq_ignore_ascii_case(nft) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "the reserve {} of issuer {} is bound to tracker NFT {}, not this \
+                     tracker's {}",
+                    box_id, issuer_pubkey_hex, reserve.base_info.tracker_nft_id, nft
+                ),
+            ));
+        }
+    }
+    if reserve.is_refund_pending() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "the reserve {} of issuer {} is in refund (since height {}); new notes are not \
+                 accepted against it",
+                box_id, issuer_pubkey_hex, reserve.base_info.refund_initiation_height
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Find the issuer's tracked reserve collateral for acceptance-policy checks.
 ///
 /// Returns `(collateral_amount, refund_initiation_height)` of the issuer's
@@ -3630,6 +3814,23 @@ pub async fn request_tracker_signature(
 ) -> (StatusCode, Json<ApiResponse<TrackerSignatureResponse>>) {
     tracing::debug!("Requesting tracker signature for redemption: {:?}", payload);
 
+    // SECURITY (round 4, C4): an emergency redemption needs no tracker signature at all: the
+    // contract accepts an empty context var #6 once the tracker box is older than the emergency
+    // window (contract/basis.es: `trackerSigValid`). Signing on `emergency: true` handed out a
+    // NORMAL tracker signature with the acceptance-policy and FIFO checks skipped, so any
+    // receiver could redeem out of turn through the normal path. Refuse before any work.
+    if payload.emergency {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(crate::models::error_response(
+                "emergency redemptions need no tracker signature: build them with an empty \
+                 context var #6 (POST /redemption/build with \"emergency\": true); \
+                 /tracker/signature only signs normal redemptions"
+                    .to_string(),
+            )),
+        );
+    }
+
     // Validate public keys
     let issuer_pubkey_bytes = match hex::decode(&payload.issuer_pubkey) {
         Ok(bytes) if bytes.len() == 33 => bytes,
@@ -3735,9 +3936,9 @@ pub async fn request_tracker_signature(
 
     // Acceptance-policy enforcement (mirrors /redemption/build): do not sign when
     // a maximal redemption of this note would newly violate another debt holder's
-    // collateralization policy. Emergency redemptions bypass the tracker (contract
-    // path after the time lock) and are exempt from this check.
-    if state.config.redemption.enforce_acceptance_policy && !payload.emergency {
+    // collateralization policy. Emergency requests were refused above, so every
+    // signature produced here went through this check.
+    if state.config.redemption.enforce_acceptance_policy {
         let (notes_tx, notes_rx) = tokio::sync::oneshot::channel();
         if let Err(e) = state
             .tx
@@ -3924,14 +4125,14 @@ pub async fn request_tracker_signature(
         tracker_signature,
         tracker_pubkey,
         message_signed: message_to_sign,
-        is_emergency: if payload.emergency { Some(true) } else { None },
+        // Emergency requests are refused (400) before signing, so this is never set.
+        is_emergency: None,
     };
 
     tracing::info!(
-        "Tracker signature generated for redemption from {} to {} (emergency: {})",
+        "Tracker signature generated for redemption from {} to {}",
         payload.issuer_pubkey,
-        payload.recipient_pubkey,
-        payload.emergency
+        payload.recipient_pubkey
     );
 
     (
@@ -4175,15 +4376,6 @@ pub async fn get_redemption_proof(
         );
     }
 
-    // Get the current tracker state digest from shared tracker state
-    let tracker_state_digest = {
-        // Get the current AVL root digest from shared tracker state
-        let shared_state = state.shared_tracker_state.lock().await;
-        let current_digest = shared_state.get_avl_root_digest();
-        drop(shared_state); // Release the lock early
-        hex::encode(current_digest)
-    };
-
     // Generate a real AVL proof for the note
     // Send command to tracker thread to generate the proof
     let (proof_response_tx, proof_response_rx) = tokio::sync::oneshot::channel();
@@ -4301,6 +4493,13 @@ pub async fn get_redemption_proof(
         }
     };
 
+    // The digest the proof was made against: the tracker thread refreshes the live tree and
+    // publishes its digest before it generates a live proof (round 4, C3).
+    let tracker_state_digest = {
+        let shared_state = state.shared_tracker_state.lock().await;
+        hex::encode(shared_state.get_avl_root_digest())
+    };
+
     // Get current blockchain height from scanner
     let block_height = {
         let scanner_guard = state.ergo_scanner.lock().await;
@@ -4399,6 +4598,23 @@ pub async fn get_latest_tracker_box_id(
                 )),
             )
         }
+    }
+}
+
+/// True when `value_hex` is exactly one canonical sigma constant: it parses, and serializing the
+/// parsed constant gives back the same bytes (no trailing bytes, no other encoding of the value).
+pub(crate) fn is_canonical_constant_hex(value_hex: &str) -> bool {
+    use ergo_lib::ergotree_ir::mir::constant::Constant;
+    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+    let Ok(bytes) = hex::decode(value_hex) else {
+        return false;
+    };
+    match Constant::sigma_parse_bytes(&bytes) {
+        Ok(constant) => constant
+            .sigma_serialize_bytes()
+            .map(|canonical| canonical == bytes)
+            .unwrap_or(false),
+        Err(_) => false,
     }
 }
 
@@ -4610,9 +4826,11 @@ pub async fn create_reserve_payload(
         config.ergo.basis_reserve_contract_p2s.clone()
     };
 
-    // Build properly serialized register values following Ergo constant format
+    // Build properly serialized register values following Ergo constant format. Every value is
+    // one canonical sigma constant in lowercase hex (checked below): clients compare and rebuild
+    // these registers byte for byte.
     // R4: GroupElement (owner pubkey) - prefix 07 + 33-byte compressed pubkey
-    let r4_value = format!("07{}", payload.owner_pubkey);
+    let r4_value = format!("07{}", hex::encode(&owner_pubkey_bytes));
 
     // R5: SAvlTree (empty AVL tree) - prefix 64 + 33-byte digest + flags + key_len + value_len
     // Empty tree digest for PlasmaParameters(32, None) is 4ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900
@@ -4648,10 +4866,40 @@ pub async fn create_reserve_payload(
             ))),
         );
     }
-    let r6_value = format!("0e{:02x}{}", tracker_nft_bytes.len(), tracker_nft_id);
+    let r6_value = format!(
+        "0e{:02x}{}",
+        tracker_nft_bytes.len(),
+        hex::encode(&tracker_nft_bytes)
+    );
 
-    // R7: Long (refund initiation height, 0 for a new reserve with no pending refund)
-    let r7_value = "05000000000000000000".to_string();
+    // R7: Long (refund initiation height, 0 for a new reserve with no pending refund): type 05,
+    // then the ZigZag VLQ of 0, one byte. (It used to carry 8 more zero bytes after the value.)
+    let r7_value = basis_offchain::ergo_tx::serialize_ergo_long(0);
+
+    // R4 is the only register built from caller input: a key that is not a point (or is the
+    // identity, which anyone can prove) would lock the owner's collateral in a box nobody, or
+    // everybody, can spend.
+    if !matches!(owner_pubkey_bytes[0], 0x02 | 0x03) || !is_canonical_constant_hex(&r4_value) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(crate::models::error_response(
+                "owner_pubkey must be a compressed secp256k1 public key (02 or 03, then the \
+                 32-byte x coordinate of a point on the curve)"
+                    .to_string(),
+            )),
+        );
+    }
+    for (id, value) in [("R5", &r5_value), ("R6", &r6_value), ("R7", &r7_value)] {
+        if !is_canonical_constant_hex(value) {
+            tracing::error!("reserve payload register {id} is not a canonical constant: {value}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::models::error_response(format!(
+                    "internal error: reserve register {id} is malformed"
+                ))),
+            );
+        }
+    }
 
     // Create registers map
     let mut registers = std::collections::HashMap::new();
@@ -4729,25 +4977,13 @@ pub async fn create_reserve_payload(
 // Get the Basis reserve contract P2S address from server configuration
 #[axum::debug_handler]
 pub async fn get_basis_reserve_contract_p2s(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
     tracing::debug!("Getting Basis reserve contract P2S address from configuration");
 
-    // Get the reserve contract address from the server configuration
-    let config = match crate::config::AppConfig::load() {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::error!("Failed to load configuration: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(crate::models::error_response(
-                    "Failed to load server configuration".to_string(),
-                )),
-            );
-        }
-    };
-
-    let reserve_contract_address = config.basis_reserve_contract_p2s();
+    // Round 4 (C10): the configuration the server runs with, not the file re-read from disk
+    // (which could differ from it, or fail, on every call).
+    let reserve_contract_address = state.config.basis_reserve_contract_p2s();
 
     tracing::info!(
         "Successfully retrieved Basis reserve contract P2S address: {}",

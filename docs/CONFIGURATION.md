@@ -28,6 +28,39 @@ database_url = "sqlite:data/basis.db"  # Legacy field, kept for compatibility (c
 
 `data_dir` controls where the server writes all persistent state. It defaults to a `data/` directory relative to the working directory from which the server is launched. You can override it with the `BASIS_SERVER_DATA_DIR` environment variable.
 
+#### Request limits
+
+```toml
+[server]
+reserve_creation_max_erg_nano = 10000000000      # max nanoERG one /reserves/create payload locks
+reserve_creation_max_token_amount = 1000000000   # max token units one /reserves/create payload locks
+redemption_build_max_per_pair_per_hour = 60       # /redemption/build per (issuer, recipient)
+redemption_build_max_per_recipient_per_hour = 30  # /redemption/build per recipient, across issuers
+redemption_build_max_per_issuer_per_hour = 6      # token-reserve builds that sign tracker fee inputs, per issuer
+redemption_build_max_per_hour = 30                # the same, all issuers together
+notes_require_reserve = true                      # POST /notes needs the issuer's active reserve here
+notes_max_recipients_per_issuer = 50              # distinct recipients of one issuer
+notes_max_updates_per_issuer_per_hour = 120       # accepted notes (new or raised) of one issuer
+notes_max_new_edges_per_hour = 1000               # new (issuer, recipient, denomination) edges, all issuers
+```
+
+All windows roll over one hour and answer `429` when reached. `/redemption/build` counts a
+request against the pair and recipient budgets only after the recipient's
+`receiver_signature` verifies and the cheap checks pass (committed outstanding debt, issuer
+signature, minimum payout), so nobody but the recipient can use them up. ERG-reserve builds pay
+the miner fee out of the payout and sign no tracker input, so only token-reserve builds use the
+two fee-signing budgets.
+
+`POST /notes` accepts a note only when its issuer has exactly one active reserve under this
+tracker in the note's denomination: tracked by the scanner, bound to this tracker's NFT in R6
+and not in refund (`409` otherwise). `notes_require_reserve = false` lifts this and allows
+credit without a reserve. The three `notes_max_*` caps answer `429`: a note to a new recipient
+beyond `notes_max_recipients_per_issuer`, more than `notes_max_updates_per_issuer_per_hour`
+accepted notes of one issuer in the last hour, or more than `notes_max_new_edges_per_hour` new
+edges in the last hour (all issuers together; raising an existing edge is not a new edge). Only
+accepted notes count: a note the tracker refuses (bad signature, old timestamp, lower debt)
+gives its slot back. The hourly windows live in memory and start empty after a restart.
+
 ### Server Authentication & TLS
 
 The tracker server supports optional TLS and three authentication modes under

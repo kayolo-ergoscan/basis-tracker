@@ -180,9 +180,102 @@ pub fn signing_message(
     message
 }
 
+/// Domain tag that starts every redemption build request message (`POST /redemption/build`).
+pub const BUILD_REQUEST_DOMAIN: &[u8] = b"basis-build-v1";
+
+/// Message the RECEIVER signs to request a redemption build (`POST /redemption/build`).
+///
+/// message = "basis-build-v1" (14 bytes ASCII) || trackerNftId (32) || issuer key (33)
+///           || receiver key (33) || denomination id (UTF-8 of the canonical id: `erg` or
+///           `token:<64 lowercase hex>`) || amount (8 BE) || requestTimestamp (8 BE, ms)
+///
+/// It is signed with the same Basis Schnorr scheme as notes. The domain tag keeps it from
+/// ever being valid as a note or redemption message (those are exactly 80 bytes and start
+/// with a debt-tree key); the denomination id is the only variable-length field and sits
+/// between fixed-width ones, so the encoding is unambiguous. 131 bytes for ERG, 198 for a token.
+pub fn build_request_message(
+    tracker_nft_id: &[u8; 32],
+    issuer_key: &PubKey,
+    receiver_key: &PubKey,
+    denomination: &DenomKey,
+    amount: u64,
+    request_timestamp_ms: u64,
+) -> Vec<u8> {
+    let denomination_id = denomination.denomination_id();
+    let mut message =
+        Vec::with_capacity(BUILD_REQUEST_DOMAIN.len() + 32 + 33 + 33 + denomination_id.len() + 16);
+    message.extend_from_slice(BUILD_REQUEST_DOMAIN);
+    message.extend_from_slice(tracker_nft_id);
+    message.extend_from_slice(issuer_key);
+    message.extend_from_slice(receiver_key);
+    message.extend_from_slice(denomination_id.as_bytes());
+    message.extend_from_slice(&amount.to_be_bytes());
+    message.extend_from_slice(&request_timestamp_ms.to_be_bytes());
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 4: worked examples for clients (the canary tool among them): the exact bytes of
+    /// the 80-byte note message (also what `/tracker/signature` signs) and of the build-request
+    /// message of `POST /redemption/build`, for fixed inputs. A client that produces the same
+    /// bytes signs what the tracker verifies. Keys: the secp256k1 generator G (issuer) and 2G
+    /// (receiver); tracker NFT 0x5a * 32; 2026-11-22T00:00:00Z in ms.
+    #[test]
+    fn worked_examples_of_the_signed_messages() {
+        let key = |h: &str| -> PubKey { hex::decode(h).unwrap().try_into().unwrap() };
+        let issuer = key("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+        let receiver = key("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5");
+        let nft = [0x5a; 32];
+        let ts = 1_795_305_600_000u64;
+
+        assert_eq!(
+            hex::encode(DenomKey::Erg.debt_key(&issuer, &receiver)),
+            "87262ce92e4cc9c99666eb41bcab2a75ed76c937b50f9e441b4f5806138228ee"
+        );
+        let note = signing_message(&issuer, &receiver, &DenomKey::Erg, 1_000_000_000, ts, &nft);
+        assert_eq!(
+            hex::encode(&note),
+            concat!(
+                "87262ce92e4cc9c99666eb41bcab2a75ed76c937b50f9e441b4f5806138228ee",
+                "000000003b9aca00",
+                "000001a2008d7400",
+                "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+            )
+        );
+
+        let build = build_request_message(
+            &nft,
+            &issuer,
+            &receiver,
+            &DenomKey::Erg,
+            500_000_000,
+            ts + 60_000,
+        );
+        assert_eq!(build.len(), 131);
+        assert_eq!(
+            hex::encode(&build),
+            concat!(
+                "62617369732d6275696c642d7631",
+                "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+                "657267",
+                "000000001dcd6500",
+                "000001a2008e5e60"
+            )
+        );
+
+        let token = DenomKey::Token([0x7c; 32]);
+        assert_eq!(
+            hex::encode(token.debt_key(&issuer, &receiver)),
+            "9166c9c9b26e3c9832d9285becd4a22fa265552a51ee77f0d6d5ae79ae6281be"
+        );
+        let build = build_request_message(&nft, &issuer, &receiver, &token, 500_000_000, ts + 60_000);
+        assert_eq!(build.len(), 198);
+    }
 
     #[test]
     fn denomination_id_roundtrip() {
@@ -193,6 +286,29 @@ mod tests {
         assert_eq!(s, format!("token:{}", hex::encode(id)));
         assert_eq!(DenomKey::parse(&s).unwrap(), key);
         assert_eq!(DenomKey::parse("ERG").unwrap(), DenomKey::Erg);
+    }
+
+    #[test]
+    fn build_request_message_layout() {
+        let nft = [0x11u8; 32];
+        let issuer = [0x02u8; 33];
+        let receiver = [0x03u8; 33];
+        let erg = build_request_message(&nft, &issuer, &receiver, &DenomKey::Erg, 7, 9);
+        assert_eq!(erg.len(), 131);
+        assert_eq!(&erg[..14], b"basis-build-v1");
+        assert_eq!(&erg[14..46], &nft);
+        assert_eq!(&erg[46..79], &issuer);
+        assert_eq!(&erg[79..112], &receiver);
+        assert_eq!(&erg[112..115], b"erg");
+        assert_eq!(&erg[115..123], &7u64.to_be_bytes());
+        assert_eq!(&erg[123..131], &9u64.to_be_bytes());
+
+        let token = DenomKey::Token([0xabu8; 32]);
+        let tok = build_request_message(&nft, &issuer, &receiver, &token, 7, 9);
+        assert_eq!(tok.len(), 198);
+        assert_eq!(&tok[112..182], format!("token:{}", "ab".repeat(32)).as_bytes());
+        // Never the 80-byte note/redemption message shape.
+        assert_ne!(erg.len(), 80);
     }
 
     #[test]

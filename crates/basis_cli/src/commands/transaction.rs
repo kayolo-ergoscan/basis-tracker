@@ -678,19 +678,25 @@ async fn build_redemption_tx(
     let issuer_signature = hex::decode(issuer_signature_hex)
         .map_err(|e| anyhow::anyhow!("Invalid issuer signature hex: {}", e))?;
 
-    // Get tracker signature from server
-    let tracker_signature_response = client
-        .request_tracker_signature(
-            issuer_pubkey,
-            recipient_pubkey,
-            total_debt,
-            note_timestamp,
-            emergency,
-            Some(&denomination.denomination_id()),
-        )
-        .await?;
-    let tracker_signature = hex::decode(&tracker_signature_response.tracker_signature)
-        .map_err(|e| anyhow::anyhow!("Invalid tracker signature hex: {}", e))?;
+    // Tracker signature (context var #6). An emergency redemption carries an EMPTY var #6: the
+    // contract accepts that once the tracker box is older than the emergency window, and the
+    // server refuses `/tracker/signature` with `emergency: true` (400).
+    let tracker_signature = if emergency {
+        Vec::new()
+    } else {
+        let tracker_signature_response = client
+            .request_tracker_signature(
+                issuer_pubkey,
+                recipient_pubkey,
+                total_debt,
+                note_timestamp,
+                false,
+                Some(&denomination.denomination_id()),
+            )
+            .await?;
+        hex::decode(&tracker_signature_response.tracker_signature)
+            .map_err(|e| anyhow::anyhow!("Invalid tracker signature hex: {}", e))?
+    };
 
     let insert_proof = reserve_insert_proof.clone();
 
@@ -1317,8 +1323,27 @@ pub async fn redeem_tracker_assisted(
     )?;
     progress!("✅ issuer signature ({} bytes)", issuer_sig.len());
 
-    // Tracker builds the unsigned tx and signs the fee input(s).
+    // Recipient (receiver) secret: it signs the build request and, later, the reserve input's
+    // proveDlog(recipient).
+    let recipient_address = pubkey_to_address(recipient_pubkey)?;
+    let receiver_secret =
+        resolve_dlog_secret(&recipient_secret, client, &recipient_address, "recipient").await?;
+    let receiver_sk = SecretKey::dlog_from_bytes(&receiver_secret)
+        .ok_or_else(|| anyhow::anyhow!("invalid recipient dlog secret"))?;
+
+    // Tracker builds the unsigned tx (an ERG redemption pays the fee out of the payout; a token
+    // redemption gets tracker fee inputs, which it signs). Only the recipient may ask.
     progress!("🔍 Requesting tracker build (POST /redemption/build)...");
+    let request_timestamp = crate::verify::now_unix_ms();
+    let receiver_signature = crate::verify::sign_build_request(
+        &receiver_secret,
+        &tracker_nft_id,
+        &issuer_pk,
+        &recipient_pk,
+        &denom,
+        amount,
+        request_timestamp,
+    )?;
     let build = client
         .redemption_build(crate::api::RedemptionBuildRequest {
             issuer_pubkey: issuer_pubkey.to_string(),
@@ -1331,6 +1356,8 @@ pub async fn redeem_tracker_assisted(
             change_address: None,
 
             denomination: denom.denomination_id(),
+            request_timestamp,
+            receiver_signature,
         })
         .await
         .map_err(|e| anyhow::anyhow!("tracker build failed: {}", e))?;
@@ -1382,15 +1409,9 @@ pub async fn redeem_tracker_assisted(
         &recipient_pk,
         &denom,
         amount,
+        crate::verify::MAX_PAYOUT_FEE_NANOERG,
     )
     .map_err(|e| anyhow::anyhow!("refusing to sign the tracker's redemption: {}", e))?;
-
-    // Recipient (receiver) secret for the reserve input's proveDlog(recipient).
-    let recipient_address = pubkey_to_address(recipient_pubkey)?;
-    let receiver_secret =
-        resolve_dlog_secret(&recipient_secret, client, &recipient_address, "recipient").await?;
-    let receiver_sk = SecretKey::dlog_from_bytes(&receiver_secret)
-        .ok_or_else(|| anyhow::anyhow!("invalid recipient dlog secret"))?;
 
     // Add the reserve input (index 0) proof over the same bytes_to_sign.
     progress!("🖊️  Adding reserve proveDlog(recipient) proof...");

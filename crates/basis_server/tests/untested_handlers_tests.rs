@@ -134,6 +134,11 @@ mod untested_handlers {
                 reserve_creation_max_erg_nano: 10_000_000_000,
                 reserve_creation_max_token_amount: 1_000_000_000,
                 redemption_build_max_per_pair_per_hour: 60,
+                redemption_build_max_per_recipient_per_hour: 30,
+                notes_require_reserve: false,
+                notes_max_recipients_per_issuer: 50,
+                notes_max_updates_per_issuer_per_hour: 120,
+                notes_max_new_edges_per_hour: 1000,
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -206,6 +211,7 @@ mod untested_handlers {
             redemption_build_rate: std::sync::Arc::new(
                 basis_server::redemption_build::BuildRateLimiter::new(),
             ),
+            note_limits: std::sync::Arc::new(basis_server::note_limits::NoteLimiter::new()),
         }
     }
 
@@ -244,28 +250,16 @@ mod untested_handlers {
     // ========================================================================
 
     #[tokio::test]
-    async fn test_get_basis_reserve_contract_p2s_reports_config_load_failure() {
-        // This handler re-reads AppConfig from disk instead of using the injected AppState, so
-        // its result depends on the deployment environment. In a test environment there is no
-        // config/basis.toml (it is gitignored), so what we pin is the documented failure path:
-        // a 5xx carrying an error, never a panic and never a silent empty string.
+    async fn test_get_basis_reserve_contract_p2s_comes_from_the_running_config() {
+        // Round 4 (C10): the handler used to re-read AppConfig from disk, so its answer depended
+        // on the working directory and could differ from the config the server runs with. It
+        // now answers from the injected AppState.
         let state = mock_state().await;
 
         let (status, body) = get_basis_reserve_contract_p2s(axum::extract::State(state)).await;
 
-        assert!(
-            status.is_server_error() || status == StatusCode::OK,
-            "expected either a successful load or a clean 5xx, got {} with body {:?}",
-            status,
-            body
-        );
-        if status.is_server_error() {
-            assert!(!body.success);
-            assert!(
-                body.error.is_some(),
-                "a 5xx must carry an error message, not an empty body"
-            );
-        }
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body.data.as_deref(), Some("9testReserveP2SAddress"));
     }
 
     // ========================================================================
@@ -732,8 +726,14 @@ mod untested_handlers {
         assert!(!body.success);
         let msg = body.error.clone().unwrap_or_default();
         assert!(
-            msg.contains("broadcast failed"),
+            msg.contains("did not accept"),
             "a failed broadcast must be reported as such, got: {}",
+            msg
+        );
+        // Round 4 (C2): the node's URL and answer are logged, never returned.
+        assert!(
+            !msg.contains("127.0.0.1") && !msg.contains("http"),
+            "the client error must not carry the node URL, got: {}",
             msg
         );
     }
