@@ -1374,12 +1374,10 @@ pub(crate) fn build_tracker_commit_tx(
     use ergo_lib::chain::transaction::unsigned::UnsignedTransaction;
     use ergo_lib::chain::transaction::UnsignedInput;
     use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
-    use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
     use ergo_lib::ergotree_ir::chain::ergo_box::{
         BoxTokens, ErgoBoxCandidate, NonMandatoryRegisterId, NonMandatoryRegisters,
     };
     use ergo_lib::ergotree_ir::chain::token::{Token, TokenId};
-    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
     use ergo_lib::ergotree_ir::mir::constant::Constant;
     use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
     use std::str::FromStr;
@@ -1466,27 +1464,9 @@ pub(crate) fn build_tracker_commit_tx(
     }
     let leftover = fee_total - fee;
 
-    let fee_tree_bytes = hex::decode(ergo_lib::wallet::miner_fee::MINERS_FEE_BASE16_BYTES)
-        .map_err(|e| ser("fee tree", e.to_string()))?;
-    let fee_tree =
-        ErgoTree::sigma_parse_bytes(&fee_tree_bytes).map_err(|e| ser("fee tree", e.to_string()))?;
-    let value = |what: &str, v: u64| BoxValue::try_from(v).map_err(|e| ser(what, e.to_string()));
-
     // Change whenever value is left; only dust that cannot form a box goes to the miner.
-    let change_output = if leftover >= BoxValue::MIN_RAW {
-        let candidate = ErgoBoxCandidate {
-            value: value("change", leftover)?,
-            ergo_tree: change_tree.clone(),
-            tokens: None,
-            additional_registers: NonMandatoryRegisters::empty(),
-            creation_height: height,
-        };
-        let min_value =
-            crate::local_wallet::min_box_value(&candidate).map_err(|e| ser("change", e))?;
-        (leftover >= min_value).then_some(candidate)
-    } else {
-        None
-    };
+    let change_output = crate::local_wallet::change_output(leftover, change_tree, height)
+        .map_err(|e| ser("change", e))?;
     let (fee, change) = match change_output {
         Some(_) => (fee, leftover),
         None => (fee + leftover, 0),
@@ -1500,13 +1480,7 @@ pub(crate) fn build_tracker_commit_tx(
             additional_registers: registers,
             creation_height: height,
         },
-        ErgoBoxCandidate {
-            value: value("fee", fee)?,
-            ergo_tree: fee_tree,
-            tokens: None,
-            additional_registers: NonMandatoryRegisters::empty(),
-            creation_height: height,
-        },
+        crate::local_wallet::miner_fee_output(fee, height).map_err(|e| ser("fee", e))?,
     ];
     outputs.extend(change_output);
 

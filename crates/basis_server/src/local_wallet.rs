@@ -452,6 +452,51 @@ fn token_totals<'a>(
     Ok(totals)
 }
 
+/// The output that returns `leftover` nanoERG to `change_tree`, or `None` when nothing should
+/// be created: nothing is left, or the leftover is below the minimum value of that box
+/// (360 nanoERG per serialized byte), so it cannot form a box. The caller adds a `None`
+/// leftover to the miner fee. Change outputs never carry tokens.
+pub fn change_output(
+    leftover: u64,
+    change_tree: &ergo_lib::ergotree_ir::ergo_tree::ErgoTree,
+    height: u32,
+) -> Result<Option<ergo_lib::ergotree_ir::chain::ergo_box::ErgoBoxCandidate>, String> {
+    use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBoxCandidate, NonMandatoryRegisters};
+    if leftover < BoxValue::MIN_RAW {
+        return Ok(None);
+    }
+    let candidate = ErgoBoxCandidate {
+        value: BoxValue::try_from(leftover).map_err(|e| format!("change value: {e}"))?,
+        ergo_tree: change_tree.clone(),
+        tokens: None,
+        additional_registers: NonMandatoryRegisters::empty(),
+        creation_height: height,
+    };
+    Ok((leftover >= min_box_value(&candidate)?).then_some(candidate))
+}
+
+/// The miner fee output: `fee` nanoERG to the standard miner fee contract.
+pub fn miner_fee_output(
+    fee: u64,
+    height: u32,
+) -> Result<ergo_lib::ergotree_ir::chain::ergo_box::ErgoBoxCandidate, String> {
+    use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBoxCandidate, NonMandatoryRegisters};
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+    let tree_bytes = hex::decode(ergo_lib::wallet::miner_fee::MINERS_FEE_BASE16_BYTES)
+        .map_err(|e| format!("miner fee tree: {e}"))?;
+    let ergo_tree =
+        ErgoTree::sigma_parse_bytes(&tree_bytes).map_err(|e| format!("miner fee tree: {e}"))?;
+    Ok(ErgoBoxCandidate {
+        value: BoxValue::try_from(fee).map_err(|e| format!("fee value: {e}"))?,
+        ergo_tree,
+        tokens: None,
+        additional_registers: NonMandatoryRegisters::empty(),
+        creation_height: height,
+    })
+}
+
 /// Pre-signing check that the transaction moves tokens and nothing else: every token of
 /// `inputs` reaches the outputs with exactly the same total amount (nothing burned), and no
 /// output token is new, except `mint` (`(token id, amount)`), which must then be absent from
@@ -607,6 +652,29 @@ pub(crate) mod tests {
         assert!(!is_fee_box(&free, &tree, &["AA"]));
         assert!(!is_fee_box(&nft_box, &tree, &[]));
         assert!(!is_fee_box(&other_script, &tree, &[]));
+    }
+
+    #[test]
+    fn change_output_only_when_it_can_form_a_box() {
+        let tree = tree_of(&PK);
+        assert!(change_output(0, &tree, 100).unwrap().is_none());
+        assert!(change_output(BoxValue::MIN_RAW - 1, &tree, 100)
+            .unwrap()
+            .is_none());
+        let probe = change_output(1_000_000, &tree, 100).unwrap().unwrap();
+        let min = min_box_value(&probe).unwrap();
+        assert!(change_output(min - 1, &tree, 100).unwrap().is_none());
+        let change = change_output(min, &tree, 100).unwrap().unwrap();
+        assert_eq!(*change.value.as_u64(), min);
+        assert_eq!(change.ergo_tree, tree);
+        assert!(change.tokens.is_none());
+
+        let fee = miner_fee_output(1_000_000, 100).unwrap();
+        assert_eq!(
+            hex::encode(fee.ergo_tree.sigma_serialize_bytes().unwrap()),
+            ergo_lib::wallet::miner_fee::MINERS_FEE_BASE16_BYTES
+        );
+        assert_eq!((*fee.value.as_u64(), fee.creation_height), (1_000_000, 100));
     }
 
     #[test]

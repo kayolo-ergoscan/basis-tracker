@@ -22,7 +22,7 @@
 
 ## Project Structure
 - Multi-crate workspace under `crates/` directory
-- Each crate has specific purpose (app, server, store, cli, mcp, offchain)
+- Each crate has specific purpose (app, server, store, cli, mcp, offchain, bootstrap: one-time tracker NFT mint and tracker box creation)
 - Shared dependencies in workspace Cargo.toml
 
 ## Testing

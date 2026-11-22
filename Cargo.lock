@@ -342,6 +342,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "basis_bootstrap"
+version = "0.1.0"
+dependencies = [
+ "basis_server",
+ "basis_store",
+ "clap",
+ "ergo-lib",
+ "hex",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "basis_cli"
 version = "0.1.0"
 dependencies = [

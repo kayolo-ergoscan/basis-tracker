@@ -220,9 +220,9 @@ The Tracker NFT is a critical component of the Basis system that:
 
 ### How to Set Up Tracker NFT
 
-1. **Create an NFT** on the Ergo blockchain
-   - Use any NFT creation tool or wallet
-   - The NFT should be unique to your tracker instance
+1. **Mint the NFT and create the tracker box** with `basis_bootstrap` (see
+   [Bootstrapping the tracker](#bootstrapping-the-tracker) below). The NFT must be a
+   single token (emission 1), unique to your tracker instance.
 
 2. **Configure the NFT ID** in `config/basis.toml`
    ```toml
@@ -270,6 +270,8 @@ The Tracker Public Key is used by the tracker server to:
 1. **Prepare a compressed secp256k1 public key** (33 bytes)
    - Can be provided as hex string: `02dada811a888cd0dc7a0a41739a3ad9b0f427741fe6ca19700cf1a51200c96bf7`
    - Can be provided as Ergo P2PK address: `9fRusAarL1KkrWQVsxSRVYnvWxaAT2A96cKtNn9tvPh5XUyCisr33`
+   - With `tracker_secret_key` set, `basis_bootstrap address` prints the public key, the
+     P2PK address and the ErgoTree that belong to it, without network access.
 
 2. **Configure the public key and its secret key** in `config/basis.toml`
    ```toml
@@ -281,6 +283,42 @@ The Tracker Public Key is used by the tracker server to:
    signatures). The server refuses to start unless `tracker_secret_key·G` equals
    `tracker_public_key`, and it commits only to a tracker box locked by
    `P2PK(tracker_public_key)`.
+
+### Bootstrapping the tracker
+
+`basis_bootstrap` creates the tracker's on-chain state once, before the first start of
+`basis_server`. It reads the same `config/basis.toml` (run it from the same working
+directory; `BASIS_*` environment overrides apply), signs locally with
+`ergo.tracker_secret_key`, reads only public endpoints of `ergo.scanner.node_url` and submits
+through `POST /transactions` on the broadcast node (`[ergo.wallet]`, else the scanner). No
+node wallet or API key is needed.
+
+```bash
+basis_bootstrap address                       # public key, P2PK address, ErgoTree
+basis_bootstrap mint-nft --dry-run            # print the transaction, send nothing
+basis_bootstrap mint-nft [--name N] [--description D]
+basis_bootstrap init-box --nft <NFT id> [--value-nano 1000000] [--dry-run]
+```
+
+1. Fund the address printed by `address` with plain ERG (0.01 ERG covers both steps).
+2. `mint-nft` mints the NFT into a 0.001 ERG box at the tracker address. The registers follow
+   EIP-4: R4 name (default `Basis Tracker`), R5 description, R6 decimals `"0"`, each a
+   `Coll[Byte]` of UTF-8 text. The NFT id is the id of the first input box; it is printed.
+3. After the mint confirms, `init-box --nft <id>` turns that box into the tracker box:
+   token 0 = the NFT, R4 = `07‖tracker public key`, R5 =
+   `644ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900032000` (the empty
+   AVL tree), R6 = `0e20‖NFT id`. The box value (default 0.001 ERG) is kept by every commit.
+4. Set `tracker_nft_id` (and `tracker_public_key`, if it is not set yet) and start
+   `basis_server`.
+
+Both commands pay a 0.001 ERG fee from token-free boxes at the tracker address and return
+the change there; a leftover too small for a box goes to the fee. They refuse to spend a box
+holding an unrelated token, and `init-box` refuses a token whose emission is not 1, a box
+holding anything besides the NFT, and a box that is already a tracker box (re-initializing
+would reset the committed digest). Before signing, every transaction is checked: ERG in
+equals ERG out, no token is burned, only the new NFT is minted, and the NFT appears once,
+first in output 0. `--dry-run` prints the unsigned transaction JSON and the exact register
+hex without signing or submitting.
 
 ### Format Options
 

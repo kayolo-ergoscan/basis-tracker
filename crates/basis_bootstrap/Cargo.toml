@@ -1,0 +1,23 @@
+[package]
+name = "basis_bootstrap"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+description = "One-time on-chain setup of a Basis tracker: mint the tracker NFT and create the tracker box, signed locally"
+
+[lib]
+name = "basis_bootstrap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "basis_bootstrap"
+path = "src/main.rs"
+
+[dependencies]
+basis_server = { path = "../basis_server" }
+basis_store = { path = "../basis_store" }
+ergo-lib = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+hex = "0.4"
+clap = { version = "4.0", features = ["derive"] }
