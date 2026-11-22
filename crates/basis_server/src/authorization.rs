@@ -60,6 +60,8 @@ fn required_role(path: &str, method: &str) -> ClientRole {
             // The removed `/reserves/submit` route fell through to the unknown-POST default
             // below, which is also Admin.
             "/redeem/complete" => ClientRole::Admin,
+            // Admin-only (round 5b, F6): drop or apply a journaled redemption.
+            "/redemption/journal/drop" | "/redemption/journal/apply" => ClientRole::Admin,
             // Write: state-changing redemption and note operations. `/reserves/create` only
             // builds a payload the owner submits to their own node (PR #16 B4), and an
             // `/acceptance/policy` upload is signed by the recipient it applies to, so both are
@@ -85,6 +87,8 @@ fn required_role(path: &str, method: &str) -> ClientRole {
             // The event log names the issuer, recipient and amount of every note update, so it
             // reveals the same note graph.
             "/notes" | "/events" | "/events/paginated" => ClientRole::Admin,
+            // Every journaled redemption with its keys and amounts (round 5b, F6).
+            "/redemption/journal" => ClientRole::Admin,
             // All other GET endpoints expose tracker state and are readable.
             _ => ClientRole::Read,
         },
@@ -173,5 +177,22 @@ mod tests {
         assert_eq!(required_role("/reserves/create", "POST"), ClientRole::Write);
         assert_eq!(required_role("/notes/state", "POST"), ClientRole::Read);
         assert_eq!(required_role("/acceptance/check", "POST"), ClientRole::Read);
+        // Round 5b (F6): the redemption journal is the operator's.
+        assert_eq!(
+            required_role("/redemption/journal", "GET"),
+            ClientRole::Admin
+        );
+        assert_eq!(
+            required_role("/redemption/journal/drop", "POST"),
+            ClientRole::Admin
+        );
+        assert_eq!(
+            required_role("/redemption/journal/apply", "POST"),
+            ClientRole::Admin
+        );
+        assert_eq!(
+            required_role("/redemption/submit", "POST"),
+            ClientRole::Write
+        );
     }
 }

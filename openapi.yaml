@@ -1254,6 +1254,149 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
 
+  /redemption/journal:
+    get:
+      summary: List the redemption journal (admin)
+      description: |
+        Every redemption journaled by `/redemption/submit` (round 5b): those
+        waiting for the chain, and those applied with a reserve tree out of
+        step with the chain (`digest_mismatch` set), which keep their reserve
+        from building until an operator drops them. Admin only.
+      operationId: listRedemptionJournal
+      tags:
+        - Redemption
+      responses:
+        '200':
+          description: The journal, in transaction id order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseRedemptionJournal'
+        '403':
+          description: The caller is not an admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '500':
+          description: The journal cannot be read
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+
+  /redemption/journal/drop:
+    post:
+      summary: Drop a journaled redemption (admin)
+      description: |
+        Remove a journaled redemption without applying it (round 5b); it no
+        longer holds back a commit, and its reserve can be built against
+        again. The answer is the removed entry. If the transaction is mined
+        after all, the tracker never applies it and its reserve tree is out of
+        step with the chain: drop only a redemption that can no longer be
+        mined, or a marked one already dealt with. Admin only.
+      operationId: dropJournaledRedemption
+      tags:
+        - Redemption
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JournalEntryRequest'
+      responses:
+        '200':
+          description: Dropped
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseJournaledRedemption'
+        '400':
+          description: '`tx_id` is not 64 hex characters'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '403':
+          description: The caller is not an admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '404':
+          description: No such journaled redemption
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '500':
+          description: The journal cannot be read or written
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+
+  /redemption/journal/apply:
+    post:
+      summary: Apply a journaled redemption now (admin)
+      description: |
+        Apply a journaled redemption without waiting for the chain (round 5b),
+        as the confirmer does once it is mined: the cumulative value and the
+        reserve tree timestamp the build proved, then the tracker's reserve
+        tree digest compared with the digest journaled at submit. Matching (or
+        nothing journaled to compare with), the entry leaves the journal and is
+        the answer. Applying an applied redemption changes nothing. Admin only.
+      operationId: applyJournaledRedemption
+      tags:
+        - Redemption
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JournalEntryRequest'
+      responses:
+        '200':
+          description: Applied and removed from the journal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseJournaledRedemption'
+        '400':
+          description: '`tx_id` is not 64 hex characters'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '403':
+          description: The caller is not an admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '404':
+          description: No such journaled redemption
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '409':
+          description: >-
+            It cannot be applied (the tracker's note no longer matches; the
+            entry stays with the error), or it is applied but the tracker's
+            reserve tree differs from the journaled digest (the entry stays,
+            marked)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '500':
+          description: The journal cannot be read
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+
   /acceptance/check:
     post:
       summary: Check note acceptance
@@ -3274,6 +3417,100 @@ components:
           properties:
             data:
               $ref: '#/components/schemas/RedemptionBuildResponse'
+
+    JournalEntryRequest:
+      type: object
+      description: Names a journaled redemption (round 5b)
+      required:
+        - tx_id
+      properties:
+        tx_id:
+          type: string
+          description: The redemption's transaction id (64 hex characters, any case)
+          pattern: '^[0-9a-fA-F]{64}$'
+
+    JournaledRedemption:
+      type: object
+      description: >-
+        A redemption submitted through `/redemption/submit` that the tracker
+        has not applied and removed yet (round 5; fields marked round 5b are
+        absent from entries journaled before it and read as their defaults)
+      properties:
+        tx_id:
+          type: string
+          description: The signed transaction's id (lower case)
+        reserve_box_id:
+          type: string
+          description: The reserve box it spends (lower case)
+        issuer_pubkey:
+          type: string
+        recipient_pubkey:
+          type: string
+        denomination:
+          type: string
+          description: '"erg" or "token:<64-hex>"'
+        redeemed_amount:
+          type: integer
+          format: uint64
+        new_already_redeemed:
+          type: integer
+          format: uint64
+          description: The cumulative redeemed amount the build proved
+        data_input_ids:
+          type: array
+          items:
+            type: string
+          description: The tracker box(es) it reads (lower case)
+        submitted_at_ms:
+          type: integer
+          format: uint64
+        missing_checks:
+          type: integer
+          format: uint32
+          description: Consecutive checks it was in neither a mempool nor the chain
+        apply_error:
+          type: string
+          nullable: true
+          description: Why the last attempt to apply it failed
+        reserve_tree_timestamp:
+          type: integer
+          format: uint64
+          nullable: true
+          description: The note timestamp the build proved in the reserve tree value (round 5b)
+        reserve_r5_digest:
+          type: string
+          nullable: true
+          description: The reserve tree digest (hex) in R5 of its reserve output (round 5b)
+        digest_mismatch:
+          type: string
+          nullable: true
+          description: >-
+            Set once it is applied with the tracker's reserve tree differing
+            from the mined reserve output's R5: both digests (round 5b)
+        next_check_at_ms:
+          type: integer
+          format: uint64
+          description: >-
+            Unix ms before which the confirmer does not look at it again (a
+            long-missing redemption that can still be mined; round 5b)
+
+    ApiResponseRedemptionJournal:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/JournaledRedemption'
+
+    ApiResponseJournaledRedemption:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/JournaledRedemption'
 
     ApiResponseRedemptionSubmit:
       allOf:

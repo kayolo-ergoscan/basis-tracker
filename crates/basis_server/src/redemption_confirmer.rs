@@ -32,6 +32,11 @@
 //! redemption is applied the reserve tree is one redemption behind the chain.
 //! `/notes/exchange` refuses the issuer's two reserves the same way (round 5b, F5).
 //!
+//! An operator lists, drops and applies journal entries through the admin routes
+//! `GET /redemption/journal`, `POST /redemption/journal/drop` and
+//! `POST /redemption/journal/apply` ([`list_journal`], [`drop_journal_entry`],
+//! [`apply_journal_entry`]; round 5b, F6).
+//!
 //! The journal is read again at startup, so a restart neither forgets a submitted redemption
 //! nor the commit it holds back ([`crate::tracker_box_updater`], round 5 item 3).
 
@@ -571,6 +576,154 @@ fn reset_missing(storage: &TrackerStorage, entry: &mut JournaledRedemption) {
         entry.missing_checks = 0;
         entry.next_check_at_ms = 0;
         write_back(storage, entry);
+    }
+}
+
+/// Body of `POST /redemption/journal/drop` and `POST /redemption/journal/apply` (round 5b, F6).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JournalEntryRequest {
+    /// The journaled redemption's transaction id (64 hex characters, any case).
+    pub tx_id: String,
+}
+
+type JournalAnswer<T> = (
+    axum::http::StatusCode,
+    axum::Json<crate::models::ApiResponse<T>>,
+);
+
+fn journal_error<T>(status: axum::http::StatusCode, message: impl Into<String>) -> JournalAnswer<T> {
+    (status, axum::Json(crate::models::error_response(message.into())))
+}
+
+/// The journal entry `tx_id` names, or the answer when there is none.
+fn requested_entry<T>(
+    storage: &TrackerStorage,
+    tx_id: &str,
+) -> Result<JournaledRedemption, JournalAnswer<T>> {
+    use axum::http::StatusCode;
+    if tx_id.len() != 64 || !tx_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(journal_error(
+            StatusCode::BAD_REQUEST,
+            "tx_id must be a transaction id (64 hex characters)",
+        ));
+    }
+    match storage.journaled_redemption(tx_id) {
+        Ok(Some(entry)) => Ok(entry),
+        Ok(None) => Err(journal_error(
+            StatusCode::NOT_FOUND,
+            format!("no journaled redemption {}", tx_id.to_ascii_lowercase()),
+        )),
+        Err(e) => {
+            error!("Cannot read the redemption journal: {:?}", e);
+            Err(journal_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the tracker cannot read its redemption journal",
+            ))
+        }
+    }
+}
+
+/// `GET /redemption/journal` (Admin; round 5b, F6): every journaled redemption, those waiting
+/// for the chain and those marked after their apply (`digest_mismatch`), in key order.
+pub async fn list_journal(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> JournalAnswer<Vec<JournaledRedemption>> {
+    match state.tracker_storage.journaled_redemptions() {
+        Ok(entries) => (
+            axum::http::StatusCode::OK,
+            axum::Json(crate::models::success_response(entries)),
+        ),
+        Err(e) => {
+            error!("Cannot read the redemption journal: {:?}", e);
+            journal_error(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "the tracker cannot read its redemption journal",
+            )
+        }
+    }
+}
+
+/// `POST /redemption/journal/drop` (Admin; round 5b, F6): remove a journaled redemption without
+/// applying it, and stop it holding back a commit; answers the removed entry. Its reserve can
+/// be built against again. If the transaction is mined after all, the tracker never applies it
+/// and its reserve tree falls out of step with the chain, so drop only a redemption that can no
+/// longer be mined, or a marked one an operator has dealt with.
+pub async fn drop_journal_entry(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    axum::Json(request): axum::Json<JournalEntryRequest>,
+) -> JournalAnswer<JournaledRedemption> {
+    let entry = match requested_entry(&state.tracker_storage, &request.tx_id) {
+        Ok(entry) => entry,
+        Err(answer) => return answer,
+    };
+    if let Err(e) = state.tracker_storage.remove_journaled_redemption(&entry.tx_id) {
+        error!("Cannot remove journaled redemption {}: {:?}", entry.tx_id, e);
+        return journal_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "the tracker cannot write its redemption journal",
+        );
+    }
+    let shared = state.shared_tracker_state.lock().await.clone();
+    shared.forget_submitted_redemptions(&[entry.tx_id.clone()]);
+    warn!(
+        "Operator dropped journaled redemption {} ({} of {} -> {} in {}, cumulative {}{}): nothing was applied. If it is mined after all, the tracker's reserve tree is out of step with the chain.",
+        entry.tx_id,
+        entry.redeemed_amount,
+        entry.issuer_pubkey,
+        entry.recipient_pubkey,
+        entry.denomination,
+        entry.new_already_redeemed,
+        entry
+            .digest_mismatch
+            .as_deref()
+            .map(|m| format!("; marked: {m}"))
+            .unwrap_or_default()
+    );
+    (
+        axum::http::StatusCode::OK,
+        axum::Json(crate::models::success_response(entry)),
+    )
+}
+
+/// `POST /redemption/journal/apply` (Admin; round 5b, F6): apply a journaled redemption now,
+/// without looking at the chain, as the confirmer does once it is mined: the cumulative value
+/// and the reserve tree timestamp the build proved, then the tracker's reserve tree compared
+/// with the digest journaled at submit. Matching (or nothing to compare with), the entry leaves
+/// the journal and the answer is it; differing, it stays marked (409); when it cannot be
+/// applied, it stays with the error (409). Applying an applied redemption changes nothing.
+pub async fn apply_journal_entry(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+    axum::Json(request): axum::Json<JournalEntryRequest>,
+) -> JournalAnswer<JournaledRedemption> {
+    use axum::http::StatusCode;
+    let entry = match requested_entry(&state.tracker_storage, &request.tx_id) {
+        Ok(entry) => entry,
+        Err(answer) => return answer,
+    };
+    let shared = state.shared_tracker_state.lock().await.clone();
+    match apply_journaled_against(&state.tracker_storage, &shared, &state.tx, &entry, None).await
+    {
+        Ok(Applied::Matching) => {
+            warn!(
+                "Operator applied journaled redemption {} without the chain's confirmation",
+                entry.tx_id
+            );
+            (StatusCode::OK, axum::Json(crate::models::success_response(entry)))
+        }
+        Ok(Applied::Mismatch) => journal_error(
+            StatusCode::CONFLICT,
+            format!(
+                "redemption {} is applied, but the tracker's reserve tree differs from the digest journaled at submit; it stays journaled, marked (GET /redemption/journal)",
+                entry.tx_id
+            ),
+        ),
+        Err(e) => journal_error(
+            StatusCode::CONFLICT,
+            format!(
+                "redemption {} cannot be applied ({e}); it stays journaled",
+                entry.tx_id
+            ),
+        ),
     }
 }
 

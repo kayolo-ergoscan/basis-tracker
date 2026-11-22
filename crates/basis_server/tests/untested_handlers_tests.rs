@@ -744,6 +744,115 @@ mod untested_handlers {
         }
     }
 
+    /// Round 5b (F6): the admin journal routes. The list shows every entry; a drop removes one
+    /// unapplied and stops it holding back a commit; an apply applies one now (with the build's
+    /// cumulative value and timestamp) and removes it; one that cannot be applied stays with the
+    /// error (409). An unknown id is 404, a malformed one 400.
+    #[tokio::test]
+    async fn test_redemption_journal_admin_routes() {
+        use basis_server::redemption_confirmer::{
+            apply_journal_entry, drop_journal_entry, list_journal, JournalEntryRequest,
+        };
+        let state = mock_state().await;
+        let (secret, issuer) = generate_keypair();
+        let (_, recipient) = generate_keypair();
+        let note = IouNote::create_and_sign(
+            recipient,
+            10_000,
+            RESERVE_TREE_TIMESTAMP,
+            &secret,
+            &[0x42; 32],
+            basis_store::DenomKey::Erg,
+        )
+        .unwrap();
+        let (added_tx, added) = tokio::sync::oneshot::channel();
+        state
+            .tx
+            .send(TrackerCommand::AddNote {
+                issuer_pubkey: issuer,
+                note,
+                response_tx: added_tx,
+            })
+            .await
+            .unwrap();
+        added.await.unwrap().unwrap();
+
+        let entry = |tx_id: String, recipient: basis_store::PubKey| {
+            basis_store::persistence::JournaledRedemption {
+                tx_id,
+                reserve_box_id: RESERVE_BOX_ID.to_string(),
+                issuer_pubkey: hex::encode(issuer),
+                recipient_pubkey: hex::encode(recipient),
+                denomination: "erg".to_string(),
+                redeemed_amount: 1_000,
+                new_already_redeemed: 1_000,
+                data_input_ids: vec!["cd".repeat(32)],
+                submitted_at_ms: 1,
+                reserve_tree_timestamp: Some(RESERVE_TREE_TIMESTAMP),
+                ..Default::default()
+            }
+        };
+        let (dropped, applied) = ("5e".repeat(32), "6f".repeat(32));
+        let shared = state.shared_tracker_state.lock().await.clone();
+        for tx_id in [&dropped, &applied] {
+            let e = entry(tx_id.clone(), recipient);
+            state.tracker_storage.journal_redemption(&e).unwrap();
+            shared.record_submitted_redemption(e.tx_id, e.data_input_ids);
+        }
+        let request = |tx_id: &str| {
+            axum::extract::Json(JournalEntryRequest {
+                tx_id: tx_id.to_string(),
+            })
+        };
+
+        let (status, body) = list_journal(axum::extract::State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let ids: Vec<String> = body.0.data.unwrap().into_iter().map(|e| e.tx_id).collect();
+        assert_eq!(ids, vec![dropped.clone(), applied.clone()]);
+
+        let (status, body) = drop_journal_entry(
+            axum::extract::State(state.clone()),
+            request(&dropped.to_ascii_uppercase()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{:?}", body.0.error);
+        assert_eq!(body.0.data.unwrap().tx_id, dropped);
+        assert_eq!(state.tracker_storage.journaled_redemptions().unwrap().len(), 1);
+        assert_eq!(shared.get_submitted_redemptions().len(), 1);
+        assert_eq!(note_redeemed(&state, issuer, recipient).await, 0, "nothing applied");
+        let (status, _) =
+            drop_journal_entry(axum::extract::State(state.clone()), request(&dropped)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) =
+            drop_journal_entry(axum::extract::State(state.clone()), request("not-a-tx")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) =
+            apply_journal_entry(axum::extract::State(state.clone()), request(&applied)).await;
+        assert_eq!(status, StatusCode::OK, "{:?}", body.0.error);
+        assert!(state.tracker_storage.journaled_redemptions().unwrap().is_empty());
+        assert!(shared.get_submitted_redemptions().is_empty());
+        assert_eq!(note_redeemed(&state, issuer, recipient).await, 1_000);
+        let (status, _) =
+            apply_journal_entry(axum::extract::State(state.clone()), request(&applied)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A redemption of a note the tracker does not hold cannot be applied: it stays.
+        let stranger = generate_keypair().1;
+        let failing = entry("7a".repeat(32), stranger);
+        state.tracker_storage.journal_redemption(&failing).unwrap();
+        let (status, body) = apply_journal_entry(
+            axum::extract::State(state.clone()),
+            request(&failing.tx_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.0.error.unwrap().contains("cannot be applied"));
+        let kept = state.tracker_storage.journaled_redemptions().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].apply_error.is_some(), "{kept:?}");
+    }
+
     async fn note_redeemed(
         state: &basis_server::AppState,
         issuer: basis_store::PubKey,

@@ -956,6 +956,19 @@ async fn main() {
             "/redemption/submit",
             post(submit_redemption).options(handle_options),
         )
+        // Round 5b (F6), Admin: the redemption journal.
+        .route(
+            "/redemption/journal",
+            get(basis_server::redemption_confirmer::list_journal),
+        )
+        .route(
+            "/redemption/journal/drop",
+            post(basis_server::redemption_confirmer::drop_journal_entry),
+        )
+        .route(
+            "/redemption/journal/apply",
+            post(basis_server::redemption_confirmer::apply_journal_entry),
+        )
         .route("/reserves", get(get_all_reserves))
         .route(
             "/reserves/create",
