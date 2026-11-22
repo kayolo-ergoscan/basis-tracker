@@ -149,8 +149,8 @@ configured Ergo node wallet.
 
 ### Events
 
-- `GET /events` - Get the 50 most recent tracker events
-- `GET /events/paginated` - Get paginated tracker events
+- `GET /events` - Get the 50 most recent tracker events (Admin role)
+- `GET /events/paginated` - Get paginated tracker events, oldest first (Admin role)
 
 ### Status
 

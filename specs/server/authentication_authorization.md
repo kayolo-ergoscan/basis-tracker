@@ -48,7 +48,7 @@ tls_key_path = "server.key"
 mode = "signature"          # RECOMMENDED. The built-in default is "none".
 # Shared secret used only when mode = "api_key".
 # api_key = "change-me"
-# Separate key for the Admin-only routes (/redeem/complete, GET /notes). Required when
+# Separate key for the Admin-only routes (/redeem/complete, GET /notes, GET /events*). Required when
 # mode = "api_key": api_key above then grants only Write. The server refuses to
 # start without it, with the "change-me-admin" placeholder, or equal to api_key.
 # admin_api_key = "..."
@@ -139,6 +139,7 @@ Every authenticated request receives an effective role. Routes require the follo
 | `/` | `GET` | public (Read context inserted) |
 | `GET` endpoints | `GET` | `Read` |
 | `/notes` | `GET` | `Admin` (every note of every pair; per-key `/notes/issuer/...` and `/notes/recipient/...` stay `Read`) |
+| `/events`, `/events/paginated` | `GET` | `Admin` (the event log names the issuer, recipient and amount of every note update) |
 | `/notes` | `POST` | `Write` |
 | `/redeem` | `POST` | `Write` |
 | `/redeem/complete` | `POST` | `Admin` |
@@ -160,7 +161,7 @@ Role hierarchy: `Admin` > `Write` > `Read`. A higher role can access endpoints r
 - `api_key` mode: by default the shared `api_key` gets `Admin`. When
   `server.auth.admin_api_key` is configured, the shared `api_key` grants only `Write` and
   `admin_api_key` grants `Admin` — the key handed to ordinary clients then cannot reach
-  operator-only routes (`/redeem/complete`, `GET /notes`). When
+  operator-only routes (`/redeem/complete`, `GET /notes`, `GET /events`, `GET /events/paginated`). When
   `admin_api_key` is unset the server keeps the full-`Admin` behavior for backward
   compatibility and logs a startup warning recommending it be set.
 - `signature` mode: role is taken from the matching `authorized_clients` entry.
@@ -254,7 +255,7 @@ Two related changes from the same review:
   `Admin` to every unauthenticated request. Do not rely on the default.
 - In `api_key` mode, **configure `server.auth.admin_api_key`** so the key shared with ordinary
   clients grants only `Write` and operator-only routes (`/redeem/complete`,
-  `GET /notes`) require the separate admin key. Never use the
+  `GET /notes`, `GET /events`, `GET /events/paginated`) require the separate admin key. Never use the
   example placeholder key — the server refuses to start with it.
 - Never run `mode = "none"` or `api_key` over plaintext in production; configure TLS.
 - Keep `signature_timestamp_tolerance_ms` small (default 30 s) to limit replay windows.

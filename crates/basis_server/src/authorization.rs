@@ -82,7 +82,9 @@ fn required_role(path: &str, method: &str) -> ClientRole {
         "GET" => match path {
             // Every note of every issuer and recipient in one response: operator-only. The
             // per-key note endpoints (`/notes/issuer/...`, `/notes/recipient/...`) stay Read.
-            "/notes" => ClientRole::Admin,
+            // The event log names the issuer, recipient and amount of every note update, so it
+            // reveals the same note graph.
+            "/notes" | "/events" | "/events/paginated" => ClientRole::Admin,
             // All other GET endpoints expose tracker state and are readable.
             _ => ClientRole::Read,
         },
@@ -153,6 +155,8 @@ mod tests {
             ClientRole::Read
         );
         assert_eq!(required_role("/tracker/state", "GET"), ClientRole::Read);
+        assert_eq!(required_role("/events", "GET"), ClientRole::Admin);
+        assert_eq!(required_role("/events/paginated", "GET"), ClientRole::Admin);
         assert_eq!(required_role("/notes", "POST"), ClientRole::Write);
         assert_eq!(required_role("/redeem", "POST"), ClientRole::Write);
         assert_eq!(required_role("/redeem/complete", "POST"), ClientRole::Admin);

@@ -26,6 +26,8 @@ fn test_app(auth_config: AuthConfig) -> Router {
         .route("/notes", get(protected_handler).post(protected_handler))
         .route("/notes/issuer/{pubkey}", get(protected_handler))
         .route("/tracker/state", get(protected_handler))
+        .route("/events", get(protected_handler))
+        .route("/events/paginated", get(protected_handler))
         .route("/acceptance/policy", post(protected_handler))
         .route("/redeem/complete", post(protected_handler))
         .layer(axum::middleware::from_fn(authorization_middleware))
@@ -556,6 +558,52 @@ async fn signature_mode_rejects_zero_padded_timestamp_replay() {
         "zero-padded replay must be rejected, got {}",
         response.status()
     );
+}
+
+/// The event log names the issuer, recipient and amount of every note update: Admin only, like
+/// GET /notes. A Read or Write client gets 403; the operator key passes.
+#[tokio::test]
+async fn event_log_requires_admin() {
+    let mut config = AuthConfig::default();
+    config.mode = AuthMode::ApiKey;
+    config.api_key = Some("shared-key".to_string());
+    config.admin_api_key = Some("operator-key".to_string());
+    let app = test_app(config);
+    for uri in ["/events", "/events/paginated?page=0&page_size=10"] {
+        for (key, expected) in [
+            ("shared-key", StatusCode::FORBIDDEN),
+            ("operator-key", StatusCode::OK),
+        ] {
+            let request = Request::builder()
+                .uri(uri)
+                .method("GET")
+                .header("Authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap();
+            let status = app.clone().oneshot(request).await.unwrap().status();
+            assert_eq!(status, expected, "{uri} with {key}");
+        }
+    }
+
+    // A Read signature client is refused too.
+    let (pubkey_hex, secret_key) = generate_keypair();
+    let mut config = AuthConfig::default();
+    config.mode = AuthMode::Signature;
+    config.authorized_clients.push(AuthorizedClient {
+        pubkey: pubkey_hex.clone(),
+        role: ClientRole::Read,
+    });
+    let app = test_app(config);
+    let request = sign_request_full(
+        Request::builder().uri("/events").method("GET"),
+        Vec::new(),
+        &pubkey_hex,
+        &secret_key,
+        current_timestamp_ms(),
+        "read-events",
+    );
+    let status = app.oneshot(request).await.unwrap().status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 /// GET /notes lists every note of every pair: Admin only. The per-key note endpoints stay

@@ -549,7 +549,10 @@ paths:
   /events:
     get:
       summary: Get recent tracker events
-      description: Retrieve the 50 most recent tracker events including note updates, reserve changes, and system events.
+      description: >-
+        Retrieve the 50 most recent tracker events including note updates, reserve changes, and
+        system events. Admin role: the events name the issuer, recipient and amount of every
+        note update.
       operationId: getEvents
       tags:
         - Events
@@ -560,6 +563,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiResponseEvents'
+        '403':
+          description: Forbidden - the caller's role is not Admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
         '500':
           description: Internal server error
           content:
@@ -570,7 +579,10 @@ paths:
   /events/paginated:
     get:
       summary: Get paginated tracker events
-      description: Retrieve paginated tracker events including note updates, reserve changes, and system events.
+      description: >-
+        Retrieve paginated tracker events, oldest first, including note updates, reserve changes,
+        and system events. Admin role. A page past the end is empty; page_size is clamped to
+        1..=100.
       operationId: getEventsPaginated
       tags:
         - Events
@@ -599,6 +611,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiResponseEvents'
+        '403':
+          description: Forbidden - the caller's role is not Admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
         '500':
           description: Internal server error
           content:

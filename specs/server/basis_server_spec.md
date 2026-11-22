@@ -107,14 +107,19 @@ fjall keyspace waits up to one fsync interval to close.
 
 ### Event Tracking
 
-- `GET /events` - Get recent tracker events
-- `GET /events/paginated?page=0&page_size=20` - Get paginated events
+- `GET /events` - Get the 50 most recent tracker events (Admin role)
+- `GET /events/paginated?page=0&page_size=20` - Get paginated events, oldest first (Admin role;
+  `page_size` 1..=100, a page past the end is empty)
+
+Both event endpoints are Admin-only: the event log names the issuer, recipient and amount of
+every note update, the same note graph as `GET /notes`.
 
 > **Endpoint inventory note (2026-09-28).** The list above was verified against the routes
 > registered in `crates/basis_server/src/main.rs`. All 30 registered routes are now documented.
-> One operational caveat: `GET /events/paginated` does not currently validate `page`/`page_size`
-> bounds — see `specs/PRODUCTION_READINESS_AUDIT.md` (Issue #3). The event store is no longer
-> seeded with demo events at startup (H9): it holds only events the tracker observed.
+> `GET /events/paginated` used to panic on a page past the end and overflow on large
+> `page`/`page_size` (`specs/PRODUCTION_READINESS_AUDIT.md`, Issue #3); both are fixed. The event
+> store is no longer seeded with demo events at startup (H9): it holds only events the tracker
+> observed.
 
 ## Data Models
 
@@ -312,7 +317,8 @@ Key configuration includes:
   - `api_key`: shared secret used when `mode = "api_key"`. Grants `Admin` by default; when
     `admin_api_key` is set it grants only `Write`.
   - `admin_api_key`: optional separate key that grants `Admin` on the operator-only routes
-    (`/redeem/complete`, `GET /notes`) when `mode = "api_key"`.
+    (`/redeem/complete`, `GET /notes`, `GET /events`, `GET /events/paginated`) when
+    `mode = "api_key"`.
   - `authorized_clients`: list of `{ pubkey, role }` entries used when `mode = "signature"`.
   - `allowed_origins`: CORS origin allow-list. Empty (default) disables CORS entirely; wildcard origins are never used.
   - `signature_timestamp_tolerance_ms`: maximum age of a request signature in milliseconds (default 30 s).

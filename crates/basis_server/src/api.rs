@@ -2040,12 +2040,13 @@ pub async fn get_events_paginated(
 ) -> (StatusCode, Json<ApiResponse<Vec<TrackerEvent>>>) {
     tracing::debug!("Getting paginated events: {:?}", params);
 
-    // Parse pagination parameters with defaults
+    // Parse pagination parameters with defaults; page_size is 1..=100 (openapi.yaml).
     let page = params.get("page").and_then(|p| p.parse().ok()).unwrap_or(0);
     let page_size = params
         .get("page_size")
-        .and_then(|ps| ps.parse().ok())
-        .unwrap_or(20);
+        .and_then(|ps| ps.parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
 
     // Get events from event store
     let events = match state
@@ -2085,19 +2086,8 @@ pub async fn get_events(
 ) -> (StatusCode, Json<ApiResponse<Vec<TrackerEvent>>>) {
     tracing::debug!("Getting recent events");
 
-    // Get recent events (last 50 events by default)
-    let events = match state.event_store.get_events_paginated(0, 50).await {
-        Ok(events) => events,
-        Err(e) => {
-            tracing::error!("Failed to retrieve events: {:?}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(crate::models::error_response(
-                    "Failed to retrieve events".to_string(),
-                )),
-            );
-        }
-    };
+    // The 50 most recent events (page 0 of the paginated list is the 50 oldest).
+    let events = state.event_store.get_recent_events(50).await;
 
     tracing::info!("Successfully retrieved {} recent events", events.len());
 
