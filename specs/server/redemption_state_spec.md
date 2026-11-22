@@ -466,6 +466,15 @@ signs the fee input(s).
 whose on-chain R5 digest equals the tracker's local reserve-tree digest. A mismatch
 means local state is stale and the reserve is skipped.
 
+**Fee inputs:** token-free boxes at `P2PK(tracker key)` from the public `byAddress` index. The
+tracker box ids the tracker knows (the data input, the live and the confirmed one) and the
+reserve box are never offered, whatever the index says they hold. Before signing, the tracker
+checks the boxes as the node returned their bytes (`/utxo/byIdBinary`), which is what the
+transaction spends: each fee input is locked by the tracker key and holds no token, and the
+transaction moves every input token to the outputs unchanged. Otherwise the build fails with
+500 and nothing is signed, so a stale index entry can never get the tracker to sign away its
+NFT.
+
 **`new_already_redeemed`:** computed from the **reserve-tree lookup** (previous
 cumulative value for this reserve, `0` for a first redemption) plus the requested
 amount — *not* from the note record. With multiple reserves per issuer (each reserve

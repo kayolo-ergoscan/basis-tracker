@@ -248,16 +248,20 @@ impl NodeClient {
 
     /// Token-free boxes locked by `P2PK(tracker_pubkey)`, from the public
     /// `POST /blockchain/box/unspent/byAddress` (no node wallet, no API key). Boxes spent in the
-    /// mempool are skipped; token-bearing boxes (the tracker box among them) are never returned.
+    /// mempool are skipped; token-bearing boxes (the tracker box among them) are never returned,
+    /// and neither are `exclude_box_ids`, whatever the index says they hold.
     async fn tracker_fee_boxes(
         &self,
         tracker_pubkey: &[u8; 33],
         enough: u64,
+        exclude_box_ids: &[&str],
     ) -> Result<Vec<NodeBox>, String> {
         let address = crate::local_wallet::p2pk_address(tracker_pubkey)?;
         let tree = crate::local_wallet::p2pk_tree_hex(tracker_pubkey);
         let node = crate::local_wallet::NodeEndpoint::new(&self.url, self.api_key.clone());
-        let scan = crate::local_wallet::scan_fee_boxes(&node, &address, &tree, &[], enough).await?;
+        let scan =
+            crate::local_wallet::scan_fee_boxes(&node, &address, &tree, exclude_box_ids, enough)
+                .await?;
         if scan.truncated {
             tracing::warn!(
                 "fee box scan of the tracker address stopped after {} pages",
@@ -635,6 +639,63 @@ fn select_fee_inputs(
     None
 }
 
+/// Checks a redemption before the tracker signs its fee inputs with its own key.
+///
+/// The fee inputs were picked from the address index (`byAddress`), which can be stale or
+/// wrong. These checks read the boxes as the node returned their bytes (`/utxo/byIdBinary`),
+/// which is what the transaction spends, so a wrong index entry (for the tracker box above
+/// all) can never get the tracker to sign away a token such as its own NFT:
+/// - `input_boxes` are exactly the boxes `unsigned` spends, in order;
+/// - every fee input (every input after the reserve, input 0) is locked by `P2PK(tracker key)`
+///   (`tracker_tree_hex`) and holds no token;
+/// - the transaction moves every input token to the outputs with the same total and creates
+///   none ([`crate::local_wallet::check_tokens_preserved`]).
+fn check_before_fee_signing(
+    unsigned: &UnsignedTransaction,
+    input_boxes: &[ErgoBox],
+    tracker_tree_hex: &str,
+) -> Result<(), String> {
+    if input_boxes.len() != unsigned.inputs.len() {
+        return Err(format!(
+            "{} boxes for {} inputs",
+            input_boxes.len(),
+            unsigned.inputs.len()
+        ));
+    }
+    for (i, (input, ergo_box)) in unsigned.inputs.iter().zip(input_boxes).enumerate() {
+        if input.box_id != ergo_box.box_id() {
+            return Err(format!(
+                "input {i} spends box {}, but the node's bytes are box {}",
+                String::from(input.box_id),
+                String::from(ergo_box.box_id())
+            ));
+        }
+    }
+    for (i, fee_box) in input_boxes.iter().enumerate().skip(1) {
+        let id = String::from(fee_box.box_id());
+        let tree = fee_box
+            .ergo_tree
+            .sigma_serialize_bytes()
+            .map_err(|e| format!("fee input {i} ({id}) script: {e}"))?;
+        if !hex::encode(tree).eq_ignore_ascii_case(tracker_tree_hex) {
+            return Err(format!(
+                "fee input {i} ({id}) is not locked by P2PK(tracker key)"
+            ));
+        }
+        if let Some(tokens) = &fee_box.tokens {
+            let token_ids: Vec<String> = tokens.iter().map(|t| String::from(t.token_id)).collect();
+            return Err(format!(
+                "fee input {i} ({id}) holds tokens {token_ids:?}; a fee input must hold none"
+            ));
+        }
+    }
+    crate::local_wallet::check_tokens_preserved(
+        input_boxes,
+        unsigned.output_candidates.as_vec(),
+        None,
+    )
+}
+
 type ApiResult<T> = Result<T, (StatusCode, Json<ApiResponse<RedemptionBuildResponse>>)>;
 
 fn api_err<T>(status: StatusCode, msg: impl Into<String>) -> ApiResult<T> {
@@ -1002,23 +1063,23 @@ async fn build_redemption_inner(
     }
 
     // Tracker box id (data input). Prefer the live shared state over the static
-    // tracker storage, which can contain spent boxes.
-    let tracker_box_id = match &payload.tracker_box_id {
-        Some(id) => id.clone(),
-        None => {
-            let shared = state.shared_tracker_state.lock().await;
-            match shared
-                .get_tracker_box_id()
-                .or_else(|| shared.get_confirmed().box_id)
-            {
-                Some(id) => id,
-                None => {
-                    return api_err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "no tracker box in live state",
-                    )
-                }
-            }
+    // tracker storage, which can contain spent boxes. Every tracker box id known here is also
+    // kept out of the fee inputs below.
+    let known_tracker_box_ids: Vec<String> = {
+        let shared = state.shared_tracker_state.lock().await;
+        [shared.get_tracker_box_id(), shared.get_confirmed().box_id]
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    let tracker_box_id = match (&payload.tracker_box_id, known_tracker_box_ids.first()) {
+        (Some(id), _) => id.clone(),
+        (None, Some(id)) => id.clone(),
+        (None, None) => {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no tracker box in live state",
+            )
         }
     };
 
@@ -1286,8 +1347,20 @@ async fn build_redemption_inner(
             )
         }
     };
+    // Never a fee input: the tracker box (it holds the tracker NFT) and the reserve box, even if
+    // the address index lists one of them as a plain box. The parsed boxes are checked again
+    // before signing (`check_before_fee_signing`).
+    let fee_exclusions: Vec<&str> = known_tracker_box_ids
+        .iter()
+        .map(String::as_str)
+        .chain([tracker_box_id.as_str(), reserve_box_id.as_str()])
+        .collect();
     let wallet_boxes = match chain_node
-        .tracker_fee_boxes(&tracker_pubkey_for_fees, fee_input_required)
+        .tracker_fee_boxes(
+            &tracker_pubkey_for_fees,
+            fee_input_required,
+            &fee_exclusions,
+        )
         .await
     {
         Ok(b) => b,
@@ -1622,6 +1695,15 @@ async fn build_redemption_inner(
     let mut input_boxes = vec![reserve_ebox];
     input_boxes.extend(fee_eboxes);
     let data_boxes = vec![tracker_ebox];
+
+    let tracker_tree_hex = crate::local_wallet::p2pk_tree_hex(&tracker_pubkey_for_fees);
+    if let Err(e) = check_before_fee_signing(&unsigned, &input_boxes, &tracker_tree_hex) {
+        tracing::error!("Refusing to sign the fee inputs of redemption {built_tx_id}: {e}");
+        return api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("refusing to sign the fee inputs: {e}"),
+        );
+    }
 
     // State context for proving (contract does not read headers/params; height from PreHeader):
     // the newest header first, and the pre-header from the newest.
@@ -2296,6 +2378,209 @@ mod tests {
         assert!(
             basis_store::schnorr::schnorr_verify(&sig, &token_message, &tracker_pubkey).is_err()
         );
+    }
+
+    /// The unsigned transaction spending `inputs` (empty extensions, no data input), in the
+    /// node's JSON format, as the builder writes it.
+    fn unsigned_spending(inputs: &[&ErgoBox], outputs: Vec<Value>) -> UnsignedTransaction {
+        let inputs: Vec<Value> = inputs
+            .iter()
+            .map(|b| json!({ "boxId": String::from(b.box_id()), "extension": {} }))
+            .collect();
+        serde_json::from_value(json!({ "inputs": inputs, "dataInputs": [], "outputs": outputs }))
+            .unwrap()
+    }
+
+    fn json_output(ergo_tree: &str, value: u64, tokens: &[([u8; 32], u64)]) -> Value {
+        let assets: Vec<Value> = tokens
+            .iter()
+            .map(|(id, amount)| json!({ "tokenId": hex::encode(id), "amount": amount }))
+            .collect();
+        json!({
+            "value": value,
+            "ergoTree": ergo_tree,
+            "creationHeight": 123_400,
+            "assets": assets,
+            "additionalRegisters": {}
+        })
+    }
+
+    /// Boxes for a redemption: the tracker key, a reserve holding its NFT, a plain fee box of
+    /// the tracker key and the tracker box (tracker key, tracker NFT).
+    struct FeeSigningFixture {
+        tracker_tree_hex: String,
+        reserve: ErgoBox,
+        fee_box: ErgoBox,
+        tracker_box: ErgoBox,
+    }
+
+    const RESERVE_NFT: [u8; 32] = [0x77; 32];
+    const TRACKER_NFT: [u8; 32] = [0x11; 32];
+
+    fn fee_signing_fixture(reserve_tokens: &[([u8; 32], u64)]) -> FeeSigningFixture {
+        use crate::local_wallet::tests::{fresh_key, tree_of, utxo_box};
+        let (_, tracker) = fresh_key();
+        let (_, owner) = fresh_key();
+        let tracker_tree = tree_of(&tracker.public_key());
+        FeeSigningFixture {
+            tracker_tree_hex: crate::local_wallet::p2pk_tree_hex(&tracker.public_key()),
+            reserve: utxo_box(
+                &tree_of(&owner.public_key()),
+                10_000_000,
+                reserve_tokens,
+                &[],
+                123_000,
+                0,
+            ),
+            fee_box: utxo_box(&tracker_tree, 5_000_000, &[], &[], 123_100, 1),
+            tracker_box: utxo_box(
+                &tracker_tree,
+                2_000_000,
+                &[(TRACKER_NFT, 1)],
+                &[],
+                123_200,
+                2,
+            ),
+        }
+    }
+
+    impl FeeSigningFixture {
+        /// The outputs of an ERG redemption of 0.001 ERG paid from `fee_input`: the reserve with
+        /// its NFT, the recipient, the miner fee (0.001 ERG) and the rest of `fee_input` back to
+        /// the tracker as change, carrying `change_tokens`.
+        fn outputs(&self, fee_input: &ErgoBox, change_tokens: &[([u8; 32], u64)]) -> Vec<Value> {
+            let reserve_tree = hex::encode(self.reserve.ergo_tree.sigma_serialize_bytes().unwrap());
+            let change = fee_input.value.as_u64() - 1_000_000;
+            vec![
+                json_output(&reserve_tree, 9_000_000, &[(RESERVE_NFT, 1)]),
+                json_output(&self.tracker_tree_hex, 1_000_000, &[]),
+                json_output(FEE_CONTRACT_TREE, 1_000_000, &[]),
+                json_output(&self.tracker_tree_hex, change, change_tokens),
+            ]
+        }
+    }
+
+    #[test]
+    fn an_honest_redemption_passes_the_fee_signing_checks() {
+        let fx = fee_signing_fixture(&[(RESERVE_NFT, 1)]);
+        let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
+        let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
+        check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap();
+    }
+
+    /// A stale or wrong index entry offered the tracker box as a plain fee box. Its bytes hold the
+    /// tracker NFT, so the tracker refuses to sign, whether or not the outputs carry the NFT on.
+    #[test]
+    fn a_fee_input_holding_a_token_is_never_signed() {
+        let fx = fee_signing_fixture(&[(RESERVE_NFT, 1)]);
+        let inputs = vec![fx.reserve.clone(), fx.tracker_box.clone()];
+        for nft_in_change in [&[][..], &[(TRACKER_NFT, 1)][..]] {
+            let unsigned = unsigned_spending(
+                &[&fx.reserve, &fx.tracker_box],
+                fx.outputs(&fx.tracker_box, nft_in_change),
+            );
+            let err =
+                check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+            assert!(err.contains("fee input 1"), "{err}");
+            assert!(err.contains("holds tokens"), "{err}");
+            assert!(err.contains(&hex::encode(TRACKER_NFT)), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_redemption_that_burns_or_mints_a_token_is_never_signed() {
+        // The reserve holds a second token that no output carries on.
+        let fx = fee_signing_fixture(&[(RESERVE_NFT, 1), ([0x55; 32], 7)]);
+        let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
+        let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
+        let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+        assert!(err.contains("would be burned"), "{err}");
+
+        // The reserve output carries an NFT the reserve does not hold.
+        let fx = fee_signing_fixture(&[]);
+        let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
+        let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
+        let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+        assert!(err.contains("in no input"), "{err}");
+    }
+
+    #[test]
+    fn fee_inputs_of_another_key_or_another_box_are_never_signed() {
+        use crate::local_wallet::tests::{fresh_key, tree_of, utxo_box};
+        let fx = fee_signing_fixture(&[(RESERVE_NFT, 1)]);
+        let (_, stranger) = fresh_key();
+        let foreign = utxo_box(
+            &tree_of(&stranger.public_key()),
+            5_000_000,
+            &[],
+            &[],
+            123_100,
+            3,
+        );
+        let unsigned = unsigned_spending(&[&fx.reserve, &foreign], fx.outputs(&foreign, &[]));
+        let inputs = vec![fx.reserve.clone(), foreign.clone()];
+        let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+        assert!(err.contains("not locked by P2PK(tracker key)"), "{err}");
+
+        // The node's bytes are another box than the one the transaction spends.
+        let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
+        let inputs = vec![fx.reserve.clone(), foreign];
+        let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+        assert!(err.contains("input 1 spends box"), "{err}");
+    }
+
+    /// The address index lists the tracker box without its NFT. The fee scan of a redemption
+    /// excludes the known tracker box id, so it is not even offered.
+    #[tokio::test]
+    async fn the_fee_scan_never_offers_the_tracker_box() {
+        use crate::local_wallet::tests::mock_node;
+        let fx = fee_signing_fixture(&[(RESERVE_NFT, 1)]);
+        let tracker_id = String::from(fx.tracker_box.box_id());
+        let fee_id = String::from(fx.fee_box.box_id());
+        let page = json!([
+            { "boxId": tracker_id, "value": 2_000_000u64, "ergoTree": fx.tracker_tree_hex,
+              "assets": [], "additionalRegisters": {}, "creationHeight": 123_200 },
+            { "boxId": fee_id, "value": 5_000_000u64, "ergoTree": fx.tracker_tree_hex,
+              "assets": [], "additionalRegisters": {}, "creationHeight": 123_100 }
+        ])
+        .to_string();
+        let (url, _) = mock_node(move |method, target, _| {
+            match (method, target.split('?').next().unwrap_or_default()) {
+                ("POST", "/blockchain/box/unspent/byAddress") if target.contains("offset=0&") => {
+                    (200, page.clone())
+                }
+                ("POST", "/blockchain/box/unspent/byAddress") => (200, "[]".to_string()),
+                _ => (404, "{}".to_string()),
+            }
+        })
+        .await;
+        let node = NodeClient { url, api_key: None };
+        let pubkey: [u8; 33] = hex::decode(&fx.tracker_tree_hex[6..])
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let offered: Vec<String> = node
+            .tracker_fee_boxes(&pubkey, u64::MAX, &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.box_id)
+            .collect();
+        assert_eq!(
+            offered,
+            [tracker_id.clone(), fee_id.clone()],
+            "the stale entry"
+        );
+
+        let offered: Vec<String> = node
+            .tracker_fee_boxes(&pubkey, u64::MAX, &[tracker_id.as_str()])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.box_id)
+            .collect();
+        assert_eq!(offered, [fee_id]);
     }
 
     /// The node lists its last headers oldest first. The redemption's signing context (and the
