@@ -578,8 +578,10 @@ Broadcasts the fully-signed transaction via the node and then **syncs local stat
 ```
 
 **Build-binding (required):** the echoed `unsigned_tx` is hashed and must match a live, single-use
-pending entry recorded by `/redemption/build` (entries expire after 30 minutes). Unknown, expired,
-or already-used `unsigned_tx` → `409 Conflict`. The signed transaction's inputs must also contain
+pending entry recorded by `/redemption/build` (entries expire after 30 minutes). A newer build of
+the same note (issuer, recipient, denomination) replaces the entry, so only the newest build of a
+note can be submitted, and a build that is never submitted (a dry run) blocks nothing: builds
+only read tracker state. Unknown, expired, replaced or already-used `unsigned_tx` → `409 Conflict`. The signed transaction's inputs must also contain
 the build's reserve box, and the reserve output's R5 must match the stored expected digest —
 otherwise `400 Bad Request`. The caller-supplied `issuer_pubkey` / `recipient_pubkey` /
 `redeemed_amount` / `new_already_redeemed` fields are accepted for backward compatibility but

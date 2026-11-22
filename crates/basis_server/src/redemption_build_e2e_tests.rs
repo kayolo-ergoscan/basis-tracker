@@ -707,3 +707,58 @@ async fn node_errors_reach_the_client_without_url_or_body() {
     assert!(!error.contains("127.0.0.1"), "{error}");
     assert!(!error.contains("http"), "{error}");
 }
+
+/// A build that is never submitted (the canary's dry run, a lost response) does not block the
+/// next build of the same note: builds only read tracker state, and the newer build replaces the
+/// older pending entry, so only the newer one can be submitted. Each build that passes the
+/// cheap checks still uses one unit of the pair's hourly budget.
+#[tokio::test]
+async fn a_build_that_is_never_submitted_does_not_block_the_next_one() {
+    let h = harness(Node::Healthy, 2).await;
+    let amount = 20_000_000;
+
+    let (status, body) = h.build(h.request(amount)).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.error);
+    let dry_run = body.data.unwrap();
+    assert_eq!(h.state.pending_redemptions.len(), 1);
+
+    // The real build, right after: the same redemption, valid on its own.
+    let (status, body) = h.build(h.request(amount)).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.error);
+    let real = body.data.unwrap();
+    assert_eq!(real.reserve_box_id, dry_run.reserve_box_id);
+    assert_eq!(real.new_already_redeemed, dry_run.new_already_redeemed);
+    assert!(real.is_first_redemption, "the dry run changed no tracker state");
+    assert_eq!(real.recipient_output_value, amount - FEE);
+
+    // Only the newest build is pending: the dry run is refused like an expired build.
+    assert_eq!(h.state.pending_redemptions.len(), 1, "replaced, not added");
+    let (dry_signed, _, _) = client_sign(&h, &dry_run);
+    let dry_fp =
+        crate::redemption_build::unsigned_tx_fingerprint(&dry_run.unsigned_tx).unwrap();
+    let err = h
+        .state
+        .pending_redemptions
+        .validate_and_consume(&dry_fp, &serde_json::to_value(&dry_signed).unwrap())
+        .unwrap_err();
+    assert_eq!(err.0, StatusCode::CONFLICT);
+
+    let (real_signed, inputs, data) = client_sign(&h, &real);
+    TransactionContext::new(real_signed.clone(), inputs, data)
+        .unwrap()
+        .validate(&crate::local_wallet::tests::fixture_state())
+        .unwrap();
+    let real_fp = crate::redemption_build::unsigned_tx_fingerprint(&real.unsigned_tx).unwrap();
+    let entry = h
+        .state
+        .pending_redemptions
+        .validate_and_consume(&real_fp, &serde_json::to_value(&real_signed).unwrap())
+        .unwrap();
+    assert_eq!(entry.redeemed_amount, amount);
+    assert_eq!(entry.issuer_pubkey, hex::encode(h.issuer_pk));
+    assert_eq!(entry.recipient_pubkey, hex::encode(h.recipient_pk));
+
+    // Both builds used the pair's budget (2 per hour here).
+    let (status, _) = h.build(h.request(amount)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}

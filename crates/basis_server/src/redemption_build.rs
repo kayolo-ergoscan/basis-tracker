@@ -357,7 +357,9 @@ fn parse_broadcast_tx_id(body: &str) -> String {
 /// How long a pending redemption entry stays usable after `/redemption/build`.
 ///
 /// Generous enough for a client to sign and submit, short enough that a captured build
-/// response is not a standing capability.
+/// response is not a standing capability. A newer build for the same (issuer, recipient,
+/// denomination) replaces the entry earlier (see [`PendingRedemptionRegistry::record`]), so a
+/// build that is never submitted (a dry run) neither waits out this time nor blocks the next.
 pub const PENDING_REDEMPTION_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Largest number of outstanding pending entries. Each entry is small and the map is pruned
@@ -415,6 +417,13 @@ pub struct PendingRedemption {
 }
 
 impl PendingRedemption {
+    /// Whether `other` redeems the same note: the same (issuer, recipient, denomination).
+    fn redeems_same_note(&self, other: &PendingRedemption) -> bool {
+        self.issuer_pubkey.eq_ignore_ascii_case(&other.issuer_pubkey)
+            && self.recipient_pubkey.eq_ignore_ascii_case(&other.recipient_pubkey)
+            && self.denomination == other.denomination
+    }
+
     /// Create an entry stamped with the current time.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -455,11 +464,18 @@ impl PendingRedemptionRegistry {
 
     /// Record a pending redemption for `fingerprint`, valid for [`PENDING_REDEMPTION_TTL`].
     ///
+    /// The entry REPLACES any pending entry for the same (issuer, recipient, denomination): only
+    /// the newest build of a note can be submitted. Only the recipient can ask for a build (its
+    /// signature is checked first), so nobody else can retire a recipient's build this way, and a
+    /// build that is never submitted (a dry run, a lost response) does not hold a slot or block
+    /// the next build for the pair.
+    ///
     /// Returns false when the registry is full, which the caller should surface as a
     /// "try again" rather than silently dropping the entry.
     pub fn record(&self, fingerprint: UnsignedTxFingerprint, entry: PendingRedemption) -> bool {
         let mut entries = self.lock();
         Self::prune(&mut entries);
+        entries.retain(|fp, pending| *fp == fingerprint || !pending.redeems_same_note(&entry));
         if entries.len() >= MAX_PENDING_REDEMPTIONS && !entries.contains_key(&fingerprint) {
             return false;
         }
@@ -2525,8 +2541,8 @@ async fn build_redemption_inner(
         PendingRedemption::new(
             built_tx_id,
             response.reserve_box_id.clone(),
-            payload.issuer_pubkey.clone(),
-            payload.recipient_pubkey.clone(),
+            hex::encode(issuer_pk),
+            hex::encode(recipient_pk),
             payload.amount,
             new_already_redeemed,
             new_reserve_digest.clone(),
@@ -2868,6 +2884,55 @@ mod tests {
         assert_eq!(entry.reserve_box_id, RESERVE_BOX);
         assert_eq!(entry.redeemed_amount, 1_000);
         assert_eq!(entry.new_already_redeemed, 2_000);
+    }
+
+    /// A newer build of the same note (issuer, recipient, denomination; keys in any case)
+    /// replaces the pending entry: the older one is refused like an expired one (409). Builds
+    /// of other notes are kept.
+    #[test]
+    fn a_new_build_replaces_the_pending_entry_of_the_same_note() {
+        let registry = PendingRedemptionRegistry::new();
+        let (first_fp, first_signed) = recorded(&registry);
+
+        // Another note of the same issuer (another recipient), and the same pair in a token.
+        let other_recipient = PendingRedemption {
+            recipient_pubkey: "cc".repeat(33),
+            ..pending_entry(&built_redemption().0)
+        };
+        assert!(registry.record([1u8; 32], other_recipient));
+        let token = PendingRedemption {
+            denomination: basis_store::DenomKey::Token([0x33; 32]),
+            ..pending_entry(&built_redemption().0)
+        };
+        assert!(registry.record([2u8; 32], token));
+        assert_eq!(registry.len(), 3);
+
+        // A second build of the first note, keys in upper case.
+        let (second_unsigned, second_signed) = tx_pair(
+            &[RESERVE_BOX, FUNDING_BOX],
+            vec![
+                output(P2PK_TREE, 8_000_000_000, Some(&[0x11; 33])),
+                output(P2PK_TREE, 2_000_000_000, None),
+            ],
+        );
+        let second_fp = unsigned_tx_fingerprint(&second_unsigned).unwrap();
+        assert_ne!(second_fp, first_fp);
+        let second = PendingRedemption {
+            issuer_pubkey: "AA".repeat(33),
+            recipient_pubkey: "BB".repeat(33),
+            ..pending_entry(&second_unsigned)
+        };
+        assert!(registry.record(second_fp, second));
+        assert_eq!(registry.len(), 3, "replaced, not added");
+
+        let err = registry
+            .validate_and_consume(&first_fp, &first_signed)
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(registry
+            .validate_and_consume(&second_fp, &second_signed)
+            .is_ok());
+        assert_eq!(registry.len(), 2, "the other notes' entries are untouched");
     }
 
     #[test]

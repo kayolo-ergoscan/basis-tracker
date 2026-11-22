@@ -1175,6 +1175,12 @@ paths:
         Before broadcasting, the server validates the note key and redemption
         amounts against the stored note state; a mismatch is rejected with 400
         and nothing is broadcast.
+
+        The echoed `unsigned_tx` must match the pending entry its
+        `/redemption/build` recorded: single use, valid for 30 minutes, and
+        replaced by a newer build of the same note (issuer, recipient,
+        denomination). An unknown, expired, replaced or used entry is 409; a
+        build that is never submitted blocks nothing.
       operationId: submitRedemption
       tags:
         - Redemption

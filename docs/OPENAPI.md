@@ -163,7 +163,7 @@ configured Ergo node wallet.
 - `POST /redeem/complete` - Mark a redemption as completed locally (amounts are validated against the stored note state; a mismatch returns 400)
 - `POST /redemption/prepare` - Removed: always answers `410 Gone` with a JSON error (use `POST /tracker/signature` and `POST /redemption/build`)
 - `POST /redemption/build` - Build an unsigned redemption transaction; recipient-signed (`request_timestamp`, `receiver_signature`). ERG reserves pay the miner fee out of the payout (only the reserve is spent, the tracker signs nothing); token reserves use tracker-signed fee inputs (the tracker proof is generated against the last on-chain-confirmed tracker state; returns 400 if the note is not yet in the confirmed state)
-- `POST /redemption/submit` - Broadcast a fully-signed redemption transaction (note key and amounts are re-validated against stored state before broadcasting; a mismatch returns 400; a node refusal returns 500 without the node's URL or answer)
+- `POST /redemption/submit` - Broadcast a fully-signed redemption transaction (note key and amounts are re-validated against stored state before broadcasting; a mismatch returns 400; a node refusal returns 500 without the node's URL or answer). The build's pending entry is single-use, lives 30 minutes and is replaced by a newer build of the same note; unknown, expired or replaced entries return 409
 
 ### Proofs
 
