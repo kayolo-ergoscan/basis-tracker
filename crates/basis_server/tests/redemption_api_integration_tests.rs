@@ -1938,7 +1938,7 @@ mod redemption_api_tests {
         let sign = |secret: &[u8; 32], msg: &[u8], pk: &[u8; 33]| {
             hex::encode(basis_store::schnorr::schnorr_sign(msg, secret, pk).unwrap())
         };
-        let request = basis_server::models::ExchangeNotesRequest {
+        let request = || basis_server::models::ExchangeNotesRequest {
             issuer_pubkey: issuer_hex.clone(),
             recipient_pubkey: recipient_hex.clone(),
             from_denomination: "erg".to_string(),
@@ -1952,9 +1952,54 @@ mod redemption_api_tests {
             recipient_to_signature: sign(&recipient_secret, &msg_to, &recipient_pubkey),
         };
 
+        // Round 5b (F5): while a redemption of either reserve is journaled (mined but not yet
+        // applied, or still in the mempool), the exchange is refused with 409 and changes
+        // nothing; once it leaves the journal, the same exchange goes through.
+        for (denomination, tx_id) in [(erg, "5e".repeat(32)), (tok, "6f".repeat(32))] {
+            let waiting = basis_store::persistence::JournaledRedemption {
+                tx_id: tx_id.clone(),
+                reserve_box_id: "ab".repeat(32),
+                issuer_pubkey: issuer_hex.to_ascii_uppercase(),
+                recipient_pubkey: recipient_hex.clone(),
+                denomination: denomination.denomination_id(),
+                redeemed_amount: 10,
+                new_already_redeemed: 10,
+                data_input_ids: vec!["cd".repeat(32)],
+                submitted_at_ms: 1,
+                ..Default::default()
+            };
+            state.tracker_storage.journal_redemption(&waiting).unwrap();
+            let (status, body) = basis_server::api::exchange_notes(
+                axum::extract::State(state.clone()),
+                axum::extract::Json(request()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{:?}", body.error);
+            let error = body.error.clone().unwrap();
+            assert!(error.contains(&tx_id), "{error}");
+            assert!(error.contains("waiting for the chain"), "{error}");
+            state
+                .tracker_storage
+                .remove_journaled_redemption(&tx_id)
+                .unwrap();
+        }
+        let (status, body) = basis_server::api::list_pending_exchanges(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(basis_server::api::PendingExchangesQuery {
+                issuer_pubkey: Some(issuer_hex.clone()),
+                recipient_pubkey: Some(recipient_hex.clone()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.data.as_ref().unwrap().is_empty(),
+            "the refused exchanges staged nothing"
+        );
+
         let (status, body) = basis_server::api::exchange_notes(
             axum::extract::State(state.clone()),
-            axum::extract::Json(request),
+            axum::extract::Json(request()),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "exchange failed: {:?}", body.error);

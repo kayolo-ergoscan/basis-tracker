@@ -539,6 +539,39 @@ pub async fn exchange_notes(
         }
     };
 
+    // Round 5b (F5): while a redemption of either reserve waits for the chain (it is
+    // journaled), the exchange would change a note behind it before the confirmer applies the
+    // redemption the build proved.
+    for denomination in [&from_denomination, &to_denomination] {
+        match crate::redemption_confirmer::waiting_redemption(
+            &state.tracker_storage,
+            &payload.issuer_pubkey,
+            denomination,
+        ) {
+            Ok(None) => {}
+            Ok(Some(waiting)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(crate::models::error_response(format!(
+                        "the reserve of issuer {} in {}: {}",
+                        payload.issuer_pubkey,
+                        denomination.denomination_id(),
+                        crate::redemption_confirmer::waiting_reason(&waiting)
+                    ))),
+                )
+            }
+            Err(e) => {
+                tracing::error!("Cannot read the redemption journal: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(crate::models::error_response(
+                        "the tracker cannot read its redemption journal".to_string(),
+                    )),
+                );
+            }
+        }
+    }
+
     // Decode the four signatures. The closure returns a plain message so the
     // Err variant stays small (the full response tuple is built only on the
     // error path).
