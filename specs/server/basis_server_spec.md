@@ -93,9 +93,9 @@ The server uses an actor-like pattern with a dedicated tracker thread that proce
 
 > **Endpoint inventory note (2026-09-28).** The list above was verified against the routes
 > registered in `crates/basis_server/src/main.rs`. All 30 registered routes are now documented.
-> Two operational caveats: `GET /events/paginated` does not currently validate `page`/`page_size`
-> bounds, and the event store is seeded with hardcoded demo events at startup — see
-> `specs/PRODUCTION_READINESS_AUDIT.md` (Issues #3 and H9).
+> One operational caveat: `GET /events/paginated` does not currently validate `page`/`page_size`
+> bounds — see `specs/PRODUCTION_READINESS_AUDIT.md` (Issue #3). The event store is no longer
+> seeded with demo events at startup (H9): it holds only events the tracker observed.
 
 ## Data Models
 
