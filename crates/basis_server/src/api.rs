@@ -2311,8 +2311,9 @@ pub async fn get_key_status(
     for denom in denom_ids {
         let denom_notes: Vec<_> = notes.iter().filter(|n| n.denomination == denom).collect();
         // Round 4 (C10): a checked sum. Each note is below 2^63, but an issuer's notes together
-        // can pass u64::MAX: `sum()` then panicked (debug) or wrapped to a small number
-        // (release), which reported a huge debt as well collateralized. Saturate instead: the
+        // can pass u64::MAX: `sum()` then panicked (this workspace builds release with
+        // overflow-checks = true), so the issuer's /key-status never answered; without the
+        // checks it would wrap and report a huge debt as a small one. Saturate instead: the
         // ratio then reads as undercollateralized, which is the truth.
         let total_debt = checked_debt_sum(denom_notes.iter().map(|n| n.outstanding_debt()))
             .unwrap_or_else(|| {

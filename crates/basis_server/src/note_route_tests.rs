@@ -433,9 +433,9 @@ async fn concurrent_notes_do_not_overshoot_a_cap() {
 }
 
 /// Round 4 (C10): the debt sum of `/key-status` is checked. Three notes of 2^63 - 1 (the most a
-/// note may carry) pass u64::MAX together: the plain `sum()` panicked in debug builds and
-/// wrapped in release ones, reporting a tiny debt. Now the total saturates and the ratio reads
-/// as undercollateralized.
+/// note may carry) pass u64::MAX together: the plain `sum()` panicked (release builds check
+/// overflow too, `[profile.release] overflow-checks = true`), so the route never answered for
+/// that issuer. Now the total saturates and the ratio reads as undercollateralized.
 #[tokio::test]
 async fn key_status_saturates_a_debt_sum_past_u64() {
     assert_eq!(crate::api::checked_debt_sum([1, 2, 3]), Some(6));
