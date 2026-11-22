@@ -469,6 +469,7 @@ mod tests {
                 submitted_at_ms: 1,
                 missing_checks: 0,
                 apply_error: None,
+                ..Default::default()
             };
             self.storage.journal_redemption(&entry).unwrap();
             self.shared
@@ -649,6 +650,7 @@ mod tests {
             submitted_at_ms: now_ms - 5 * 60_000,
             missing_checks: 0,
             apply_error: None,
+            ..Default::default()
         };
         fx.storage.journal_redemption(&entry).unwrap();
         entry.tx_id = "8b".repeat(32);

@@ -2851,6 +2851,7 @@ pub async fn submit_redemption(
             .unwrap_or_default(),
         missing_checks: 0,
         apply_error: None,
+        ..Default::default()
     };
     // Round 5b (F9): the entry is on disk before the node can have the transaction.
     if let Err(e) = state

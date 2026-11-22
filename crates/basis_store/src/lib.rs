@@ -2307,6 +2307,21 @@ impl TrackerStateManager {
         recipient_pubkey: &PubKey,
         denomination: &DenomKey,
     ) -> Result<u64, NoteError> {
+        Ok(self
+            .reserve_tree_value(issuer_pubkey, recipient_pubkey, denomination)?
+            .map(|(_, redeemed)| redeemed)
+            .unwrap_or(0)) // First redemption: no already_redeemed amount yet.
+    }
+
+    /// The whole reserve AVL tree value of an (issuer, receiver) edge in the reserve tree of
+    /// `denomination`: `(timestamp, already_redeemed)`, `None` before its first redemption.
+    /// Round 5b (F1): applying a redemption again is a no-op only when BOTH halves match.
+    pub fn reserve_tree_value(
+        &self,
+        issuer_pubkey: &PubKey,
+        recipient_pubkey: &PubKey,
+        denomination: &DenomKey,
+    ) -> Result<Option<(u64, u64)>, NoteError> {
         let key = NoteKey::from_keys(issuer_pubkey, recipient_pubkey);
         let key_bytes = key.to_bytes();
 
@@ -2315,13 +2330,13 @@ impl TrackerStateManager {
             .get(&(*issuer_pubkey, *denomination))
         {
             Some(tree) => tree,
-            None => return Ok(0u64), // Fresh pair: no reserve tree yet, first redemption.
+            None => return Ok(None), // Fresh pair: no reserve tree yet, first redemption.
         };
 
         // Lookup value in issuer's reserve AVL tree
         let value_bytes = match reserve_tree.get(&key_bytes) {
             Some(bytes) => bytes,
-            None => return Ok(0u64), // First redemption - no already_redeemed amount
+            None => return Ok(None), // First redemption - no already_redeemed amount
         };
 
         // Value format: timestamp (8 bytes BE) || redeemedAmount (8 bytes BE) = 16 bytes total
@@ -2332,9 +2347,11 @@ impl TrackerStateManager {
             )));
         }
 
-        let mut redeemed_bytes = [0u8; 8];
-        redeemed_bytes.copy_from_slice(&value_bytes[8..16]);
-        Ok(u64::from_be_bytes(redeemed_bytes))
+        let mut timestamp = [0u8; 8];
+        timestamp.copy_from_slice(&value_bytes[..8]);
+        let mut redeemed = [0u8; 8];
+        redeemed.copy_from_slice(&value_bytes[8..16]);
+        Ok(Some((u64::from_be_bytes(timestamp), u64::from_be_bytes(redeemed))))
     }
 
     /// Generate a reserve lookup proof for context var #7
@@ -2606,6 +2623,62 @@ impl TrackerStateManager {
             timestamp,
             already_redeemed,
         )
+    }
+
+    /// Apply a redemption: the note's cumulative redeemed amount becomes
+    /// `new_amount_redeemed`, and its reserve tree value `tree_timestamp ‖ tree_value`. Round 5b
+    /// (F6): both are stored in ONE storage batch, and the in-memory reserve tree changes only
+    /// after that batch is stored (its next state is computed on a copy first), so a failure
+    /// leaves the note, the reserve tree and their storage as they were: never half-applied.
+    ///
+    /// The same rules as [`Self::record_redemption`]: the cumulative amount may only grow, and
+    /// never past `amount_collected`.
+    pub fn apply_redemption(
+        &mut self,
+        issuer_pubkey: &PubKey,
+        recipient_pubkey: &PubKey,
+        denomination: &DenomKey,
+        new_amount_redeemed: u64,
+        tree_timestamp: u64,
+        tree_value: u64,
+    ) -> Result<(), NoteError> {
+        let mut note = self
+            .lookup_note(issuer_pubkey, recipient_pubkey, denomination)
+            .map_err(|_| NoteError::StorageError("note not found".to_string()))?;
+        if new_amount_redeemed < note.amount_redeemed {
+            return Err(NoteError::StorageError(format!(
+                "cumulative redeemed amount cannot decrease (stored {}, requested {})",
+                note.amount_redeemed, new_amount_redeemed
+            )));
+        }
+        if new_amount_redeemed > note.amount_collected {
+            return Err(NoteError::AmountOverflow);
+        }
+
+        let key = NoteKey::from_keys(issuer_pubkey, recipient_pubkey);
+        let mut value = Vec::with_capacity(16);
+        value.extend_from_slice(&tree_timestamp.to_be_bytes());
+        value.extend_from_slice(&tree_value.to_be_bytes());
+        let mut next_tree = match self
+            .reserve_avl_states
+            .get(&(*issuer_pubkey, *denomination))
+        {
+            Some(tree) => tree.try_clone(),
+            None => basis_trees::BasisAvlTree::new(),
+        }
+        .map_err(|e| NoteError::StorageError(format!("Reserve AVL tree copy failed: {:?}", e)))?;
+        next_tree
+            .update(key.to_bytes(), value)
+            .map_err(|e| {
+                NoteError::StorageError(format!("Reserve AVL tree update failed: {}", e))
+            })?;
+
+        note.amount_redeemed = new_amount_redeemed;
+        self.storage
+            .store_redemption(issuer_pubkey, &note, tree_timestamp, tree_value)?;
+        self.reserve_avl_states
+            .insert((*issuer_pubkey, *denomination), next_tree);
+        Ok(())
     }
 
     /// Generate proof for a specific note

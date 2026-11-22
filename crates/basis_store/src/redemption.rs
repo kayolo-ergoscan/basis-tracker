@@ -378,6 +378,9 @@ impl RedemptionManager {
     /// `new_already_redeemed` optionally overrides the cumulative value written to the
     /// reserve AVL tree; pass the value proven on-chain by the redemption build when it
     /// can diverge from the note's cumulative redeemed amount (e.g. fresh reserves).
+    ///
+    /// The reserve tree value takes the note's CURRENT timestamp: see
+    /// [`Self::complete_redemption_at`], which takes the build's.
     pub fn complete_redemption(
         &mut self,
         issuer_pubkey: &PubKey,
@@ -385,6 +388,34 @@ impl RedemptionManager {
         denomination: &crate::DenomKey,
         redeemed_amount: u64,
         new_already_redeemed: Option<u64>,
+    ) -> Result<(), RedemptionError> {
+        self.complete_redemption_at(
+            issuer_pubkey,
+            recipient_pubkey,
+            denomination,
+            redeemed_amount,
+            new_already_redeemed,
+            None,
+        )
+    }
+
+    /// [`Self::complete_redemption`] with the timestamp the build wrote into the reserve tree
+    /// value (`reserve_tree_timestamp`, round 5b, F1). The build proves the reserve's next R5
+    /// with `note.timestamp ‖ new_already_redeemed`; the note may be re-signed (a new timestamp,
+    /// the same total) before the redemption is applied, and the tree must then still take the
+    /// build's timestamp, or the tracker's reserve tree no longer matches the reserve's R5 and
+    /// every later build for the reserve fails. `None` takes the note's current timestamp.
+    ///
+    /// The note's cumulative redeemed amount and the reserve tree value are stored in one
+    /// batch ([`crate::TrackerStateManager::apply_redemption`], round 5b, F6).
+    pub fn complete_redemption_at(
+        &mut self,
+        issuer_pubkey: &PubKey,
+        recipient_pubkey: &PubKey,
+        denomination: &crate::DenomKey,
+        redeemed_amount: u64,
+        new_already_redeemed: Option<u64>,
+        reserve_tree_timestamp: Option<u64>,
     ) -> Result<(), RedemptionError> {
         // Get the current note
         let mut note = self
@@ -396,7 +427,9 @@ impl RedemptionManager {
         // (`key || totalDebt || timestamp`). Refreshing it here made the stored issuer signature stop
         // verifying, so the creditor's note silently became unredeemable. Redemptions do not change
         // the debt figure, so the timestamp must stay exactly as the issuer signed it.
-        let payment_timestamp = note.timestamp;
+        //
+        // The reserve tree value takes the timestamp the build proved (round 5b, F1).
+        let tree_timestamp = reserve_tree_timestamp.unwrap_or(note.timestamp);
 
         // The caller supplies `redeemed_amount` (and optionally the cumulative
         // `new_already_redeemed`); validate both against the stored note state
@@ -410,23 +443,37 @@ impl RedemptionManager {
         // Round 5 (C8): applying the same redemption again changes nothing. The redemption
         // confirmer applies a redemption once the chain has it, and an operator repair
         // (`/redeem/complete`) may send the same one. With the explicit cumulative value, the
-        // note AND the reserve tree both at that value mean it is applied: the tree only takes
-        // values from applied redemptions, and each redemption raises it.
+        // note AND the whole reserve tree value (round 5b, F1: timestamp AND cumulative amount)
+        // at that value mean it is applied: the tree only takes values from applied
+        // redemptions, and each redemption raises it.
         if let Some(explicit) = new_already_redeemed {
-            if note.amount_redeemed == explicit
-                && self
+            if note.amount_redeemed == explicit {
+                match self
                     .tracker
-                    .get_already_redeemed(issuer_pubkey, recipient_pubkey, denomination)
+                    .reserve_tree_value(issuer_pubkey, recipient_pubkey, denomination)
                     .map_err(RedemptionError::from)?
-                    == explicit
-            {
-                tracing::info!(
-                    "Redemption to cumulative {} of {} -> {} is applied already; nothing to do",
-                    explicit,
-                    hex::encode(issuer_pubkey),
-                    hex::encode(recipient_pubkey)
-                );
-                return Ok(());
+                {
+                    Some((timestamp, redeemed))
+                        if redeemed == explicit && timestamp == tree_timestamp =>
+                    {
+                        tracing::info!(
+                            "Redemption to cumulative {} of {} -> {} is applied already; nothing to do",
+                            explicit,
+                            hex::encode(issuer_pubkey),
+                            hex::encode(recipient_pubkey)
+                        );
+                        return Ok(());
+                    }
+                    Some((timestamp, redeemed)) if redeemed == explicit => {
+                        return Err(RedemptionError::InvalidAmount(format!(
+                            "the reserve tree holds cumulative {} for this note with timestamp {}, \
+                             not {}: the redemption was applied with another timestamp, so the \
+                             tree no longer matches the reserve's R5",
+                            explicit, timestamp, tree_timestamp
+                        )));
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -471,31 +518,24 @@ impl RedemptionManager {
             }
         }
 
-        // Update the note in tracker.
+        // Update the note and the reserve AVL tree together (round 5b, F6: one storage batch,
+        // so a failure leaves both as they were and a retry applies both).
         //
-        // `record_redemption` rather than `update_note`: a redemption is not a new signed note, so it
-        // must not require a strictly newer timestamp, must not re-verify an issuer signature that
-        // did not change, and must not rewrite the committed `amount_collected`.
+        // `apply_redemption` rather than `update_note`: a redemption is not a new signed note, so
+        // it must not require a strictly newer timestamp, must not re-verify an issuer signature
+        // that did not change, and must not rewrite the committed `amount_collected`. The reserve
+        // tree keeps the cumulative redeemed amount, so subsequent redemptions generate
+        // insert/lookup proofs that verify against the on-chain reserve R5. An explicit value
+        // from the on-chain build was validated above to equal the note's resulting cumulative
+        // redeemed amount.
+        let tree_value = new_already_redeemed.unwrap_or(note.amount_redeemed);
         self.tracker
-            .record_redemption(
+            .apply_redemption(
                 issuer_pubkey,
                 recipient_pubkey,
                 denomination,
                 note.amount_redeemed,
-            )
-            .map_err(RedemptionError::from)?;
-
-        // Keep the reserve AVL tree in sync with the cumulative redeemed amount so subsequent
-        // redemptions generate insert/lookup proofs that verify against the on-chain reserve R5.
-        // An explicit value from the on-chain build was validated above to equal the note's
-        // resulting cumulative redeemed amount.
-        let tree_value = new_already_redeemed.unwrap_or(note.amount_redeemed);
-        self.tracker
-            .update_already_redeemed(
-                issuer_pubkey,
-                recipient_pubkey,
-                denomination,
-                payment_timestamp,
+                tree_timestamp,
                 tree_value,
             )
             .map_err(RedemptionError::from)?;
@@ -1499,6 +1539,152 @@ mod tests {
         ));
         complete(&mut redemption_manager, 200, 500).expect("the next redemption");
         assert_eq!(state(&redemption_manager), (500, 500));
+    }
+
+    /// Round 5b (F1): the build proves the reserve's next R5 with the note's timestamp at build
+    /// time. A note re-signed before the redemption is applied (the same total, a newer
+    /// timestamp) must not change the value the reserve tree takes: with the build's timestamp
+    /// the tracker's reserve digest is the build's R5; with the note's new one (what the apply
+    /// did before) it is not. Applying it again with the build's timestamp is a no-op; with
+    /// another timestamp it is refused, not taken as applied.
+    #[test]
+    fn test_a_note_re_signed_between_build_and_apply_keeps_the_build_timestamp() {
+        let secp = secp256k1::Secp256k1::new();
+        let issuer_secret = secp256k1::SecretKey::from_slice(&[0x23u8; 32]).unwrap();
+        let issuer = secp256k1::PublicKey::from_secret_key(&secp, &issuer_secret).serialize();
+        let recipient = [0x03u8; 33];
+        let erg = crate::DenomKey::Erg;
+        let (built_at, re_signed_at) = (1_700_000_000_000u64, 1_700_000_060_000u64);
+        let signed_at = |timestamp: u64| {
+            IouNote::create_and_sign(
+                recipient,
+                1_000,
+                timestamp,
+                &issuer_secret.secret_bytes(),
+                &[0x42; 32],
+                erg,
+            )
+            .unwrap()
+        };
+        let manager = || {
+            let mut m = RedemptionManager::new(crate::TrackerStateManager::new_with_temp_storage());
+            m.tracker.add_note(&issuer, &signed_at(built_at)).unwrap();
+            m
+        };
+
+        let mut m = manager();
+        // The build: the reserve's next digest, with the note's timestamp at build time.
+        let (_, built_r5) = m
+            .tracker
+            .generate_reserve_insert_proof(&issuer, &recipient, &erg, built_at, 300)
+            .unwrap();
+        // Re-signed before the redemption is applied: the same total, a newer timestamp.
+        m.tracker.add_note(&issuer, &signed_at(re_signed_at)).unwrap();
+
+        let mut before = manager();
+        before.tracker.add_note(&issuer, &signed_at(re_signed_at)).unwrap();
+        before
+            .complete_redemption(&issuer, &recipient, &erg, 300, Some(300))
+            .unwrap();
+        assert_ne!(
+            before.tracker.reserve_state_digest(&issuer, &erg),
+            built_r5,
+            "the note's current timestamp diverges from the chain"
+        );
+
+        m.complete_redemption_at(&issuer, &recipient, &erg, 300, Some(300), Some(built_at))
+            .unwrap();
+        assert_eq!(m.tracker.reserve_state_digest(&issuer, &erg), built_r5);
+        assert_eq!(
+            m.tracker.reserve_tree_value(&issuer, &recipient, &erg).unwrap(),
+            Some((built_at, 300))
+        );
+        let note = m.tracker.lookup_note(&issuer, &recipient, &erg).unwrap();
+        assert_eq!((note.timestamp, note.amount_redeemed), (re_signed_at, 300));
+
+        m.complete_redemption_at(&issuer, &recipient, &erg, 300, Some(300), Some(built_at))
+            .expect("the same redemption again is a no-op");
+        assert_eq!(m.tracker.reserve_state_digest(&issuer, &erg), built_r5);
+        match m.complete_redemption_at(&issuer, &recipient, &erg, 300, Some(300), Some(re_signed_at))
+        {
+            Err(RedemptionError::InvalidAmount(msg)) => {
+                assert!(msg.contains("another timestamp"), "{msg}")
+            }
+            other => panic!("a different timestamp is not the same redemption: {other:?}"),
+        }
+        assert_eq!(m.tracker.reserve_state_digest(&issuer, &erg), built_r5);
+    }
+
+    /// Round 5b (F6): the note's cumulative redeemed amount and the reserve tree value are
+    /// stored in one batch. A failed store leaves the note, the reserve tree (value and digest)
+    /// and the stored reserve journal as they were, never half-applied; the retry applies both,
+    /// and a restart rebuilds the same reserve tree.
+    #[test]
+    fn test_a_failed_redemption_store_leaves_nothing_half_applied() {
+        let secp = secp256k1::Secp256k1::new();
+        let issuer_secret = secp256k1::SecretKey::from_slice(&[0x24u8; 32]).unwrap();
+        let issuer = secp256k1::PublicKey::from_secret_key(&secp, &issuer_secret).serialize();
+        let recipient = [0x03u8; 33];
+        let erg = crate::DenomKey::Erg;
+        let timestamp = 1_700_000_000_000u64;
+        let note = IouNote::create_and_sign(
+            recipient,
+            1_000,
+            timestamp,
+            &issuer_secret.secret_bytes(),
+            &[0x42; 32],
+            erg,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = RedemptionManager::new(crate::TrackerStateManager::new(dir.path()));
+        m.tracker.add_note(&issuer, &note).unwrap();
+        m.complete_redemption_at(&issuer, &recipient, &erg, 100, Some(100), Some(timestamp))
+            .unwrap();
+
+        let state = |m: &RedemptionManager| {
+            (
+                m.tracker
+                    .lookup_note(&issuer, &recipient, &erg)
+                    .unwrap()
+                    .amount_redeemed,
+                m.tracker.reserve_tree_value(&issuer, &recipient, &erg).unwrap(),
+                m.tracker.reserve_state_digest(&issuer, &erg),
+                m.tracker.storage.iter_reserve_avl_updates().unwrap().len(),
+            )
+        };
+        let before = state(&m);
+        assert_eq!((before.0, before.1, before.3), (100, Some((timestamp, 100)), 1));
+
+        m.tracker
+            .storage
+            .fail_note_store
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(m
+            .complete_redemption_at(&issuer, &recipient, &erg, 200, Some(300), Some(timestamp))
+            .is_err());
+        assert_eq!(state(&m), before, "nothing half-applied");
+
+        m.tracker
+            .storage
+            .fail_note_store
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        m.complete_redemption_at(&issuer, &recipient, &erg, 200, Some(300), Some(timestamp))
+            .expect("the retry applies both");
+        let after = state(&m);
+        assert_eq!((after.0, after.1, after.3), (300, Some((timestamp, 300)), 2));
+        assert_ne!(after.2, before.2);
+
+        drop(m);
+        let restarted = crate::TrackerStateManager::new(dir.path());
+        assert_eq!(restarted.reserve_state_digest(&issuer, &erg), after.2);
+        assert_eq!(
+            restarted
+                .lookup_note(&issuer, &recipient, &erg)
+                .unwrap()
+                .amount_redeemed,
+            300
+        );
     }
 
     /// The reserve AVL journal must survive a TrackerStateManager restart so that

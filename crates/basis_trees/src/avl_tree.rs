@@ -249,6 +249,26 @@ impl BasisAvlTree {
         }
     }
 
+    /// A separate tree with the same content and shape: a fresh tree that replays this tree's
+    /// insertion-order journal with [`Self::update`], as a restart does. `AVLTree::clone()` is
+    /// shallow (`Rc<RefCell<Node>>`), so a clone would share, and corrupt, this tree's nodes.
+    /// Used to compute a tree's next state aside, so the tree itself changes only once the
+    /// change is stored.
+    pub fn try_clone(&self) -> Result<Self, TreeError> {
+        let mut copy = Self::new()?;
+        for (key, value) in &self.journal {
+            copy.update(key.clone(), value.clone())?;
+        }
+        if copy.root_digest() != self.root_digest() {
+            return Err(TreeError::StorageError(format!(
+                "AVL tree journal replay digest mismatch: copy {:?} != tree {:?}",
+                copy.root_digest(),
+                self.root_digest()
+            )));
+        }
+        Ok(copy)
+    }
+
     /// Lookup a value by key in the AVL tree
     /// Returns the value bytes if found, None otherwise
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -275,6 +295,29 @@ impl BasisAvlTree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 5b (F6): a copy has the tree's digest and content, and changing it leaves the
+    /// tree as it was.
+    #[test]
+    fn try_clone_copies_without_sharing() {
+        let mut tree = BasisAvlTree::new().unwrap();
+        // All-zero is the tree's negative infinity key.
+        for i in 1u8..=20 {
+            tree.update(vec![i; 32], vec![i; 16]).unwrap();
+        }
+        tree.update(vec![3; 32], vec![9; 16]).unwrap();
+        let mut copy = tree.try_clone().unwrap();
+        assert_eq!(copy.root_digest(), tree.root_digest());
+        assert_eq!(copy.get(&[3; 32]), Some(vec![9; 16]));
+
+        let before = tree.root_digest();
+        copy.update(vec![3; 32], vec![7; 16]).unwrap();
+        copy.update(vec![42; 32], vec![1; 16]).unwrap();
+        assert_ne!(copy.root_digest(), before);
+        assert_eq!(tree.root_digest(), before);
+        assert_eq!(tree.get(&[3; 32]), Some(vec![9; 16]));
+        assert_eq!(tree.get(&[42; 32]), None);
+    }
 
     /// Regression test for issue #15 S6: `generate_insert_proof` rebuilds a temporary
     /// prover to avoid mutating persistent state. AVL+ shape depends on insertion

@@ -147,7 +147,7 @@ pub const REDEMPTION_JOURNAL_PARTITION: &str = "redemption_journal";
 /// redemption is applied to the note and the reserve tree (it is in a block, deep enough) or
 /// dropped (gone from the mempools and the chain, or refused by the node). Stored as JSON under
 /// the transaction id.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JournaledRedemption {
     /// Id of the redemption transaction (a signed transaction has its unsigned one's id).
     pub tx_id: String,
@@ -173,6 +173,28 @@ pub struct JournaledRedemption {
     /// Why the last attempt to apply it failed, if one did.
     #[serde(default)]
     pub apply_error: Option<String>,
+    /// The timestamp the build wrote into the note's reserve tree value (`timestamp ‖
+    /// new_already_redeemed`): the note's timestamp at build time (round 5b, F1). The redemption
+    /// is applied with exactly this value, so a note re-signed after the build does not put the
+    /// tracker's reserve tree out of step with the reserve's R5. `None` (an entry written before
+    /// round 5b) applies with the note's current timestamp.
+    #[serde(default)]
+    pub reserve_tree_timestamp: Option<u64>,
+    /// The reserve tree digest (hex, 33 bytes) the transaction's reserve output carries in R5
+    /// (round 5b, F1): what the tracker's reserve tree must hash to once it is applied.
+    #[serde(default)]
+    pub reserve_r5_digest: Option<String>,
+    /// Set once it is applied, when the tracker's reserve tree digest then differed from R5 of
+    /// the mined transaction's reserve output (round 5b, F1): the two digests. The entry stays,
+    /// so its reserve builds nothing until an operator has looked at it; the confirmer leaves it
+    /// alone.
+    #[serde(default)]
+    pub digest_mismatch: Option<String>,
+    /// Unix milliseconds before which the confirmer does not look at it again (round 5b, F4): a
+    /// redemption missing for long but still mineable is checked at a slower pace. 0: at every
+    /// check.
+    #[serde(default)]
+    pub next_check_at_ms: u64,
 }
 
 /// Database storage for per-recipient acceptance policies
@@ -560,6 +582,59 @@ impl NoteStorage {
         batch
             .commit()
             .map_err(|e| NoteError::StorageError(format!("Failed to insert note: {}", e)))
+    }
+
+    /// Store a redemption: `note` with its new cumulative redeemed amount AND the reserve AVL
+    /// journal entry (`tree_timestamp ‖ tree_value` for the note's reserve tree key) in ONE
+    /// journaled batch (round 5b, F6). A crash or an I/O error cannot leave the note redeemed
+    /// while the reserve tree is not, or the other way round.
+    pub fn store_redemption(
+        &self,
+        issuer_pubkey: &PubKey,
+        note: &IouNote,
+        tree_timestamp: u64,
+        tree_value: u64,
+    ) -> Result<(), NoteError> {
+        #[cfg(test)]
+        if self
+            .fail_note_store
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(NoteError::StorageError(
+                "injected note store failure".to_string(),
+            ));
+        }
+
+        let key = NoteKey::from_assets(issuer_pubkey, &note.recipient_pubkey, &note.denomination);
+        let value_bytes = Self::serialize_note_value(issuer_pubkey, note);
+        let issuer_index_value =
+            self.index_value_with_key(&self.issuer_index, issuer_pubkey, &key)?;
+        let recipient_index_value =
+            self.index_value_with_key(&self.recipient_index, &note.recipient_pubkey, &key)?;
+        let (journal_key, journal_value) = Self::reserve_avl_journal_entry(
+            issuer_pubkey,
+            &note.recipient_pubkey,
+            &note.denomination,
+            tree_timestamp,
+            tree_value,
+        )?;
+
+        let mut batch = self.keyspace.batch();
+        batch.insert(&self.notes_partition, key.to_bytes(), value_bytes);
+        if let Some(value) = issuer_index_value {
+            batch.insert(&self.issuer_index, issuer_pubkey, value);
+        }
+        if let Some(value) = recipient_index_value {
+            batch.insert(&self.recipient_index, &note.recipient_pubkey, value);
+        }
+        batch.insert(
+            &self.reserve_avl_journal_partition,
+            journal_key,
+            journal_value,
+        );
+        batch
+            .commit()
+            .map_err(|e| NoteError::StorageError(format!("Failed to store a redemption: {}", e)))
     }
 
     /// Retrieve an IOU note by issuer, recipient and denomination
@@ -1257,6 +1332,34 @@ impl NoteStorage {
         timestamp: u64,
         already_redeemed: u64,
     ) -> Result<(), NoteError> {
+        let (key, value) = Self::reserve_avl_journal_entry(
+            issuer_pubkey,
+            recipient_pubkey,
+            denomination,
+            timestamp,
+            already_redeemed,
+        )?;
+        self.reserve_avl_journal_partition
+            .insert(&key, &value)
+            .map_err(|e| {
+                NoteError::StorageError(format!(
+                    "Failed to append reserve AVL journal entry: {}",
+                    e
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    /// The reserve AVL journal key (`nanos ‖ issuer ‖ note key`, so storage order is operation
+    /// order) and value (`timestamp ‖ already_redeemed ‖ denomination`) of one tree update.
+    fn reserve_avl_journal_entry(
+        issuer_pubkey: &PubKey,
+        recipient_pubkey: &PubKey,
+        denomination: &DenomKey,
+        timestamp: u64,
+        already_redeemed: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), NoteError> {
         let note_key = NoteKey::from_assets(issuer_pubkey, recipient_pubkey, denomination);
 
         let nanos = std::time::SystemTime::now()
@@ -1273,17 +1376,7 @@ impl NoteStorage {
         value.extend_from_slice(&timestamp.to_be_bytes());
         value.extend_from_slice(&already_redeemed.to_be_bytes());
         value.extend_from_slice(&denomination.encode33());
-
-        self.reserve_avl_journal_partition
-            .insert(&key, &value)
-            .map_err(|e| {
-                NoteError::StorageError(format!(
-                    "Failed to append reserve AVL journal entry: {}",
-                    e
-                ))
-            })?;
-
-        Ok(())
+        Ok((key, value))
     }
 
     /// Iterate the reserve AVL journal in operation order.
@@ -1990,8 +2083,7 @@ mod redemption_journal_tests {
             new_already_redeemed: 100,
             data_input_ids: vec!["cd".repeat(32)],
             submitted_at_ms: 1_700_000_000_000,
-            missing_checks: 0,
-            apply_error: None,
+            ..Default::default()
         }
     }
 
@@ -2043,6 +2135,11 @@ mod redemption_journal_tests {
         assert_eq!(read.len(), 2);
         assert_eq!(read[1].missing_checks, 0);
         assert_eq!(read[1].apply_error, None);
+        // ...and without the round-5b fields too.
+        assert_eq!(read[1].reserve_tree_timestamp, None);
+        assert_eq!(read[1].reserve_r5_digest, None);
+        assert_eq!(read[1].digest_mismatch, None);
+        assert_eq!(read[1].next_check_at_ms, 0);
     }
 
     /// Round 5b, F8 and F9: a write-back of an entry read earlier lands only while the entry

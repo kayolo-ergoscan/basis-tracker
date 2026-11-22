@@ -861,8 +861,7 @@ async fn a_reserve_with_a_journaled_redemption_builds_nothing() {
         new_already_redeemed: 10_000_000,
         data_input_ids: vec![String::from(h.tracker_box.box_id())],
         submitted_at_ms: 1,
-        missing_checks: 0,
-        apply_error: None,
+        ..Default::default()
     };
     let others = [
         basis_store::persistence::JournaledRedemption {
