@@ -155,6 +155,7 @@ mod untested_handlers {
             transaction: basis_server::config::TransactionConfig {
                 fee: 1_000_000,
                 change_address: None,
+                heartbeat_blocks: 720,
             },
             acceptance: basis_server::acceptance::config::AcceptanceConfig::empty(),
             redemption: basis_server::config::RedemptionConfig {

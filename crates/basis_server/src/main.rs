@@ -662,7 +662,29 @@ async fn main() {
             config.ergo.basis_reserve_contract_p2s.clone(),
             config.ergo.basis_token_reserve_contract_p2s.clone(),
         ],
+        heartbeat_blocks: config.transaction.heartbeat_blocks,
     };
+    if config.transaction.heartbeat_blocks == 0 {
+        tracing::warn!(
+            "[transaction] heartbeat_blocks = 0: heartbeat disabled. If the digest does not change \
+             for {} blocks, the tracker box ages into the emergency redemption window.",
+            basis_server::config::TRACKER_EMERGENCY_WINDOW_BLOCKS
+        );
+    } else if config.transaction.heartbeat_blocks
+        >= basis_server::config::TRACKER_EMERGENCY_WINDOW_BLOCKS
+    {
+        tracing::warn!(
+            "[transaction] heartbeat_blocks = {} is not below the {}-block emergency window: the \
+             tracker box can age into it before a heartbeat recommits it.",
+            config.transaction.heartbeat_blocks,
+            basis_server::config::TRACKER_EMERGENCY_WINDOW_BLOCKS
+        );
+    } else {
+        tracing::info!(
+            "Tracker box heartbeat every {} blocks",
+            config.transaction.heartbeat_blocks
+        );
+    }
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     // Clone the channel for the tracker updater

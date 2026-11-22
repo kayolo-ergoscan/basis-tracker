@@ -330,6 +330,7 @@ mod http_api_tests {
             transaction: config::TransactionConfig {
                 fee: 1000000,
                 change_address: None,
+                heartbeat_blocks: 720,
             },
             acceptance: basis_server::acceptance::config::AcceptanceConfig::empty(),
             redemption: config::RedemptionConfig::default(),

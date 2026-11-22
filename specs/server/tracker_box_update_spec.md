@@ -188,7 +188,7 @@ The background task executes the following algorithm in a continuous loop:
 1. **Wait for Interval**: Use tokio::time::interval to wait for the configured update period (10 minutes)
 2. **Check Pending Transaction**: If a transaction was previously submitted but not yet confirmed, check its confirmation status via `/blockchain/transaction/byId`. Only update `last_submitted_digest` after confirmation.
 3. **Access Shared State**: Read the current AVL tree root digest and tracker public key
-4. **Skip Unchanged State**: If the AVL root digest hasn't changed since the last confirmed submission, skip the update cycle
+4. **Skip Unchanged State**: If the AVL root digest hasn't changed since the last confirmed submission, skip the update cycle, unless a heartbeat is due: with `[transaction] heartbeat_blocks` > 0 (default 720) and the tracker box at least that many blocks old (`/info` height minus the box creation height), the unchanged digest is recommitted through the normal path so the box never ages into the 2160-block emergency window
 5. **Find Tracker Box**: Query the blockchain for the tracker box using the tracker NFT ID via `/blockchain/box/unspent/byTokenId`
    - **NFT singleton check**: the tracker NFT must be a singleton (`amount == 1`) in the box. A non-singleton amount is a setup error (logged as an error): the reserve contract's singleton guarantees break if the tracker NFT is divisible.
    - If multiple non-reserve boxes hold the NFT, a warning is logged and the first box is used.

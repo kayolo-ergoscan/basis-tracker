@@ -712,6 +712,7 @@ async fn create_test_app(
         transaction: config::TransactionConfig {
             fee: 1000000,
             change_address: None,
+            heartbeat_blocks: 720,
         },
         acceptance: acceptance::config::AcceptanceConfig::empty(),
         redemption: config::RedemptionConfig::default(),
@@ -816,6 +817,7 @@ async fn create_test_app_with_policy_routes(
         transaction: config::TransactionConfig {
             fee: 1000000,
             change_address: None,
+            heartbeat_blocks: 720,
         },
         acceptance: acceptance::config::AcceptanceConfig::empty(),
         redemption: config::RedemptionConfig::default(),
@@ -926,6 +928,7 @@ async fn create_test_app_with_all_routes(
         transaction: config::TransactionConfig {
             fee: 1000000,
             change_address: None,
+            heartbeat_blocks: 720,
         },
         acceptance: acceptance::config::AcceptanceConfig::empty(),
         redemption: config::RedemptionConfig::default(),

@@ -198,6 +198,9 @@ pub struct TrackerBoxUpdateConfig {
     /// tracker box. Token-backed reserves store the tracker NFT in R6, so
     /// they are returned by `byTokenId` queries and must be filtered out.
     pub reserve_contract_addresses: Vec<String>,
+    /// Recommit the unchanged digest once the tracker box is this many blocks old and nothing
+    /// else is pending, so the box never reaches the 2160-block emergency window. 0 disables.
+    pub heartbeat_blocks: u64,
 }
 
 impl std::fmt::Debug for TrackerBoxUpdateConfig {
@@ -225,6 +228,7 @@ impl std::fmt::Debug for TrackerBoxUpdateConfig {
                 "reserve_contract_addresses",
                 &self.reserve_contract_addresses,
             )
+            .field("heartbeat_blocks", &self.heartbeat_blocks)
             .finish()
     }
 }
@@ -242,6 +246,7 @@ impl Default for TrackerBoxUpdateConfig {
             tracker_secret_key: None,
             min_confirmation_depth: 2,
             reserve_contract_addresses: Vec::new(),
+            heartbeat_blocks: 720,
         }
     }
 }
@@ -335,6 +340,13 @@ const MAX_PENDING_MISSING_CYCLES: u32 = 3;
 /// (and the pending notes reverted so a fresh update can be submitted).
 fn pending_tx_is_dropped(missing_cycles: u32) -> bool {
     missing_cycles >= MAX_PENDING_MISSING_CYCLES
+}
+
+/// Whether a heartbeat commit is due: heartbeats are enabled (`heartbeat_blocks > 0`) and the
+/// tracker box, created at `box_creation_height`, is at least `heartbeat_blocks` old at
+/// `current_height`.
+fn heartbeat_due(heartbeat_blocks: u64, current_height: u64, box_creation_height: u64) -> bool {
+    heartbeat_blocks > 0 && current_height.saturating_sub(box_creation_height) >= heartbeat_blocks
 }
 
 /// Whether the tracker can spend `box_ergo_tree_hex`: it must be exactly `P2PK(tracker_pubkey)`.
@@ -562,6 +574,8 @@ impl TrackerBoxUpdater {
                 }
             }
 
+            // Set when this cycle has no new digest to commit (the reason is logged).
+            let mut nothing_to_commit: Option<&str> = None;
             if let Some(r5_value) = tracker_box.additional_registers.get("R5") {
                 if let Ok(r5_bytes) = hex::decode(r5_value) {
                     if r5_bytes.len() >= 34 {
@@ -599,9 +613,9 @@ impl TrackerBoxUpdater {
                         Self::process_pending_exchanges(&config, &cmd_tx).await;
 
                         if onchain_digest == current_digest.as_slice() {
-                            info!("On-chain tracker box already has current AVL root digest");
                             last_submitted_digest = Some(current_digest);
-                            continue;
+                            nothing_to_commit =
+                                Some("On-chain tracker box already has current AVL root digest");
                         }
                     }
                 }
@@ -610,9 +624,15 @@ impl TrackerBoxUpdater {
             // If a previous submission for a different digest is still pending
             // and never confirmed, skip submitting a new one (the confirmation
             // check at the top of the loop handles the in-flight tx).
-            if let Some(last) = last_submitted_digest {
-                if last == current_digest {
-                    info!("AVL root digest unchanged, skipping redundant update");
+            if nothing_to_commit.is_none() && last_submitted_digest == Some(current_digest) {
+                nothing_to_commit = Some("AVL root digest unchanged, skipping redundant update");
+            }
+
+            // With nothing to commit, a due heartbeat recommits the unchanged digest anyway
+            // so the tracker box never ages into the emergency window.
+            if let Some(reason) = nothing_to_commit {
+                if !Self::heartbeat_now(&config, &tracker_box).await {
+                    info!("{}", reason);
                     continue;
                 }
             }
@@ -658,6 +678,38 @@ impl TrackerBoxUpdater {
                 }
             }
         }
+    }
+
+    /// Whether this cycle should recommit an unchanged digest (heartbeat): enabled, and the
+    /// tracker box is at least `heartbeat_blocks` old at the node's current height. Only called
+    /// when nothing is pending. A node error skips the heartbeat for this cycle.
+    async fn heartbeat_now(config: &TrackerBoxUpdateConfig, tracker_box: &ErgoBoxApi) -> bool {
+        if config.heartbeat_blocks == 0 {
+            return false;
+        }
+        let current_height = match Self::get_node_height(config).await {
+            Ok(h) => h as u64,
+            Err(e) => {
+                warn!(
+                    "Heartbeat check skipped: cannot read the node height: {}",
+                    e
+                );
+                return false;
+            }
+        };
+        let creation_height = tracker_box.creation_height as u64;
+        if !heartbeat_due(config.heartbeat_blocks, current_height, creation_height) {
+            return false;
+        }
+        info!(
+            "Heartbeat: tracker box {} is {} blocks old (created at {}, height {}, heartbeat_blocks {}); recommitting the current digest",
+            tracker_box.box_id,
+            current_height.saturating_sub(creation_height),
+            creation_height,
+            current_height,
+            config.heartbeat_blocks
+        );
+        true
     }
 
     /// Fetch a minimal summary (box_id, creation_height) for a tracker box by
@@ -1834,5 +1886,55 @@ mod tests {
         assert!(!printed.contains("92, 92, 92"), "{printed}");
         assert!(!printed.contains("wallet-key"));
         assert!(printed.contains("<redacted>"));
+    }
+
+    #[test]
+    fn heartbeat_is_due_at_heartbeat_blocks_and_disabled_by_zero() {
+        assert!(!heartbeat_due(720, 1_000 + 719, 1_000));
+        assert!(heartbeat_due(720, 1_000 + 720, 1_000));
+        assert!(heartbeat_due(720, 1_000 + 2_000, 1_000));
+        // 0 disables, whatever the age.
+        assert!(!heartbeat_due(0, 1_000_000, 1_000));
+        // A box newer than the node's tip (node behind) is never due.
+        assert!(!heartbeat_due(720, 900, 1_000));
+        assert_eq!(TrackerBoxUpdateConfig::default().heartbeat_blocks, 720);
+    }
+
+    /// The heartbeat asks the node for its height (public `/info`) and fires only when the
+    /// box is old enough; heartbeat_blocks = 0 never calls the node.
+    #[tokio::test]
+    async fn heartbeat_now_reads_the_node_height() {
+        use crate::local_wallet::tests::mock_node;
+        let (url, seen) =
+            mock_node(|_, _, _| (200, serde_json::json!({ "fullHeight": 1_720 }).to_string()))
+                .await;
+        let fx = commit_fixture(&[]);
+        let mut tracker_box = fx.tracker_api;
+        tracker_box.creation_height = 1_000;
+
+        let config = TrackerBoxUpdateConfig {
+            scanner_node_url: url,
+            heartbeat_blocks: 720,
+            ..Default::default()
+        };
+        assert!(TrackerBoxUpdater::heartbeat_now(&config, &tracker_box).await);
+        let config = TrackerBoxUpdateConfig {
+            heartbeat_blocks: 721,
+            ..config
+        };
+        assert!(!TrackerBoxUpdater::heartbeat_now(&config, &tracker_box).await);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert!(seen.lock().unwrap().iter().all(|r| r.target == "/info"));
+
+        let config = TrackerBoxUpdateConfig {
+            heartbeat_blocks: 0,
+            ..config
+        };
+        assert!(!TrackerBoxUpdater::heartbeat_now(&config, &tracker_box).await);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "disabled heartbeat must not call the node"
+        );
     }
 }

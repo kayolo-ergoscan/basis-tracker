@@ -125,6 +125,39 @@ from the token-free boxes at `P2PK(tracker_public_key)`, so fund that address wi
 ERG. Boxes holding any token, such as the tracker box with the tracker NFT, are never spent
 for fees.
 
+### Transaction Configuration
+
+```toml
+[transaction]
+fee = 1000000              # Miner fee in nanoERG for the tracker's own transactions (0.001 ERG)
+# change_address = "9..."  # Change of the fee boxes; default: P2PK(tracker_public_key)
+# heartbeat_blocks = 720   # Recommit an unchanged digest at this tracker box age; 0 disables
+```
+
+The tracker commits its AVL root digest to the tracker box whenever the digest changes.
+Reserve contracts open **emergency redemption** (without a tracker signature) once the
+tracker box is more than 2160 blocks old, counted from its creation height
+(`HEIGHT - tracker.creationInfo._1 > 3 * 720` in `contract/basis.es`). With an unchanged
+digest there is nothing to commit, so without a heartbeat a quiet tracker would let its
+box age into that window.
+
+`heartbeat_blocks` closes this gap. When the tracker box is at least `heartbeat_blocks`
+blocks old (current height minus the box creation height) and no update transaction is
+pending, the tracker recommits the same digest through the normal commit path (same
+inputs, outputs and fee rules). The new box has a fresh creation height, and note
+confirmations do not change.
+
+- Default `720` (about a day); each heartbeat costs one `fee`.
+- `0` disables it. The server then warns at startup, and so it does for a value of
+  `2160` or more, which cannot keep the box out of the window.
+- Keep the tracker address funded: heartbeats are paid from the same token-free boxes
+  as every other commit.
+- A heartbeat spends the tracker box. A redemption transaction built before it, which
+  carries the old tracker box as a data input, has to be rebuilt.
+
+`change_address`, when set, receives the change of the fee boxes. Leave it unset to keep
+the change at the tracker address, where the next commit can spend it.
+
 ### Redemption Configuration
 
 ```toml

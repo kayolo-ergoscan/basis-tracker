@@ -296,7 +296,20 @@ pub struct TransactionConfig {
     /// Change address for redemption transactions (P2PK address)
     /// If not specified, the tracker's public key will be used to derive a change address
     pub change_address: Option<String>,
+    /// Recommit the tracker box when it is this many blocks old and nothing else is pending,
+    /// even with an unchanged digest, so the box never reaches the 2160-block emergency
+    /// window (`[transaction] heartbeat_blocks`, default 720; 0 disables).
+    #[serde(default = "default_heartbeat_blocks")]
+    pub heartbeat_blocks: u64,
 }
+
+/// Default `[transaction] heartbeat_blocks`: 720 blocks, about a day.
+pub fn default_heartbeat_blocks() -> u64 {
+    720
+}
+
+/// Blocks after the tracker box creation height at which emergency redemption opens.
+pub const TRACKER_EMERGENCY_WINDOW_BLOCKS: u64 = 2160;
 
 /// Redemption policy enforcement configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +424,7 @@ impl AppConfig {
             .set_default("ergo.wallet.api_key", "")?
             // Transaction configuration defaults
             .set_default("transaction.fee", 1000000)? // 0.001 ERG
+            .set_default("transaction.heartbeat_blocks", default_heartbeat_blocks())?
             // Token reserve configuration defaults
             .set_default("ergo.basis_token_reserve_contract_p2s", "")?
             // Tracker public key (optional)
@@ -962,6 +976,7 @@ mod tests {
             transaction: TransactionConfig {
                 fee: 1000000,
                 change_address: None,
+                heartbeat_blocks: default_heartbeat_blocks(),
             },
             acceptance: AcceptanceConfig::empty(),
             redemption: RedemptionConfig::default(),
@@ -1052,6 +1067,7 @@ mod tests {
             transaction: TransactionConfig {
                 fee: 1000000,
                 change_address: None,
+                heartbeat_blocks: default_heartbeat_blocks(),
             },
             acceptance: AcceptanceConfig::empty(),
             redemption: RedemptionConfig::default(),
@@ -1104,6 +1120,23 @@ mod tests {
         // Explicit override is honored.
         let config: ConfirmationConfig = toml::from_str("min_depth = 6").unwrap();
         assert_eq!(config.min_depth, 6);
+    }
+
+    #[test]
+    fn test_transaction_heartbeat_blocks_defaults_to_720() {
+        // Absent from [transaction]: 720 blocks.
+        let config: TransactionConfig = toml::from_str("fee = 1000000").unwrap();
+        assert_eq!(config.heartbeat_blocks, 720);
+        assert_eq!(default_heartbeat_blocks(), 720);
+        assert!(default_heartbeat_blocks() < TRACKER_EMERGENCY_WINDOW_BLOCKS);
+
+        // Explicit values, including 0 (disabled), are honored.
+        let config: TransactionConfig =
+            toml::from_str("fee = 1000000\nheartbeat_blocks = 0").unwrap();
+        assert_eq!(config.heartbeat_blocks, 0);
+        let config: TransactionConfig =
+            toml::from_str("fee = 1000000\nheartbeat_blocks = 360").unwrap();
+        assert_eq!(config.heartbeat_blocks, 360);
     }
 
     #[test]
@@ -1172,6 +1205,7 @@ mod tests {
             transaction: TransactionConfig {
                 fee: 1000000,
                 change_address: None,
+                heartbeat_blocks: default_heartbeat_blocks(),
             },
             acceptance: AcceptanceConfig::empty(),
             redemption: RedemptionConfig::default(),

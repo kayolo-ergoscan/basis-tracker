@@ -89,6 +89,7 @@ mod create_reserve_tests {
             transaction: crate::config::TransactionConfig {
                 fee: 1000000,
                 change_address: None,
+                heartbeat_blocks: 720,
             },
             acceptance: crate::acceptance::config::AcceptanceConfig::empty(),
             redemption: crate::config::RedemptionConfig::default(),
