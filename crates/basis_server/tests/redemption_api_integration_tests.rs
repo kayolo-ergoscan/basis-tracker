@@ -1449,53 +1449,47 @@ mod redemption_api_tests {
         basis_store::schnorr::schnorr_verify(&signature, &message, &tracker_pubkey).unwrap();
     }
 
+    /// Round 4, C4: `emergency: true` is refused with 400 before any work. An emergency
+    /// redemption needs no tracker signature (empty var #6 after the time lock), and signing
+    /// one used to hand out a NORMAL signature with the acceptance-policy check skipped.
     #[tokio::test]
     async fn test_request_tracker_signature_emergency_flag() {
-        // Test that emergency flag is accepted in request
-        let state = create_mock_app_state().await;
-
-        let (issuer_secret, issuer_pubkey) = generate_keypair();
-        let (_recipient_secret, recipient_pubkey) = generate_keypair();
-        let issuer_hex = hex::encode(issuer_pubkey);
-        let recipient_hex = hex::encode(recipient_pubkey);
-        add_test_note(
-            &state,
-            &issuer_secret,
-            &issuer_hex,
-            &recipient_hex,
-            1000,
-            1000,
-        )
-        .await;
-
-        let request = TrackerSignatureRequest {
-            issuer_pubkey: issuer_hex,
-            recipient_pubkey: recipient_hex,
-            total_debt: 1000,
-            timestamp: 1234567890,
-            emergency: true, // Emergency flag
-
-            denomination: String::new(),
-        };
+        // A fully signable state: the refusal must not depend on a missing key or note.
+        let (tracker_secret, tracker_pubkey) = generate_keypair();
+        let state = state_with_tracker_key(&tracker_pubkey, Some(&tracker_secret)).await;
+        let mut request = signable_request(&state).await;
+        request.emergency = true;
 
         let response =
             request_tracker_signature(axum::extract::State(state), axum::extract::Json(request))
                 .await;
 
-        // The emergency flag should be accepted in the request structure
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
         let body = &response.1;
-        if !body.success {
-            let default_msg = "unknown".to_string();
-            let error_msg = body.error.as_ref().unwrap_or(&default_msg);
-            assert!(
-                error_msg.contains("tracker")
-                    || error_msg.contains("Tracker")
-                    || error_msg.contains("sign")
-                    || error_msg.contains("node"),
-                "Expected tracker/signing-related error for valid request structure, got: {}",
-                error_msg
-            );
-        }
+        assert!(!body.success);
+        assert!(body.data.is_none(), "no signature may be returned");
+        let error_msg = body.error.clone().unwrap_or_default();
+        assert!(
+            error_msg.contains("emergency"),
+            "expected the emergency refusal, got: {}",
+            error_msg
+        );
+    }
+
+    /// The same request without the flag is signed: the refusal is the flag alone.
+    #[tokio::test]
+    async fn test_request_tracker_signature_non_emergency_still_signs() {
+        let (tracker_secret, tracker_pubkey) = generate_keypair();
+        let state = state_with_tracker_key(&tracker_pubkey, Some(&tracker_secret)).await;
+        let request = signable_request(&state).await;
+        assert!(!request.emergency);
+
+        let response =
+            request_tracker_signature(axum::extract::State(state), axum::extract::Json(request))
+                .await;
+
+        assert_eq!(response.0, StatusCode::OK, "{:?}", response.1.error);
+        assert!(response.1.data.as_ref().unwrap().is_emergency.is_none());
     }
 
     /// Issue #15 S4: the tracker must not sign caller-chosen (issuer, recipient,

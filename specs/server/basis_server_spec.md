@@ -173,7 +173,8 @@ The `/tracker/signature` endpoint accepts requests with the following structure:
 - `recipient_pubkey`: Public key of the note recipient (hex-encoded, 33 bytes)
 - `total_debt`: Total cumulative debt amount in nanoERG — must equal the stored note's total debt (rejected with 409 otherwise)
 - `timestamp`: Payment timestamp of the note — must equal the stored note's timestamp (rejected with 409 otherwise)
-- `emergency`: Boolean indicating if this is an emergency redemption (tracker signature optional after 3 days)
+- `emergency`: must be `false` or omitted; `true` is refused with HTTP 400 (an emergency redemption
+  needs no tracker signature: after 3 days the contract accepts an empty context var #6)
 
 ### Tracker Signature Response Structure
 
@@ -182,7 +183,8 @@ The `/tracker/signature` endpoint returns responses with the following structure
 - `tracker_signature`: 65-byte Schnorr signature (hex-encoded, 130 characters) proving tracker authorization
 - `tracker_pubkey`: Tracker's public key (hex-encoded, 66 characters)
 - `message_signed`: The hex-encoded message that was signed
-  - Normal and emergency: `hash(issuerKey||recipientKey) || longToByteArray(totalDebt) || longToByteArray(timestamp) || trackerNftId` (80 bytes)
+  - `hash(issuerKey||recipientKey) || longToByteArray(totalDebt) || longToByteArray(timestamp) || trackerNftId` (80 bytes)
+- `is_emergency`: always `null` (kept for compatibility)
 
 ### Redemption Preparation Request Structure
 

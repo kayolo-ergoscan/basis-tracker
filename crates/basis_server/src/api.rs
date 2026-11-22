@@ -3630,6 +3630,23 @@ pub async fn request_tracker_signature(
 ) -> (StatusCode, Json<ApiResponse<TrackerSignatureResponse>>) {
     tracing::debug!("Requesting tracker signature for redemption: {:?}", payload);
 
+    // SECURITY (round 4, C4): an emergency redemption needs no tracker signature at all: the
+    // contract accepts an empty context var #6 once the tracker box is older than the emergency
+    // window (contract/basis.es: `trackerSigValid`). Signing on `emergency: true` handed out a
+    // NORMAL tracker signature with the acceptance-policy and FIFO checks skipped, so any
+    // receiver could redeem out of turn through the normal path. Refuse before any work.
+    if payload.emergency {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(crate::models::error_response(
+                "emergency redemptions need no tracker signature: build them with an empty \
+                 context var #6 (POST /redemption/build with \"emergency\": true); \
+                 /tracker/signature only signs normal redemptions"
+                    .to_string(),
+            )),
+        );
+    }
+
     // Validate public keys
     let issuer_pubkey_bytes = match hex::decode(&payload.issuer_pubkey) {
         Ok(bytes) if bytes.len() == 33 => bytes,
@@ -3735,9 +3752,9 @@ pub async fn request_tracker_signature(
 
     // Acceptance-policy enforcement (mirrors /redemption/build): do not sign when
     // a maximal redemption of this note would newly violate another debt holder's
-    // collateralization policy. Emergency redemptions bypass the tracker (contract
-    // path after the time lock) and are exempt from this check.
-    if state.config.redemption.enforce_acceptance_policy && !payload.emergency {
+    // collateralization policy. Emergency requests were refused above, so every
+    // signature produced here went through this check.
+    if state.config.redemption.enforce_acceptance_policy {
         let (notes_tx, notes_rx) = tokio::sync::oneshot::channel();
         if let Err(e) = state
             .tx
@@ -3924,14 +3941,14 @@ pub async fn request_tracker_signature(
         tracker_signature,
         tracker_pubkey,
         message_signed: message_to_sign,
-        is_emergency: if payload.emergency { Some(true) } else { None },
+        // Emergency requests are refused (400) before signing, so this is never set.
+        is_emergency: None,
     };
 
     tracing::info!(
-        "Tracker signature generated for redemption from {} to {} (emergency: {})",
+        "Tracker signature generated for redemption from {} to {}",
         payload.issuer_pubkey,
-        payload.recipient_pubkey,
-        payload.emergency
+        payload.recipient_pubkey
     );
 
     (

@@ -918,12 +918,17 @@ paths:
         The signed `totalDebt` and `timestamp` always come from the tracker's
         stored note for the given issuer/recipient pair; the `total_debt` and
         `timestamp` request fields must match the stored note (mismatches are
-        rejected with 409). The acceptance policy is enforced for non-emergency
-        requests before signing, evaluated against the issuer's tracked reserve
-        for the note's denomination: 409 when the issuer has more than one
-        tracked reserve in that denomination, or none — a reserve of another
-        currency is never consulted in its place. Returns 404 when no note is
-        stored for the pair.
+        rejected with 409). The acceptance policy is enforced before signing,
+        evaluated against the issuer's tracked reserve for the note's
+        denomination: 409 when the issuer has more than one tracked reserve in
+        that denomination, or none — a reserve of another currency is never
+        consulted in its place. Returns 404 when no note is stored for the pair.
+
+        Only normal redemptions are signed. A request with `emergency: true`
+        is refused with 400 before any lookup: an emergency redemption needs no
+        tracker signature (after the 3-day window the contract accepts an empty
+        context var #6), so it is built with `POST /redemption/build` and
+        `emergency: true`, or by the client with an empty var #6.
       operationId: requestTrackerSignature
       tags:
         - Redemption
@@ -941,7 +946,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseTrackerSignature'
         '400':
-          description: Bad request - invalid public key format
+          description: >-
+            Bad request - invalid public key format, or `emergency: true` (emergency
+            redemptions are not signed by the tracker)
           content:
             application/json:
               schema:
@@ -2226,7 +2233,9 @@ components:
         emergency:
           type: boolean
           default: false
-          description: Whether this is an emergency redemption
+          description: >-
+            Must be false or omitted: `true` is refused with 400, because an emergency
+            redemption needs no tracker signature (empty context var #6)
           example: false
 
 
@@ -2260,8 +2269,8 @@ components:
         is_emergency:
           type: boolean
           nullable: true
-          description: Whether this was an emergency redemption
-          example: false
+          description: Always null (emergency requests are refused with 400); kept for compatibility
+          example: null
 
     # Proof Schemas
     ProofResponse:

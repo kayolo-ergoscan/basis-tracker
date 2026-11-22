@@ -173,7 +173,7 @@ configured Ergo node wallet.
 
 ### Tracker
 
-- `POST /tracker/signature` - Request a tracker Schnorr signature for redemption (signs the stored note's `total_debt`/`timestamp`; the request fields of the same names are legacy and ignored; returns 404 if no note is stored for the pair)
+- `POST /tracker/signature` - Request a tracker Schnorr signature for a normal redemption (signs the stored note's `total_debt`/`timestamp`; the request fields of the same names must match the stored note; returns 404 if no note is stored for the pair, 400 for `emergency: true`)
 - `GET /tracker/state` - Get local/confirmed/pending tracker state digests
 - `GET /tracker/pending-tx` - Get the in-flight tracker update transaction
 - `GET /tracker/latest-box-id` - Get the latest on-chain tracker box ID
@@ -372,8 +372,11 @@ curl -X POST http://localhost:3048/tracker/signature \
 ```
 
 The tracker always signs the stored note's cumulative `total_debt` and payment
-`timestamp`; the request fields of the same names are legacy and ignored. The
-acceptance policy is enforced for non-emergency requests before signing — it is
+`timestamp`; the request fields of the same names must match the stored note
+(409 otherwise). Only normal redemptions are signed: `"emergency": true` is
+refused with 400, because an emergency redemption (after the 3-day window) uses
+an empty context var #6 instead of a tracker signature. The
+acceptance policy is enforced before signing — it is
 evaluated against the issuer's tracked reserve of the note's denomination (409
 when that reserve is missing or not unique; a reserve of another currency is
 never consulted) — and the endpoint returns 404 when no note is stored for the
@@ -419,7 +422,7 @@ where:
 - `timestamp` is the note payment timestamp (8 bytes, big-endian)
 - `trackerNftId` is the tracker's NFT id (32 bytes), binding the signature to one specific tracker/contract — on-chain the contract reads it from the tracker box's `R6` register and appends it, so a signature made for one tracker cannot be replayed on another
 
-The same message format is used for both normal and emergency redemption. In an emergency redemption, the tracker signature is optional.
+The same message format is used for both normal and emergency redemption. An emergency redemption carries no tracker signature: context var #6 is an empty byte collection, and `POST /tracker/signature` refuses `emergency: true` with 400.
 
 ## Context Extension Variables
 

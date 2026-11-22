@@ -678,19 +678,25 @@ async fn build_redemption_tx(
     let issuer_signature = hex::decode(issuer_signature_hex)
         .map_err(|e| anyhow::anyhow!("Invalid issuer signature hex: {}", e))?;
 
-    // Get tracker signature from server
-    let tracker_signature_response = client
-        .request_tracker_signature(
-            issuer_pubkey,
-            recipient_pubkey,
-            total_debt,
-            note_timestamp,
-            emergency,
-            Some(&denomination.denomination_id()),
-        )
-        .await?;
-    let tracker_signature = hex::decode(&tracker_signature_response.tracker_signature)
-        .map_err(|e| anyhow::anyhow!("Invalid tracker signature hex: {}", e))?;
+    // Tracker signature (context var #6). An emergency redemption carries an EMPTY var #6: the
+    // contract accepts that once the tracker box is older than the emergency window, and the
+    // server refuses `/tracker/signature` with `emergency: true` (400).
+    let tracker_signature = if emergency {
+        Vec::new()
+    } else {
+        let tracker_signature_response = client
+            .request_tracker_signature(
+                issuer_pubkey,
+                recipient_pubkey,
+                total_debt,
+                note_timestamp,
+                false,
+                Some(&denomination.denomination_id()),
+            )
+            .await?;
+        hex::decode(&tracker_signature_response.tracker_signature)
+            .map_err(|e| anyhow::anyhow!("Invalid tracker signature hex: {}", e))?
+    };
 
     let insert_proof = reserve_insert_proof.clone();
 
