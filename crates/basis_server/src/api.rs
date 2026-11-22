@@ -4581,6 +4581,29 @@ pub async fn create_reserve_payload(
         }
     }
 
+    // The reserve is bound to the tracker NFT (R6). Until the tracker box holding that NFT is
+    // on chain, the reserve would point at a tracker that does not exist yet and could only be
+    // refunded. The tracker box updater records the box once it finds it in the blockchain
+    // index (boxes in blocks only); refuse until then.
+    if state
+        .shared_tracker_state
+        .lock()
+        .await
+        .get_confirmed()
+        .box_id
+        .is_none()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(crate::models::error_response(format!(
+                "the tracker box for tracker NFT {} is not confirmed on chain yet. Reserves can \
+                 be created once the tracker NFT is minted and the tracker has seen its box in a \
+                 block; a reserve bound to a tracker that does not exist could only be refunded.",
+                config.ergo.tracker_nft_id.as_deref().unwrap_or("(not set)")
+            ))),
+        );
+    }
+
     let reserve_contract_address = if token_reserve_mode {
         config.ergo.basis_token_reserve_contract_p2s.clone()
     } else {

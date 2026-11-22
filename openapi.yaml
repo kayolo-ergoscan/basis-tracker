@@ -539,6 +539,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
+        '503':
+          description: >-
+            The tracker box for the configured tracker NFT is not confirmed on chain yet (not
+            minted, or not seen in a block by the tracker). A reserve bound to a tracker that
+            does not exist could only be refunded, so no payload is built until it is.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
         '500':
           description: Internal server error
           content:

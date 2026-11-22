@@ -126,8 +126,9 @@ All endpoints return a standardized response envelope:
 - `GET /reserves/quarantined` - List reserve boxes rejected by admission control (issue #19): duplicates that do not descend from the tracked reserve for their (owner, denomination), roots that failed setup validation, or roots whose creating transaction spends no P2PK input of the R4 owner key. Quarantined boxes are never tracked.
 - `POST /reserves/create` - Build a reserve creation payment request
 
-`POST /reserves/create` only *builds* the payment request. To create the
-reserve on-chain, submit the returned `requests` array to your own Ergo
+`POST /reserves/create` only *builds* the payment request, and only once the tracker
+box for the configured tracker NFT is confirmed on chain (until then it answers 503). To
+create the reserve on-chain, submit the returned `requests` array to your own Ergo
 node's wallet directly:
 
 ```bash

@@ -771,6 +771,28 @@ impl AppConfig {
         }
     }
 
+    /// The configured tracker NFT id, checked at startup: 32 bytes of hex, not all zeros. An
+    /// all-zero id is a placeholder, never a minted token; reserves bound to it could only be
+    /// refunded.
+    pub fn tracker_nft_id_checked(&self) -> Result<[u8; 32], String> {
+        let id = match self.ergo.tracker_nft_id.as_deref() {
+            Some(id) if !id.is_empty() => id,
+            _ => return Err("ergo.tracker_nft_id is not set".to_string()),
+        };
+        let bytes: [u8; 32] = hex::decode(id)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| {
+                "ergo.tracker_nft_id must be 32 bytes of hex (64 characters)".to_string()
+            })?;
+        if bytes == [0u8; 32] {
+            return Err(
+                "ergo.tracker_nft_id is all zeros: a placeholder, not a minted token".to_string(),
+            );
+        }
+        Ok(bytes)
+    }
+
     /// Get the tracker NFT ID bytes (required - server will fail if not configured)
     pub fn tracker_nft_bytes(&self) -> Result<Vec<u8>, hex::FromHexError> {
         match &self.ergo.tracker_nft_id {
@@ -1589,6 +1611,27 @@ mod tests {
         [transaction]
         fee = 1000000
     "#;
+
+    #[test]
+    fn tracker_nft_id_must_be_32_bytes_and_not_all_zeros() {
+        let with_nft = |id: Option<&str>| {
+            let mut config = minimal_config();
+            config.ergo.tracker_nft_id = id.map(str::to_string);
+            config.tracker_nft_id_checked()
+        };
+        assert_eq!(with_nft(Some(&"11".repeat(32))).unwrap(), [0x11; 32]);
+        let err = with_nft(Some(&"00".repeat(32))).unwrap_err();
+        assert!(err.contains("all zeros"), "{err}");
+        for bad in [
+            None,
+            Some(""),
+            Some("11"),
+            Some(&*"zz".repeat(32)),
+            Some(&*"11".repeat(33)),
+        ] {
+            assert!(with_nft(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn printed_config_errors_keep_the_key_but_not_the_value() {

@@ -263,6 +263,13 @@ The server provides an endpoint to generate reserve creation payloads for Ergo n
   - in token mode, `token_amount` above `server.reserve_creation_max_token_amount` (default 1e9)
   - an `owner_pubkey` that is not a valid secp256k1 curve point
 
+- HTTP 503 until the tracker box for the configured tracker NFT is confirmed on chain (the
+  tracker box updater has found it in the blockchain index, which lists boxes in blocks only).
+  The reserve's R6 binds it to that NFT; before the NFT is minted, a reserve would point at a
+  tracker that does not exist and could only be refunded.
+- The server itself refuses to start with an `ergo.tracker_nft_id` that is not 32 bytes of hex
+  or is all zeros (a placeholder, never a minted token).
+
 - Returns a JSON response compatible with Ergo's `/wallet/payment/send` API:
   - `requests`: Array of payment requests
     - `address`: Reserve contract P2S address (hardcoded in configuration)

@@ -73,11 +73,11 @@ async fn main() {
     }
 
     // Validate that tracker NFT ID is properly configured
-    if config.tracker_nft_bytes().is_err() {
-        exit_on_startup_error(
-            "Tracker NFT ID is not properly configured in the configuration file. The server \
-             requires a valid tracker_nft_id value.",
-        );
+    if let Err(problem) = config.tracker_nft_id_checked() {
+        exit_on_startup_error(&format!(
+            "Tracker NFT ID is not properly configured: {problem}. The server requires the id \
+             of the minted tracker NFT."
+        ));
     }
 
     tracing::info!("Configuration loaded successfully");

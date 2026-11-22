@@ -134,9 +134,7 @@ mod create_reserve_tests {
             ergo_scanner: Arc::new(Mutex::new(scanner)),
             reserve_tracker,
             config: test_config,
-            shared_tracker_state: Arc::new(tokio::sync::Mutex::new(
-                crate::tracker_box_updater::SharedTrackerState::new(),
-            )),
+            shared_tracker_state: Arc::new(tokio::sync::Mutex::new(confirmed_tracker_box())),
             tracker_storage,
             acceptance_predicate: None,
             policy_storage,
@@ -147,6 +145,57 @@ mod create_reserve_tests {
                 crate::redemption_build::BuildRateLimiter::new(),
             ),
         }
+    }
+
+    /// Shared tracker state in which the box updater has seen the tracker box in a block.
+    fn confirmed_tracker_box() -> crate::tracker_box_updater::SharedTrackerState {
+        let shared = crate::tracker_box_updater::SharedTrackerState::new();
+        shared.set_confirmed([0x42; 33], "ab".repeat(32), 1_000);
+        shared
+    }
+
+    fn request(nft_id: &str) -> CreateReserveRequest {
+        CreateReserveRequest {
+            nft_id: nft_id.to_string(),
+            owner_pubkey: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .to_string(),
+            erg_amount: 1_000_000_000,
+            token_amount: 0,
+            token_id: String::new(),
+        }
+    }
+
+    /// Before the tracker box for the configured NFT is confirmed on chain, a reserve would be
+    /// bound to a tracker that does not exist yet: 503 with a clear message, no payload. Once
+    /// the box updater has seen the box, the same request gets its payload.
+    #[tokio::test]
+    async fn test_create_reserve_payload_waits_for_a_confirmed_tracker_box() {
+        let reserve_nft = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let state = create_test_app_state();
+        *state.shared_tracker_state.lock().await =
+            crate::tracker_box_updater::SharedTrackerState::new();
+
+        let (status, body) =
+            create_reserve_payload(State(state.clone()), Json(request(reserve_nft))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        let error = body.error.clone().unwrap();
+        assert!(error.contains("not confirmed on chain yet"), "{error}");
+        assert!(body.data.is_none());
+
+        // A live box id alone (no confirmed state) is not enough either.
+        state
+            .shared_tracker_state
+            .lock()
+            .await
+            .set_tracker_box_id("cd".repeat(32));
+        let (status, _) =
+            create_reserve_payload(State(state.clone()), Json(request(reserve_nft))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        *state.shared_tracker_state.lock().await = confirmed_tracker_box();
+        let (status, body) = create_reserve_payload(State(state), Json(request(reserve_nft))).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(body.data.is_some());
     }
 
     fn create_token_test_app_state() -> AppState {
