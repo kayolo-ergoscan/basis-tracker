@@ -219,6 +219,100 @@ pub async fn create_note(
         }
     };
 
+    // Round 4 (C3): a note needs its issuer's active reserve under this tracker, in the note's
+    // denomination (`server.notes_require_reserve`, default true). Without one the note could
+    // never be redeemed, and anyone could grow the tree for free.
+    if state.config.server.notes_require_reserve {
+        if let Err((status, message)) =
+            require_active_issuer_reserve(&state, &hex::encode(issuer_pubkey), &denomination).await
+        {
+            return (status, Json(crate::models::error_response(message)));
+        }
+    }
+
+    // Round 4 (C3): the note caps (429). Admission is serialized from the checks to the
+    // tracker's answer, so concurrent notes cannot overshoot a cap.
+    let _admission = state.note_limits.admit().await;
+    let issuer_notes = {
+        let (notes_tx, notes_rx) = tokio::sync::oneshot::channel();
+        if state
+            .tx
+            .send(crate::TrackerCommand::GetNotesByIssuer {
+                issuer_pubkey,
+                response_tx: notes_tx,
+            })
+            .await
+            .is_err()
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::models::error_response(
+                    "Tracker thread unavailable".to_string(),
+                )),
+            );
+        }
+        match notes_rx.await {
+            Ok(Ok(notes)) => notes,
+            Ok(Err(e)) => {
+                tracing::error!("Failed to read the issuer's notes: {:?}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(crate::models::error_response(
+                        "could not read the issuer's notes".to_string(),
+                    )),
+                );
+            }
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(crate::models::error_response(
+                        "Tracker thread unavailable".to_string(),
+                    )),
+                )
+            }
+        }
+    };
+    let is_new_edge = !issuer_notes
+        .iter()
+        .any(|n| n.recipient_pubkey == recipient_pubkey && n.denomination == denomination);
+    if !issuer_notes
+        .iter()
+        .any(|n| n.recipient_pubkey == recipient_pubkey)
+    {
+        let mut recipients: Vec<&PubKey> =
+            issuer_notes.iter().map(|n| &n.recipient_pubkey).collect();
+        recipients.sort();
+        recipients.dedup();
+        let max = state.config.server.notes_max_recipients_per_issuer;
+        if recipients.len() >= max as usize {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(crate::models::error_response(format!(
+                    "issuer {} already has {} recipients, the most this tracker accepts per \
+                     issuer (server.notes_max_recipients_per_issuer = {}); notes to existing \
+                     recipients are still accepted",
+                    hex::encode(issuer_pubkey),
+                    recipients.len(),
+                    max
+                ))),
+            );
+        }
+    }
+    let slot = match state.note_limits.try_record(
+        &issuer_pubkey,
+        is_new_edge,
+        state.config.server.notes_max_updates_per_issuer_per_hour,
+        state.config.server.notes_max_new_edges_per_hour,
+    ) {
+        Ok(slot) => slot,
+        Err(message) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(crate::models::error_response(message)),
+            )
+        }
+    };
+
     // Create the IOU note
     let note = IouNote::new(
         recipient_pubkey,
@@ -243,6 +337,7 @@ pub async fn create_note(
         .await
     {
         tracing::error!("Failed to send to tracker thread: {:?}", e);
+        state.note_limits.release(slot);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(crate::models::error_response(
@@ -251,8 +346,12 @@ pub async fn create_note(
         );
     }
 
-    // Wait for response from tracker thread
-    match response_rx.await {
+    // Wait for response from tracker thread. A note the tracker refuses gives its cap slot back.
+    let answer = response_rx.await;
+    if !matches!(answer, Ok(Ok(()))) {
+        state.note_limits.release(slot);
+    }
+    match answer {
         Ok(Ok(())) => {
             tracing::info!(
                 "Successfully created note from {} to {}",
@@ -3507,6 +3606,80 @@ pub(crate) async fn ensure_single_issuer_reserve(
         ));
     }
     Ok(matching_boxes.pop())
+}
+
+/// Round 4 (C3, `server.notes_require_reserve`): the issuer must have an ACTIVE reserve under
+/// this tracker in `denomination` before a note is accepted: exactly one tracked reserve there
+/// (the same view `ensure_single_issuer_reserve` gives the redemption routes), bound to this
+/// tracker's NFT in R6, and not in refund. Every failure is a 409 with the reason.
+pub(crate) async fn require_active_issuer_reserve(
+    state: &AppState,
+    issuer_pubkey_hex: &str,
+    denomination: &basis_store::DenomKey,
+) -> Result<(), (StatusCode, String)> {
+    let box_id = match ensure_single_issuer_reserve(state, issuer_pubkey_hex, denomination).await {
+        Ok(Some(box_id)) => box_id,
+        Ok(None) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "issuer {} has no reserve under this tracker in denomination {}; a note is \
+                     accepted only when its issuer has an active reserve here \
+                     (server.notes_require_reserve)",
+                    issuer_pubkey_hex,
+                    denomination.denomination_id()
+                ),
+            ))
+        }
+        Err(conflict) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("{conflict} New notes of this issuer are not accepted until then."),
+            ))
+        }
+    };
+    let reserve = match state.reserve_tracker.lock().await.get_reserve(&box_id) {
+        Ok(reserve) => reserve,
+        // Spent between the two reads.
+        Err(_) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "the reserve {} of issuer {} is no longer tracked; try again",
+                    box_id, issuer_pubkey_hex
+                ),
+            ))
+        }
+    };
+    if let Some(nft) = state
+        .config
+        .ergo
+        .tracker_nft_id
+        .as_deref()
+        .filter(|nft| !nft.is_empty())
+    {
+        if !reserve.base_info.tracker_nft_id.eq_ignore_ascii_case(nft) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "the reserve {} of issuer {} is bound to tracker NFT {}, not this \
+                     tracker's {}",
+                    box_id, issuer_pubkey_hex, reserve.base_info.tracker_nft_id, nft
+                ),
+            ));
+        }
+    }
+    if reserve.is_refund_pending() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "the reserve {} of issuer {} is in refund (since height {}); new notes are not \
+                 accepted against it",
+                box_id, issuer_pubkey_hex, reserve.base_info.refund_initiation_height
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Find the issuer's tracked reserve collateral for acceptance-policy checks.

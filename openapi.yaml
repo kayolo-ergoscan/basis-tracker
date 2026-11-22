@@ -51,7 +51,16 @@ paths:
   /notes:
     post:
       summary: Create a new IOU note
-      description: Creates a new IOU note with the specified parameters. The note must be signed by the issuer.
+      description: >-
+        Creates a new IOU note with the specified parameters. The note must be signed by the issuer.
+        With `server.notes_require_reserve` (default true) the issuer must have exactly one active
+        reserve under this tracker in the note's denomination: tracked, bound to this tracker's NFT
+        and not in refund (409 otherwise). Three caps answer 429: distinct recipients per issuer
+        (`server.notes_max_recipients_per_issuer`, default 50), accepted notes per issuer per rolling
+        hour (`server.notes_max_updates_per_issuer_per_hour`, default 120) and new (issuer,
+        recipient, denomination) edges per rolling hour for all issuers together
+        (`server.notes_max_new_edges_per_hour`, default 1000). A note the tracker refuses does not
+        count against the hourly caps.
       operationId: createNote
       tags:
         - Notes
@@ -75,7 +84,20 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
         '409':
-          description: Conflict - note's tracker_nft_id does not match this tracker's configured tracker NFT ID
+          description: >-
+            Conflict - the note's tracker_nft_id does not match this tracker's configured tracker NFT
+            ID, or (with server.notes_require_reserve) the issuer has no active reserve under this
+            tracker in the note's denomination: none, more than one, bound to another tracker NFT, or
+            in refund
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '429':
+          description: >-
+            Too many requests - a note cap is reached (server.notes_max_recipients_per_issuer,
+            server.notes_max_updates_per_issuer_per_hour or server.notes_max_new_edges_per_hour); the
+            message names the cap
           content:
             application/json:
               schema:
@@ -2764,7 +2786,10 @@ components:
       properties:
         local_digest:
           type: string
-          description: Local tracker AVL tree digest
+          description: >-
+            Local tracker AVL tree digest as of the last refresh of the live tree: the box
+            updater's cycle or a live proof request. Notes accepted since then are stored but not
+            yet in this digest; the next refresh includes them all at once.
           example: "64abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
         confirmed_digest:
           type: string

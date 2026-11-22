@@ -135,6 +135,10 @@ mod untested_handlers {
                 reserve_creation_max_token_amount: 1_000_000_000,
                 redemption_build_max_per_pair_per_hour: 60,
                 redemption_build_max_per_recipient_per_hour: 30,
+                notes_require_reserve: false,
+                notes_max_recipients_per_issuer: 50,
+                notes_max_updates_per_issuer_per_hour: 120,
+                notes_max_new_edges_per_hour: 1000,
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -207,6 +211,7 @@ mod untested_handlers {
             redemption_build_rate: std::sync::Arc::new(
                 basis_server::redemption_build::BuildRateLimiter::new(),
             ),
+            note_limits: std::sync::Arc::new(basis_server::note_limits::NoteLimiter::new()),
         }
     }
 

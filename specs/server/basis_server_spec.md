@@ -60,7 +60,9 @@ fjall keyspace waits up to one fsync interval to close.
 ### Core Endpoints
 
 - `GET /` - Root endpoint returning "Hello, Basis Tracker API!"
-- `POST /notes` - Create a new IOU note
+- `POST /notes` - Create a new IOU note. With `server.notes_require_reserve` (default true) the
+  issuer needs one active reserve under this tracker in the note's denomination (409 otherwise);
+  `server.notes_max_*` caps answer 429 (see `docs/CONFIGURATION.md`)
 - `GET /notes` - Get all IOU notes in the system (Admin role)
 - `GET /notes/issuer/{pubkey}` - Get all notes issued by a public key
 - `GET /notes/recipient/{pubkey}` - Get all notes received by a public key

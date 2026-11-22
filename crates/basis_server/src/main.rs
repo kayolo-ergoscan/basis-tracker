@@ -795,6 +795,7 @@ async fn main() {
         redemption_build_rate: std::sync::Arc::new(
             basis_server::redemption_build::BuildRateLimiter::new(),
         ),
+        note_limits: std::sync::Arc::new(basis_server::note_limits::NoteLimiter::new()),
     };
 
     // Build CORS layer based on auth configuration.

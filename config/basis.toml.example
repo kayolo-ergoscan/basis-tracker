@@ -25,6 +25,16 @@ database_url = "sqlite:data/basis.db"
 # earlier, and ERG-reserve builds (the fee comes out of the payout), do not count.
 # redemption_build_max_per_issuer_per_hour = 6
 # redemption_build_max_per_hour = 30
+# POST /notes needs the issuer's active reserve under this tracker in the note's denomination
+# (one reserve, bound to this tracker's NFT, not in refund; 409 otherwise). false allows credit
+# without a reserve.
+# notes_require_reserve = true
+# Note caps, each answered with 429: distinct recipients per issuer, accepted notes per issuer
+# per rolling hour, and new (issuer, recipient, denomination) edges per rolling hour for all
+# issuers together.
+# notes_max_recipients_per_issuer = 50
+# notes_max_updates_per_issuer_per_hour = 120
+# notes_max_new_edges_per_hour = 1000
 
 [server.auth]
 # Authentication mode: "none", "api_key", or "signature".
