@@ -105,7 +105,7 @@ pub struct AuthConfig {
     /// explicitly. Defaults to false, so the safe case is the default case.
     #[serde(default)]
     pub allow_anonymous_non_loopback: bool,
-    /// Separate operator credential for Admin routes (`/redeem/complete`).
+    /// Separate operator credential for Admin routes (`/redeem/complete`, `GET /notes`).
     /// `api_key` then only grants `ClientRole::Write`, so the key shared with
     /// ordinary clients cannot drive operator-only endpoints. Required in
     /// `api_key` mode: `validate_startup` refuses to start without a distinct,

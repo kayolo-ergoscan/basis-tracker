@@ -42,7 +42,7 @@ The server uses an actor-like pattern with a dedicated tracker thread that proce
 
 - `GET /` - Root endpoint returning "Hello, Basis Tracker API!"
 - `POST /notes` - Create a new IOU note
-- `GET /notes` - Get all IOU notes in the system
+- `GET /notes` - Get all IOU notes in the system (Admin role)
 - `GET /notes/issuer/{pubkey}` - Get all notes issued by a public key
 - `GET /notes/recipient/{pubkey}` - Get all notes received by a public key
 - `GET /notes/issuer/{issuer_pubkey}/recipient/{recipient_pubkey}` - Get specific note between two parties
@@ -293,7 +293,7 @@ Key configuration includes:
   - `api_key`: shared secret used when `mode = "api_key"`. Grants `Admin` by default; when
     `admin_api_key` is set it grants only `Write`.
   - `admin_api_key`: optional separate key that grants `Admin` on the operator-only routes
-    (`/reserves/create`, `/acceptance/policy`, `/redeem/complete`) when `mode = "api_key"`.
+    (`/redeem/complete`, `GET /notes`) when `mode = "api_key"`.
   - `authorized_clients`: list of `{ pubkey, role }` entries used when `mode = "signature"`.
   - `allowed_origins`: CORS origin allow-list. Empty (default) disables CORS entirely; wildcard origins are never used.
   - `signature_timestamp_tolerance_ms`: maximum age of a request signature in milliseconds (default 30 s).

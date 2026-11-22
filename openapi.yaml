@@ -87,8 +87,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
     get:
-      summary: Get all IOU notes
-      description: Retrieve all IOU notes tracked by the server, including the age of each note in seconds.
+      summary: Get all IOU notes (Admin only)
+      description: >-
+        Retrieve all IOU notes tracked by the server, including the age of each
+        note in seconds. This lists every note of every issuer and recipient, so
+        when authentication is enabled it requires the Admin role (403 for Read
+        and Write clients). Clients that need their own notes use
+        GET /notes/issuer/{pubkey} or GET /notes/recipient/{pubkey} (Read).
       operationId: getAllNotes
       tags:
         - Notes
@@ -99,6 +104,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiResponseNotesWithAge'
+        '403':
+          description: Forbidden - the caller's role is not Admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
         '500':
           description: Internal server error
           content:

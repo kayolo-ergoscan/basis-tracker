@@ -24,6 +24,8 @@ fn test_app(auth_config: AuthConfig) -> Router {
     Router::new()
         .route("/", get(protected_handler))
         .route("/notes", get(protected_handler).post(protected_handler))
+        .route("/notes/issuer/{pubkey}", get(protected_handler))
+        .route("/tracker/state", get(protected_handler))
         .route("/acceptance/policy", post(protected_handler))
         .route("/redeem/complete", post(protected_handler))
         .layer(axum::middleware::from_fn(authorization_middleware))
@@ -119,7 +121,7 @@ async fn signature_mode_accepts_valid_signature() {
 
     let app = test_app(config);
     let request = sign_request(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         None,
         &pubkey_hex,
         &secret_key,
@@ -158,7 +160,7 @@ async fn signature_mode_rejects_unauthorized_pubkey() {
 
     let app = test_app(config);
     let request = sign_request(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         None,
         &pubkey_hex,
         &secret_key,
@@ -179,7 +181,7 @@ async fn signature_mode_rejects_bad_signature() {
 
     let app = test_app(config);
     let mut request = sign_request(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         None,
         &pubkey_hex,
         &secret_key,
@@ -210,7 +212,7 @@ async fn signature_mode_rejects_replayed_nonce() {
     let app = test_app(config);
     let timestamp = current_timestamp_ms();
     let request1 = sign_request_full(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         Vec::new(),
         &pubkey_hex,
         &secret_key,
@@ -224,7 +226,7 @@ async fn signature_mode_rejects_replayed_nonce() {
 
     // Same (timestamp, nonce) pair replayed is rejected.
     let request2 = sign_request_full(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         Vec::new(),
         &pubkey_hex,
         &secret_key,
@@ -324,7 +326,7 @@ async fn signature_mode_rejects_missing_nonce() {
     let app = test_app(write_mode_config(&pubkey_hex));
 
     let mut request = sign_request(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         None,
         &pubkey_hex,
         &secret_key,
@@ -347,7 +349,7 @@ async fn bad_signature_does_not_burn_nonce() {
 
     // Forged request: valid headers but a corrupted signature.
     let mut forged = sign_request_full(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         Vec::new(),
         &pubkey_hex,
         &secret_key,
@@ -366,7 +368,7 @@ async fn bad_signature_does_not_burn_nonce() {
 
     // Legitimate request with the same nonce succeeds.
     let genuine = sign_request_full(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         Vec::new(),
         &pubkey_hex,
         &secret_key,
@@ -439,7 +441,7 @@ async fn api_key_with_admin_key_set_grants_only_write() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/notes")
+                .uri("/tracker/state")
                 .header("Authorization", "Bearer shared-key")
                 .body(Body::empty())
                 .unwrap(),
@@ -520,7 +522,7 @@ async fn signature_mode_rejects_zero_padded_timestamp_replay() {
     let timestamp = current_timestamp_ms();
     let nonce = "padded-replay-nonce";
     let request1 = sign_request_full(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         Vec::new(),
         &pubkey_hex,
         &secret_key,
@@ -536,7 +538,7 @@ async fn signature_mode_rejects_zero_padded_timestamp_replay() {
     // string is zero-padded. The signature still verifies (it covers the
     // parsed value), so only the replay cache can stop it.
     let mut request2 = sign_request_full(
-        Request::builder().uri("/notes").method("GET"),
+        Request::builder().uri("/tracker/state").method("GET"),
         Vec::new(),
         &pubkey_hex,
         &secret_key,
@@ -553,5 +555,89 @@ async fn signature_mode_rejects_zero_padded_timestamp_replay() {
         response.status() == StatusCode::UNAUTHORIZED || response.status() == StatusCode::FORBIDDEN,
         "zero-padded replay must be rejected, got {}",
         response.status()
+    );
+}
+
+/// GET /notes lists every note of every pair: Admin only. The per-key note endpoints stay
+/// readable by Read and Write clients.
+#[tokio::test]
+async fn get_all_notes_requires_admin() {
+    async fn status_of(app: &Router, request: Request<Body>) -> StatusCode {
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+    let get = |uri: &str| Request::builder().uri(uri).method("GET");
+
+    // Signature mode: Read and Write clients get 403 on GET /notes, 200 on per-key notes.
+    for role in [ClientRole::Read, ClientRole::Write] {
+        let (pubkey_hex, secret_key) = generate_keypair();
+        let mut config = AuthConfig::default();
+        config.mode = AuthMode::Signature;
+        config.authorized_clients.push(AuthorizedClient {
+            pubkey: pubkey_hex.clone(),
+            role,
+        });
+        let app = test_app(config);
+        let all = sign_request_full(
+            get("/notes"),
+            Vec::new(),
+            &pubkey_hex,
+            &secret_key,
+            current_timestamp_ms(),
+            "all-notes",
+        );
+        assert_eq!(
+            status_of(&app, all).await,
+            StatusCode::FORBIDDEN,
+            "{role:?}"
+        );
+        let per_key = sign_request_full(
+            get(&format!("/notes/issuer/{pubkey_hex}")),
+            Vec::new(),
+            &pubkey_hex,
+            &secret_key,
+            current_timestamp_ms(),
+            "per-key-notes",
+        );
+        assert_eq!(status_of(&app, per_key).await, StatusCode::OK, "{role:?}");
+    }
+
+    // An Admin signature client passes.
+    let (pubkey_hex, secret_key) = generate_keypair();
+    let mut config = AuthConfig::default();
+    config.mode = AuthMode::Signature;
+    config.authorized_clients.push(AuthorizedClient {
+        pubkey: pubkey_hex.clone(),
+        role: ClientRole::Admin,
+    });
+    let app = test_app(config);
+    let all = sign_request_full(
+        get("/notes"),
+        Vec::new(),
+        &pubkey_hex,
+        &secret_key,
+        current_timestamp_ms(),
+        "admin-all-notes",
+    );
+    assert_eq!(status_of(&app, all).await, StatusCode::OK);
+
+    // API-key mode with a separate admin key: shared key 403, operator key 200.
+    let mut config = AuthConfig::default();
+    config.mode = AuthMode::ApiKey;
+    config.api_key = Some("shared-key".to_string());
+    config.admin_api_key = Some("operator-key".to_string());
+    let app = test_app(config);
+    let with_key = |key: &str| {
+        get("/notes")
+            .header("Authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        status_of(&app, with_key("shared-key")).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status_of(&app, with_key("operator-key")).await,
+        StatusCode::OK
     );
 }

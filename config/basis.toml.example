@@ -32,7 +32,7 @@ mode = "none"
 # Shared API key for server-to-server / MCP clients when mode = "api_key".
 # The literal "change-me" is rejected at startup; use a strong random key.
 # api_key = "change-me"
-# Separate operator credential for Admin routes (/redeem/complete). Required when
+# Separate operator credential for Admin routes (/redeem/complete, GET /notes). Required when
 # mode = "api_key": `api_key` then grants only Write access, so the key shared with
 # ordinary clients cannot drive operator-only endpoints. The server refuses to start
 # without it, with the literal "change-me-admin", or with a value equal to api_key.

@@ -79,8 +79,13 @@ fn required_role(path: &str, method: &str) -> ClientRole {
             // Unknown POSTs default to Admin for safety.
             _ => ClientRole::Admin,
         },
-        // All GET endpoints expose tracker state and are readable.
-        "GET" => ClientRole::Read,
+        "GET" => match path {
+            // Every note of every issuer and recipient in one response: operator-only. The
+            // per-key note endpoints (`/notes/issuer/...`, `/notes/recipient/...`) stay Read.
+            "/notes" => ClientRole::Admin,
+            // All other GET endpoints expose tracker state and are readable.
+            _ => ClientRole::Read,
+        },
         // OPTIONS preflight is handled at the CORS layer before auth/authorization.
         "OPTIONS" => ClientRole::Read,
         // Any other verb is unexpected; default to Admin.
@@ -131,7 +136,23 @@ mod tests {
     #[test]
     fn required_roles_match_expectations() {
         assert_eq!(required_role("/", "GET"), ClientRole::Read);
-        assert_eq!(required_role("/notes", "GET"), ClientRole::Read);
+        assert_eq!(required_role("/notes", "GET"), ClientRole::Admin);
+        assert_eq!(
+            required_role("/notes/issuer/{pubkey}", "GET"),
+            ClientRole::Read
+        );
+        assert_eq!(
+            required_role("/notes/recipient/{pubkey}", "GET"),
+            ClientRole::Read
+        );
+        assert_eq!(
+            required_role(
+                "/notes/issuer/{issuer_pubkey}/recipient/{recipient_pubkey}",
+                "GET"
+            ),
+            ClientRole::Read
+        );
+        assert_eq!(required_role("/tracker/state", "GET"), ClientRole::Read);
         assert_eq!(required_role("/notes", "POST"), ClientRole::Write);
         assert_eq!(required_role("/redeem", "POST"), ClientRole::Write);
         assert_eq!(required_role("/redeem/complete", "POST"), ClientRole::Admin);

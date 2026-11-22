@@ -58,7 +58,7 @@ signature_timestamp_tolerance_ms = 30000
 ```
 
 With `admin_api_key` set, the shared `api_key` grants only Write access; Admin routes
-(`/reserves/create`, `/acceptance/policy`, `/redeem/complete`) require the admin key.
+(`/redeem/complete`, `GET /notes`) require the admin key.
 Without it, `api_key` keeps its full Admin meaning (a startup warning is printed).
 
 When auth is enabled, configure TLS (`tls_cert_path` / `tls_key_path`) so
