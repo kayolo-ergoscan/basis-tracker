@@ -4419,6 +4419,23 @@ pub async fn get_latest_tracker_box_id(
     }
 }
 
+/// True when `value_hex` is exactly one canonical sigma constant: it parses, and serializing the
+/// parsed constant gives back the same bytes (no trailing bytes, no other encoding of the value).
+pub(crate) fn is_canonical_constant_hex(value_hex: &str) -> bool {
+    use ergo_lib::ergotree_ir::mir::constant::Constant;
+    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+    let Ok(bytes) = hex::decode(value_hex) else {
+        return false;
+    };
+    match Constant::sigma_parse_bytes(&bytes) {
+        Ok(constant) => constant
+            .sigma_serialize_bytes()
+            .map(|canonical| canonical == bytes)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 // Create a reserve creation payload shaped for the Ergo node's /wallet/payment/send API.
 //
 // The OWNER submits this payload to their own node, which signs it with the owner's wallet.
@@ -4627,9 +4644,11 @@ pub async fn create_reserve_payload(
         config.ergo.basis_reserve_contract_p2s.clone()
     };
 
-    // Build properly serialized register values following Ergo constant format
+    // Build properly serialized register values following Ergo constant format. Every value is
+    // one canonical sigma constant in lowercase hex (checked below): clients compare and rebuild
+    // these registers byte for byte.
     // R4: GroupElement (owner pubkey) - prefix 07 + 33-byte compressed pubkey
-    let r4_value = format!("07{}", payload.owner_pubkey);
+    let r4_value = format!("07{}", hex::encode(&owner_pubkey_bytes));
 
     // R5: SAvlTree (empty AVL tree) - prefix 64 + 33-byte digest + flags + key_len + value_len
     // Empty tree digest for PlasmaParameters(32, None) is 4ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900
@@ -4665,10 +4684,40 @@ pub async fn create_reserve_payload(
             ))),
         );
     }
-    let r6_value = format!("0e{:02x}{}", tracker_nft_bytes.len(), tracker_nft_id);
+    let r6_value = format!(
+        "0e{:02x}{}",
+        tracker_nft_bytes.len(),
+        hex::encode(&tracker_nft_bytes)
+    );
 
-    // R7: Long (refund initiation height, 0 for a new reserve with no pending refund)
-    let r7_value = "05000000000000000000".to_string();
+    // R7: Long (refund initiation height, 0 for a new reserve with no pending refund): type 05,
+    // then the ZigZag VLQ of 0, one byte. (It used to carry 8 more zero bytes after the value.)
+    let r7_value = basis_offchain::ergo_tx::serialize_ergo_long(0);
+
+    // R4 is the only register built from caller input: a key that is not a point (or is the
+    // identity, which anyone can prove) would lock the owner's collateral in a box nobody, or
+    // everybody, can spend.
+    if !matches!(owner_pubkey_bytes[0], 0x02 | 0x03) || !is_canonical_constant_hex(&r4_value) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(crate::models::error_response(
+                "owner_pubkey must be a compressed secp256k1 public key (02 or 03, then the \
+                 32-byte x coordinate of a point on the curve)"
+                    .to_string(),
+            )),
+        );
+    }
+    for (id, value) in [("R5", &r5_value), ("R6", &r6_value), ("R7", &r7_value)] {
+        if !is_canonical_constant_hex(value) {
+            tracing::error!("reserve payload register {id} is not a canonical constant: {value}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::models::error_response(format!(
+                    "internal error: reserve register {id} is malformed"
+                ))),
+            );
+        }
+    }
 
     // Create registers map
     let mut registers = std::collections::HashMap::new();

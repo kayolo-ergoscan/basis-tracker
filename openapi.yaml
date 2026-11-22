@@ -534,7 +534,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseReserveCreation'
         '400':
-          description: Bad request - invalid input parameters
+          description: >-
+            Bad request - invalid input parameters, including an owner_pubkey that
+            is not a compressed secp256k1 point (02/03 prefix, on the curve)
           content:
             application/json:
               schema:
@@ -2073,10 +2075,16 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Register values for the reserve box
+          description: >-
+            Register values for the reserve box, each exactly one canonical sigma
+            constant in lowercase hex (no trailing bytes): R4 GroupElement owner
+            key (07 + 33 bytes), R5 the empty reserve AVL tree, R6 Coll[Byte]
+            tracker NFT id (0e20 + 32 bytes), R7 Long 0 (0500)
           example:
-            R4: "010101010101010101010101010101010101010101010101010101010101010101"
-            R5: "64abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+            R4: "070279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            R5: "644ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900032000"
+            R6: "0e201af23d4e5f6a7b8c9daebfc0d1e2f30415263748596a7b8c9daebfc0d1e2f304"
+            R7: "0500"
 
     Asset:
       type: object

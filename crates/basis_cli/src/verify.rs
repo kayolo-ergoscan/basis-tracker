@@ -432,9 +432,23 @@ fn parse_point(pubkey: &[u8; 33]) -> Result<EcPoint> {
 }
 
 /// Parse a hex-encoded serialized constant, as the node reads register values.
+/// Parse a register value: exactly one sigma constant, canonically encoded (serializing the
+/// parsed constant gives back the same bytes, so no trailing bytes are ignored).
 fn parse_constant(value_hex: &str) -> Result<Constant> {
     let bytes = hex::decode(value_hex).map_err(|e| anyhow!("invalid hex: {}", e))?;
-    Constant::sigma_parse_bytes(&bytes).map_err(|e| anyhow!("invalid constant: {}", e))
+    let constant =
+        Constant::sigma_parse_bytes(&bytes).map_err(|e| anyhow!("invalid constant: {}", e))?;
+    let canonical = constant
+        .sigma_serialize_bytes()
+        .map_err(|e| anyhow!("invalid constant: {}", e))?;
+    if canonical != bytes {
+        return Err(anyhow!(
+            "not a canonical constant ({} bytes, of which the value takes {})",
+            bytes.len(),
+            canonical.len()
+        ));
+    }
+    Ok(constant)
 }
 
 fn decode_array<const N: usize>(value_hex: &str, label: &str) -> Result<[u8; N]> {
@@ -515,7 +529,7 @@ mod tests {
             ("R4".to_string(), format!("07{}", request.owner_pubkey)),
             ("R5".to_string(), EMPTY_RESERVE_TREE_R5.to_string()),
             ("R6".to_string(), format!("0e20{}", TRACKER_NFT)),
-            ("R7".to_string(), "05000000000000000000".to_string()),
+            ("R7".to_string(), "0500".to_string()),
         ]);
         ReserveCreationResponse {
             requests: vec![ReservePaymentRequest {
@@ -651,6 +665,10 @@ mod tests {
         assert!(err.contains("R6"));
         // A pending refund on a brand-new reserve.
         assert!(reserve_err(&request, &with("R7", "050a")).contains("R7"));
+        // The Long 0 followed by trailing bytes (what trackers before round 4 sent) is not one
+        // canonical constant.
+        let err = reserve_err(&request, &with("R7", "05000000000000000000"));
+        assert!(err.contains("R7") && err.contains("canonical"), "{err}");
         // Anything beyond R4..R7.
         assert!(reserve_err(&request, &with("R8", "0500")).contains("R8"));
     }

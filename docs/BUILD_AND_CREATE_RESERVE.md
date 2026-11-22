@@ -63,7 +63,7 @@ The CLI command will output a JSON payload that you can use with the Ergo wallet
       "R4": "0703bc58014bd741ea06d6f3b1de5d0847b71758a64c6f04e6c98639dcf3d12be273",
       "R5": "644ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900032000",
       "R6": "0e20160aca8aaa854a47a58f1d84f9d2e40cea473bd670982631884c76b4ebfca2a4",
-      "R7": "05000000000000000000"
+      "R7": "0500"
     }
   }
 ]
@@ -91,7 +91,7 @@ curl -X POST http://your-ergo-node:9053/wallet/payment/send \
       "R4": "0703bc58014bd741ea06d6f3b1de5d0847b71758a64c6f04e6c98639dcf3d12be273",
       "R5": "644ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900032000",
       "R6": "0e20160aca8aaa854a47a58f1d84f9d2e40cea473bd670982631884c76b4ebfca2a4",
-      "R7": "05000000000000000000"
+      "R7": "0500"
     }
   }
 ]'
@@ -116,7 +116,7 @@ If you want the exact JSON array format that the wallet/payment/send API expects
       "R4": "0703bc58014bd741ea06d6f3b1de5d0847b71758a64c6f04e6c98639dcf3d12be273",
       "R5": "644ec61f485b98eb87153f7c57db4f5ecd75556fddbc403b41acf8441fde8e160900032000",
       "R6": "0e20160aca8aaa854a47a58f1d84f9d2e40cea473bd670982631884c76b4ebfca2a4",
-      "R7": "05000000000000000000"
+      "R7": "0500"
     }
   }
 ]
