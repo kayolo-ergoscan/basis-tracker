@@ -218,6 +218,65 @@ pub fn build_request_message(
 mod tests {
     use super::*;
 
+    /// Round 4: worked examples for clients (the canary tool among them): the exact bytes of
+    /// the 80-byte note message (also what `/tracker/signature` signs) and of the build-request
+    /// message of `POST /redemption/build`, for fixed inputs. A client that produces the same
+    /// bytes signs what the tracker verifies. Keys: the secp256k1 generator G (issuer) and 2G
+    /// (receiver); tracker NFT 0x5a * 32; 2026-11-22T00:00:00Z in ms.
+    #[test]
+    fn worked_examples_of_the_signed_messages() {
+        let key = |h: &str| -> PubKey { hex::decode(h).unwrap().try_into().unwrap() };
+        let issuer = key("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+        let receiver = key("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5");
+        let nft = [0x5a; 32];
+        let ts = 1_795_305_600_000u64;
+
+        assert_eq!(
+            hex::encode(DenomKey::Erg.debt_key(&issuer, &receiver)),
+            "87262ce92e4cc9c99666eb41bcab2a75ed76c937b50f9e441b4f5806138228ee"
+        );
+        let note = signing_message(&issuer, &receiver, &DenomKey::Erg, 1_000_000_000, ts, &nft);
+        assert_eq!(
+            hex::encode(&note),
+            concat!(
+                "87262ce92e4cc9c99666eb41bcab2a75ed76c937b50f9e441b4f5806138228ee",
+                "000000003b9aca00",
+                "000001a2008d7400",
+                "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+            )
+        );
+
+        let build = build_request_message(
+            &nft,
+            &issuer,
+            &receiver,
+            &DenomKey::Erg,
+            500_000_000,
+            ts + 60_000,
+        );
+        assert_eq!(build.len(), 131);
+        assert_eq!(
+            hex::encode(&build),
+            concat!(
+                "62617369732d6275696c642d7631",
+                "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+                "657267",
+                "000000001dcd6500",
+                "000001a2008e5e60"
+            )
+        );
+
+        let token = DenomKey::Token([0x7c; 32]);
+        assert_eq!(
+            hex::encode(token.debt_key(&issuer, &receiver)),
+            "9166c9c9b26e3c9832d9285becd4a22fa265552a51ee77f0d6d5ae79ae6281be"
+        );
+        let build = build_request_message(&nft, &issuer, &receiver, &token, 500_000_000, ts + 60_000);
+        assert_eq!(build.len(), 198);
+    }
+
     #[test]
     fn denomination_id_roundtrip() {
         assert_eq!(DenomKey::Erg.denomination_id(), "erg");
