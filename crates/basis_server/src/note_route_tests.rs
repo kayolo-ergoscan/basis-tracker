@@ -1,5 +1,5 @@
 //! `POST /notes` with a real tracker state: the reserve requirement and the note caps
-//! (round 4, C3).
+//! (round 4, C3), and the C10 fixes of the read routes that sit on the same state.
 
 use std::sync::{Arc, Mutex};
 
@@ -147,17 +147,16 @@ fn state(caps: Caps) -> AppState {
     }
 }
 
-/// Track a reserve of `owner` (ERG, or the token `token`), bound to `nft`, in refund since
+/// A reserve of `owner` (ERG, or the token `token`), bound to `nft`, in refund since
 /// `refund_height` (0: none).
-async fn add_reserve(
-    state: &AppState,
+fn reserve_info(
     owner: &PubKey,
     box_id: &str,
     token: Option<[u8; 32]>,
     nft: [u8; 32],
     refund_height: u64,
-) {
-    let info = basis_store::reserve_tracker::ExtendedReserveInfo {
+) -> basis_store::reserve_tracker::ExtendedReserveInfo {
+    basis_store::reserve_tracker::ExtendedReserveInfo {
         base_info: basis_store::ReserveInfo {
             collateral_amount: 1_000_000_000,
             last_updated_height: 1,
@@ -170,12 +169,23 @@ async fn add_reserve(
         box_id: box_id.to_string(),
         owner_pubkey: hex::encode(owner),
         last_updated_timestamp: 0,
-    };
+    }
+}
+
+/// Track a reserve (see [`reserve_info`]).
+async fn add_reserve(
+    state: &AppState,
+    owner: &PubKey,
+    box_id: &str,
+    token: Option<[u8; 32]>,
+    nft: [u8; 32],
+    refund_height: u64,
+) {
     state
         .reserve_tracker
         .lock()
         .await
-        .update_reserve(info)
+        .update_reserve(reserve_info(owner, box_id, token, nft, refund_height))
         .unwrap();
 }
 
@@ -420,4 +430,70 @@ async fn concurrent_notes_do_not_overshoot_a_cap() {
     }
     assert_eq!(created, 3);
     assert_eq!(stored_notes(&state, &a).await, 3);
+}
+
+/// Round 4 (C10): the debt sum of `/key-status` is checked. Three notes of 2^63 - 1 (the most a
+/// note may carry) pass u64::MAX together: the plain `sum()` panicked in debug builds and
+/// wrapped in release ones, reporting a tiny debt. Now the total saturates and the ratio reads
+/// as undercollateralized.
+#[tokio::test]
+async fn key_status_saturates_a_debt_sum_past_u64() {
+    assert_eq!(crate::api::checked_debt_sum([1, 2, 3]), Some(6));
+    assert_eq!(crate::api::checked_debt_sum([u64::MAX, 1]), None);
+
+    let state = state(DEFAULT_CAPS);
+    let a = issuer();
+    add_reserve(&state, &a.key, "box-a", None, TRACKER_NFT, 0).await;
+    let ts = now_ms() - 10_000;
+    let max_note = i64::MAX as u64;
+    for _ in 0..3 {
+        let (status, error) =
+            post(&state, note_request(&a, &recipient(), max_note, ts, DenomKey::Erg)).await;
+        assert_eq!(status, StatusCode::CREATED, "{error}");
+    }
+
+    let (status, body) = crate::api::get_key_status(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(hex::encode(a.key)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.0.error);
+    let data = body.0.data.unwrap();
+    assert_eq!(data.note_count, 3);
+    let erg = &data.denominations[0];
+    assert_eq!(erg.denomination, "erg");
+    assert_eq!(erg.total_debt, u64::MAX);
+    assert!(erg.collateralization_ratio < 1e-9, "{}", erg.collateralization_ratio);
+}
+
+/// Round 4 (C10): `/reserves/issuer/{pubkey}` compares normalized keys, so an upper-case or
+/// 07-prefixed key finds the issuer's reserves.
+#[tokio::test]
+async fn reserves_by_issuer_matches_normalized_keys() {
+    let state = state(DEFAULT_CAPS);
+    let owner = issuer().key;
+    state
+        .ergo_scanner
+        .lock()
+        .await
+        .reserve_storage()
+        .store_reserve(&reserve_info(&owner, "box-n", None, TRACKER_NFT, 0))
+        .unwrap();
+
+    let lower = hex::encode(owner);
+    for path in [
+        lower.clone(),
+        lower.to_ascii_uppercase(),
+        format!("07{lower}"),
+    ] {
+        let (status, body) = crate::reserve_api::get_reserves_by_issuer(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(path.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        let reserves = body.0.data.unwrap();
+        assert_eq!(reserves.len(), 1, "{path}");
+        assert_eq!(reserves[0].box_id, "box-n");
+    }
 }

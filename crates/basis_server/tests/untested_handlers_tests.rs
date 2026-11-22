@@ -250,28 +250,16 @@ mod untested_handlers {
     // ========================================================================
 
     #[tokio::test]
-    async fn test_get_basis_reserve_contract_p2s_reports_config_load_failure() {
-        // This handler re-reads AppConfig from disk instead of using the injected AppState, so
-        // its result depends on the deployment environment. In a test environment there is no
-        // config/basis.toml (it is gitignored), so what we pin is the documented failure path:
-        // a 5xx carrying an error, never a panic and never a silent empty string.
+    async fn test_get_basis_reserve_contract_p2s_comes_from_the_running_config() {
+        // Round 4 (C10): the handler used to re-read AppConfig from disk, so its answer depended
+        // on the working directory and could differ from the config the server runs with. It
+        // now answers from the injected AppState.
         let state = mock_state().await;
 
         let (status, body) = get_basis_reserve_contract_p2s(axum::extract::State(state)).await;
 
-        assert!(
-            status.is_server_error() || status == StatusCode::OK,
-            "expected either a successful load or a clean 5xx, got {} with body {:?}",
-            status,
-            body
-        );
-        if status.is_server_error() {
-            assert!(!body.success);
-            assert!(
-                body.error.is_some(),
-                "a 5xx must carry an error message, not an empty body"
-            );
-        }
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body.data.as_deref(), Some("9testReserveP2SAddress"));
     }
 
     // ========================================================================

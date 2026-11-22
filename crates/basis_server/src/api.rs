@@ -2187,6 +2187,13 @@ pub async fn get_events(
     )
 }
 
+/// Sum debts with overflow checking (`None` when the sum passes `u64::MAX`).
+pub(crate) fn checked_debt_sum(debts: impl IntoIterator<Item = u64>) -> Option<u64> {
+    debts
+        .into_iter()
+        .try_fold(0u64, |total, debt| total.checked_add(debt))
+}
+
 // Get key status information
 #[axum::debug_handler]
 pub async fn get_key_status(
@@ -2303,7 +2310,19 @@ pub async fn get_key_status(
     let mut breakdown: Vec<KeyStatusDenomination> = Vec::new();
     for denom in denom_ids {
         let denom_notes: Vec<_> = notes.iter().filter(|n| n.denomination == denom).collect();
-        let total_debt: u64 = denom_notes.iter().map(|n| n.outstanding_debt()).sum();
+        // Round 4 (C10): a checked sum. Each note is below 2^63, but an issuer's notes together
+        // can pass u64::MAX: `sum()` then panicked (debug) or wrapped to a small number
+        // (release), which reported a huge debt as well collateralized. Saturate instead: the
+        // ratio then reads as undercollateralized, which is the truth.
+        let total_debt = checked_debt_sum(denom_notes.iter().map(|n| n.outstanding_debt()))
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "issuer {} owes more than u64::MAX in denomination {}; reporting u64::MAX",
+                    pubkey_hex,
+                    denom.denomination_id()
+                );
+                u64::MAX
+            });
 
         let denom_reserves: Vec<_> = matching_reserves
             .iter()
@@ -4957,25 +4976,13 @@ pub async fn create_reserve_payload(
 // Get the Basis reserve contract P2S address from server configuration
 #[axum::debug_handler]
 pub async fn get_basis_reserve_contract_p2s(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<String>>) {
     tracing::debug!("Getting Basis reserve contract P2S address from configuration");
 
-    // Get the reserve contract address from the server configuration
-    let config = match crate::config::AppConfig::load() {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::error!("Failed to load configuration: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(crate::models::error_response(
-                    "Failed to load server configuration".to_string(),
-                )),
-            );
-        }
-    };
-
-    let reserve_contract_address = config.basis_reserve_contract_p2s();
+    // Round 4 (C10): the configuration the server runs with, not the file re-read from disk
+    // (which could differ from it, or fail, on every call).
+    let reserve_contract_address = state.config.basis_reserve_contract_p2s();
 
     tracing::info!(
         "Successfully retrieved Basis reserve contract P2S address: {}",

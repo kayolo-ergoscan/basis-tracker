@@ -2727,7 +2727,9 @@ components:
         total_debt:
           type: integer
           format: uint64
-          description: Outstanding debt in this denomination (raw units)
+          description: >-
+            Outstanding debt in this denomination (raw units). Saturates at 18446744073709551615
+            (u64::MAX) when the issuer's notes together pass it.
           example: 1500000000
         collateral:
           type: integer
