@@ -776,11 +776,13 @@ impl AppConfig {
         }
     }
 
-    /// Get the tracker secret key bytes (if configured)
+    /// Get the tracker secret key bytes (if configured). Surrounding whitespace is ignored, as
+    /// in [`AppConfig::check_tracker_keys`], so a key that passes the startup check is the key
+    /// every signer gets.
     pub fn tracker_secret_key_bytes(&self) -> Option<[u8; 32]> {
         match &self.ergo.tracker_secret_key {
-            Some(secret_hex) if !secret_hex.is_empty() => {
-                if let Ok(bytes) = hex::decode(secret_hex) {
+            Some(secret_hex) if !secret_hex.trim().is_empty() => {
+                if let Ok(bytes) = hex::decode(secret_hex.trim()) {
                     if bytes.len() == 32 {
                         let mut secret_bytes = [0u8; 32];
                         secret_bytes.copy_from_slice(&bytes);
@@ -1407,9 +1409,14 @@ mod tests {
         );
         let address = basis_offchain::ergo_tx::pubkey_to_address(&hex::encode(pubkey)).unwrap();
         assert_eq!(
-            with(Some(address), Some(format!(" {secret_hex}\n"))).unwrap(),
+            with(Some(address.clone()), Some(format!(" {secret_hex}\n"))).unwrap(),
             pubkey
         );
+        // A secret that passes the check is the one the signers get, whitespace included.
+        let mut config = minimal_config();
+        config.ergo.tracker_public_key = Some(address);
+        config.ergo.tracker_secret_key = Some(format!(" {secret_hex}\n"));
+        assert_eq!(config.tracker_secret_key_bytes(), Some(secret));
 
         let err = |pk: Option<String>, sk: Option<String>| with(pk, sk).unwrap_err();
         let pk = || Some(hex::encode(pubkey));
