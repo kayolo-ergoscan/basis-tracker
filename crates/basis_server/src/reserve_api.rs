@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
+use basis_store::persistence::JournaledRedemption;
 use basis_store::{DenomKey, ExtendedReserveInfo, IouNote, PubKey};
 
 use crate::{
@@ -21,6 +22,47 @@ fn add_outstanding(debts: &mut OutstandingDebts, issuer: PubKey, note: &IouNote)
     let outstanding = note.amount_collected.saturating_sub(note.amount_redeemed);
     let total = debts.entry((issuer, note.denomination)).or_insert(0);
     *total = total.saturating_add(outstanding);
+}
+
+/// Redeemed amounts of the redemptions waiting for the chain, per (issuer, denomination)
+/// (round 5b, F11).
+type PendingRedemptions = HashMap<(PubKey, DenomKey), u64>;
+
+/// Add `entry`'s redeemed amount to its issuer's pending total in its denomination if it waits
+/// for the chain: submitted through `/redemption/submit`, journaled, not applied yet. A marked
+/// entry (`digest_mismatch`) is applied already and adds nothing. Totals saturate.
+fn add_pending(pending: &mut PendingRedemptions, entry: &JournaledRedemption) {
+    if entry.digest_mismatch.is_some() {
+        return;
+    }
+    if let Ok((issuer, _, denomination)) = crate::redemption_confirmer::journal_keys(entry) {
+        let total = pending.entry((issuer, denomination)).or_insert(0);
+        *total = total.saturating_add(entry.redeemed_amount);
+    }
+}
+
+/// The redemptions waiting for the chain, from the redemption journal: a handful of entries,
+/// since builds of a reserve wait while it has one.
+fn pending_redemptions(state: &AppState) -> Result<PendingRedemptions, String> {
+    let entries = state
+        .tracker_storage
+        .journaled_redemptions()
+        .map_err(|e| format!("redemption journal read failed: {e:?}"))?;
+    let mut pending = PendingRedemptions::new();
+    for entry in &entries {
+        add_pending(&mut pending, entry);
+    }
+    Ok(pending)
+}
+
+/// The outstanding debts of the notes of `owners` and the redemptions of theirs waiting for the
+/// chain: what [`reserve_view`] reports.
+async fn reserve_figures(
+    state: &AppState,
+    owners: impl IntoIterator<Item = PubKey>,
+) -> Result<(OutstandingDebts, PendingRedemptions), String> {
+    let debts = outstanding_debts(state, owners).await?;
+    Ok((debts, pending_redemptions(state)?))
 }
 
 /// The outstanding debts of the notes of `issuers`, read from the tracker thread through the
@@ -64,22 +106,28 @@ fn owner_key(owner_pubkey: &str) -> Option<PubKey> {
         .and_then(|bytes| PubKey::try_from(bytes.as_slice()).ok())
 }
 
-/// The API view of a reserve, with its outstanding debt from `debts`.
+/// The API view of a reserve, with its outstanding debt from `debts` and its redemptions
+/// waiting for the chain from `pending`.
 ///
 /// `total_debt` is what the reserve's owner still owes in the reserve's denomination on the
 /// notes this tracker holds (`amount_collected - amount_redeemed`, summed); it is per (owner,
 /// denomination), not per box. `collateralization_ratio` is `collateral_amount / total_debt`,
 /// and `null` when nothing is owed. A redemption submitted through `/redemption/submit` counts
 /// only once it is applied (mined, `[confirmation] min_depth` deep): while it is journaled,
-/// `total_debt` still includes it, and once its block is in, `collateral_amount` (the scanner's
-/// reserve box) may already be the smaller successor's (round 5b, F11).
-fn reserve_view(info: ExtendedReserveInfo, debts: &OutstandingDebts) -> SerializableReserveInfo {
-    let total_debt = match (owner_key(&info.owner_pubkey), info.denomination()) {
-        (Some(owner), Some(denomination)) => {
-            debts.get(&(owner, denomination)).copied().unwrap_or(0)
-        }
-        _ => 0,
+/// `total_debt` still includes it, `pending_redemption_amount` says how much, and once its block
+/// is in, `collateral_amount` (the scanner's reserve box) may already be the smaller
+/// successor's (round 5b, F11).
+fn reserve_view(
+    info: ExtendedReserveInfo,
+    debts: &OutstandingDebts,
+    pending: &PendingRedemptions,
+) -> SerializableReserveInfo {
+    let key = match (owner_key(&info.owner_pubkey), info.denomination()) {
+        (Some(owner), Some(denomination)) => Some((owner, denomination)),
+        _ => None,
     };
+    let total_debt = key.and_then(|k| debts.get(&k).copied()).unwrap_or(0);
+    let pending_redemption_amount = key.and_then(|k| pending.get(&k).copied()).unwrap_or(0);
     let collateral_amount = info.base_info.collateral_amount;
     let collateralization_ratio =
         (total_debt > 0).then(|| collateral_amount as f64 / total_debt as f64);
@@ -88,6 +136,7 @@ fn reserve_view(info: ExtendedReserveInfo, debts: &OutstandingDebts) -> Serializ
         box_id: info.box_id,
         collateral_amount,
         total_debt,
+        pending_redemption_amount,
         tracker_nft_id: info.base_info.tracker_nft_id,
         reserve_token_id: info.base_info.reserve_token_id,
         last_updated_height: info.base_info.last_updated_height,
@@ -97,7 +146,7 @@ fn reserve_view(info: ExtendedReserveInfo, debts: &OutstandingDebts) -> Serializ
     }
 }
 
-/// 500 for a failed note read behind the reserves' debt.
+/// 500 for a failed read of the notes (or the redemption journal) behind the reserves' debt.
 fn debt_read_failed<T>(e: String) -> (StatusCode, Json<ApiResponse<T>>) {
     tracing::error!("Failed to read the notes behind the reserves' debt: {e}");
     (
@@ -151,13 +200,13 @@ pub async fn get_all_reserves(
             let owners = all_reserves
                 .iter()
                 .filter_map(|reserve| owner_key(&reserve.owner_pubkey));
-            let debts = match outstanding_debts(&state, owners).await {
-                Ok(debts) => debts,
+            let (debts, pending) = match reserve_figures(&state, owners).await {
+                Ok(figures) => figures,
                 Err(e) => return debt_read_failed(e),
             };
             let reserves: Vec<SerializableReserveInfo> = all_reserves
                 .into_iter()
-                .map(|info| reserve_view(info, &debts))
+                .map(|info| reserve_view(info, &debts, &pending))
                 .collect();
 
             tracing::info!("Returning {} reserves (from database)", reserves.len());
@@ -208,13 +257,13 @@ pub async fn get_reserves_by_issuer(
                 .collect();
             // Round 5 (item 5): the debt comes from the notes this tracker holds for the issuer.
             let owners = mine.first().and_then(|r| owner_key(&r.owner_pubkey));
-            let debts = match outstanding_debts(&state, owners).await {
-                Ok(debts) => debts,
+            let (debts, pending) = match reserve_figures(&state, owners).await {
+                Ok(figures) => figures,
                 Err(e) => return debt_read_failed(e),
             };
             let reserves: Vec<SerializableReserveInfo> = mine
                 .into_iter()
-                .map(|info| reserve_view(info, &debts))
+                .map(|info| reserve_view(info, &debts, &pending))
                 .collect();
 
             tracing::info!(
@@ -260,13 +309,12 @@ pub async fn get_reserve_by_box_id(
     match stored {
         Ok(Some(reserve_info)) => {
             // Round 5 (item 5): the debt comes from the notes this tracker holds for the owner.
-            let debts = match outstanding_debts(&state, owner_key(&reserve_info.owner_pubkey))
-                .await
-            {
-                Ok(debts) => debts,
-                Err(e) => return debt_read_failed(e),
-            };
-            let serializable_reserve = reserve_view(reserve_info, &debts);
+            let (debts, pending) =
+                match reserve_figures(&state, owner_key(&reserve_info.owner_pubkey)).await {
+                    Ok(figures) => figures,
+                    Err(e) => return debt_read_failed(e),
+                };
+            let serializable_reserve = reserve_view(reserve_info, &debts, &pending);
 
             tracing::info!("Successfully retrieved reserve with box ID: {}", box_id);
 
@@ -356,6 +404,11 @@ pub struct SerializableReserveInfo {
     /// denomination): two reserves of one owner in one denomination show the same debt. A
     /// journaled redemption (submitted, not yet applied) is still included (round 5b, F11).
     pub total_debt: u64,
+    /// Round 5b (F11): the redeemed amount of the owner's redemptions in this denomination that
+    /// wait for the chain (submitted through `/redemption/submit`, journaled, not applied yet);
+    /// 0 when none waits. `total_debt` still includes it: once they are applied, the debt is
+    /// `total_debt - pending_redemption_amount`.
+    pub pending_redemption_amount: u64,
     pub tracker_nft_id: String, // Tracker NFT ID from R6 register (hex-encoded serialized SColl(SByte) format following byte_array_register_serialization.md spec)
     /// Reserve token ID (hex-encoded) for token-backed reserves, or empty for ERG reserves.
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -414,28 +467,83 @@ mod tests {
         add_outstanding(&mut debts, a, &note(3, 50, 50, DenomKey::Token(token)));
         add_outstanding(&mut debts, b, &note(4, 10, 0, DenomKey::Erg));
 
-        let erg = reserve_view(reserve(&a, None, 1_200), &debts);
+        let none = PendingRedemptions::new();
+        let erg = reserve_view(reserve(&a, None, 1_200), &debts, &none);
         assert_eq!(erg.total_debt, 600, "200 + 400");
         assert_eq!(erg.collateralization_ratio, Some(2.0));
 
         // Fully redeemed: nothing owed, no ratio.
-        let tokens = reserve_view(reserve(&a, Some(token), 1_000), &debts);
+        let tokens = reserve_view(reserve(&a, Some(token), 1_000), &debts, &none);
         assert_eq!(tokens.total_debt, 0);
         assert_eq!(tokens.collateralization_ratio, None);
         let json = serde_json::to_value(&tokens).unwrap();
         assert!(json["collateralization_ratio"].is_null(), "{json}");
         assert_eq!(json["total_debt"], 0);
+        assert_eq!(json["pending_redemption_amount"], 0);
 
         // Another owner, and an owner stored with the register prefix.
-        let other = reserve_view(reserve(&b, None, 5), &debts);
+        let other = reserve_view(reserve(&b, None, 5), &debts, &none);
         assert_eq!(other.total_debt, 10);
         assert_eq!(other.collateralization_ratio, Some(0.5));
         let mut prefixed = reserve(&b, None, 5);
         prefixed.owner_pubkey = format!("07{}", hex::encode(b));
-        assert_eq!(reserve_view(prefixed, &debts).total_debt, 10);
+        assert_eq!(reserve_view(prefixed, &debts, &none).total_debt, 10);
 
         // Totals saturate instead of overflowing.
         add_outstanding(&mut debts, b, &note(5, u64::MAX, 0, DenomKey::Erg));
-        assert_eq!(reserve_view(reserve(&b, None, 5), &debts).total_debt, u64::MAX);
+        assert_eq!(
+            reserve_view(reserve(&b, None, 5), &debts, &none).total_debt,
+            u64::MAX
+        );
+    }
+
+    /// Round 5b, F11: a reserve notes how much of its owner's debt waits for a redemption that
+    /// is in a mempool or in a block not deep enough yet: the journaled amounts of its owner in
+    /// its denomination. A marked entry is applied already and adds nothing. The debt and the
+    /// ratio stay as the notes say.
+    #[test]
+    fn a_reserve_notes_the_redemptions_waiting_for_the_chain() {
+        let (a, b) = ([0x02; 33], [0x03; 33]);
+        let token = [0x7c; 32];
+        let mut debts = OutstandingDebts::new();
+        add_outstanding(&mut debts, a, &note(1, 300, 0, DenomKey::Erg));
+        add_outstanding(&mut debts, b, &note(2, 50, 0, DenomKey::Erg));
+        let journaled = |owner: &PubKey, denomination: DenomKey, amount: u64| JournaledRedemption {
+            tx_id: "ab".repeat(32),
+            issuer_pubkey: hex::encode(owner),
+            recipient_pubkey: hex::encode([0x01; 33]),
+            denomination: denomination.denomination_id(),
+            redeemed_amount: amount,
+            ..Default::default()
+        };
+        let mut pending = PendingRedemptions::new();
+        add_pending(&mut pending, &journaled(&a, DenomKey::Erg, 100));
+        add_pending(&mut pending, &journaled(&a, DenomKey::Erg, 20));
+        add_pending(&mut pending, &journaled(&a, DenomKey::Token(token), 7));
+        add_pending(
+            &mut pending,
+            &JournaledRedemption {
+                digest_mismatch: Some("applied, out of step".to_string()),
+                ..journaled(&b, DenomKey::Erg, 5)
+            },
+        );
+        // An entry whose keys do not parse is skipped.
+        add_pending(
+            &mut pending,
+            &JournaledRedemption {
+                issuer_pubkey: "zz".to_string(),
+                ..journaled(&a, DenomKey::Erg, 1_000)
+            },
+        );
+
+        let erg = reserve_view(reserve(&a, None, 1_200), &debts, &pending);
+        assert_eq!((erg.total_debt, erg.pending_redemption_amount), (300, 120));
+        assert_eq!(erg.collateralization_ratio, Some(4.0));
+        let json = serde_json::to_value(&erg).unwrap();
+        assert_eq!(json["pending_redemption_amount"], 120);
+        let tokens = reserve_view(reserve(&a, Some(token), 10), &debts, &pending);
+        assert_eq!((tokens.total_debt, tokens.pending_redemption_amount), (0, 7));
+        let other = reserve_view(reserve(&b, None, 5), &debts, &pending);
+        assert_eq!((other.total_debt, other.pending_redemption_amount), (50, 0));
     }
 }

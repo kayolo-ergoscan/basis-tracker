@@ -2201,9 +2201,20 @@ components:
             denomination show the same debt. A redemption submitted through
             `/redemption/submit` counts once it is applied (in a block,
             `[confirmation] min_depth` deep): while it is journaled the debt
-            still includes it, while `collateral_amount` may already be the
-            reserve's smaller successor box (round 5b).
+            still includes it (`pending_redemption_amount` says how much),
+            while `collateral_amount` may already be the reserve's smaller
+            successor box (round 5b).
           example: 1200000000
+        pending_redemption_amount:
+          type: integer
+          format: uint64
+          description: >-
+            Round 5b: the redeemed amount of the owner's redemptions in the
+            reserve's denomination that wait for the chain (submitted through
+            `/redemption/submit`, journaled, not applied yet), 0 when none
+            waits. `total_debt` still includes it; once they are applied the
+            debt is `total_debt - pending_redemption_amount`.
+          example: 0
         tracker_nft_id:
           type: string
           description: Tracker NFT ID (hex-encoded)

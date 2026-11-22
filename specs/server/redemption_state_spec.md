@@ -683,10 +683,13 @@ Now:
 `/reserves/issuer/{pubkey}` and `/reserves/{box_id}` is the owner's outstanding debt on the notes
 (`amount_collected - amount_redeemed`), read through the issuer index for the reserves' owners
 only. A journaled redemption changes `amount_redeemed` only when it is applied: until then the
-debt still includes it, while `collateral_amount` (the scanner's reserve box) is the smaller
-successor box as soon as the scanner has seen the block. For that window (at least `min_depth`
-blocks plus up to a minute) the debt is high by the redeemed amount, so the collateral ratio
-reads low.
+debt still includes it, and each reserve notes it as pending: `pending_redemption_amount` is the
+redeemed amount of its owner's journaled, not yet applied redemptions in its denomination (0 when
+none waits; a marked entry is applied already and does not count). Once they are applied the
+debt is `total_debt - pending_redemption_amount`. Meanwhile `collateral_amount` (the scanner's
+reserve box) is the smaller successor box as soon as the scanner has seen the block, so for that
+window (at least `min_depth` blocks plus up to a minute) `total_debt` is high by the pending
+amount and the collateral ratio reads low.
 
 **The window of 6113b8d (round 5b, F1).** In 6113b8d the submit applied the redemption right after
 the broadcast with the note's timestamp at that moment, so a note re-signed between the build and

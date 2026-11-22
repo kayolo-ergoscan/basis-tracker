@@ -484,7 +484,9 @@ pub fn restore_submitted_redemptions(storage: &TrackerStorage, shared_state: &Sh
     }
 }
 
-fn journal_keys(entry: &JournaledRedemption) -> Result<(PubKey, PubKey, DenomKey), String> {
+pub(crate) fn journal_keys(
+    entry: &JournaledRedemption,
+) -> Result<(PubKey, PubKey, DenomKey), String> {
     let key = |hex_key: &str, what: &str| -> Result<PubKey, String> {
         hex::decode(hex_key)
             .ok()

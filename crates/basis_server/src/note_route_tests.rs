@@ -646,4 +646,59 @@ async fn reserves_report_the_notes_outstanding_debt_and_ratio() {
     let one = body.0.data.unwrap().unwrap();
     assert_eq!(one.total_debt, 500_000_000);
     assert_eq!(one.collateralization_ratio, Some(2.0));
+    assert_eq!(one.pending_redemption_amount, 0);
+
+    // Round 5b (F11): a redemption of A's ERG reserve waiting for the chain is noted on that
+    // reserve, and the debt still includes it; B's marked entry is applied already.
+    let waiting = basis_store::persistence::JournaledRedemption {
+        tx_id: "ab".repeat(32),
+        reserve_box_id: "cd".repeat(32),
+        issuer_pubkey: hex::encode(a.key),
+        recipient_pubkey: hex::encode(recipient()),
+        denomination: DenomKey::Erg.denomination_id(),
+        redeemed_amount: 100_000_000,
+        new_already_redeemed: 100_000_000,
+        ..Default::default()
+    };
+    state.tracker_storage.journal_redemption(&waiting).unwrap();
+    state
+        .tracker_storage
+        .journal_redemption(&basis_store::persistence::JournaledRedemption {
+            tx_id: "ef".repeat(32),
+            issuer_pubkey: hex::encode(b.key),
+            digest_mismatch: Some("applied, out of step".to_string()),
+            ..waiting.clone()
+        })
+        .unwrap();
+    let (status, body) = crate::reserve_api::get_all_reserves(axum::extract::State(state.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.0.error);
+    let all = serde_json::to_value(body.0.data.unwrap()).unwrap();
+    let field = |id: &str, name: &str| {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["box_id"] == id)
+            .unwrap()[name]
+            .clone()
+    };
+    assert_eq!(field("box-a-erg", "pending_redemption_amount"), 100_000_000u64);
+    assert_eq!(field("box-a-erg", "total_debt"), 500_000_000u64);
+    assert_eq!(field("box-a-token", "pending_redemption_amount"), 0);
+    assert_eq!(field("box-b-erg", "pending_redemption_amount"), 0);
+    let (_, body) = crate::reserve_api::get_reserves_by_issuer(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(hex::encode(a.key)),
+    )
+    .await;
+    for reserve in body.0.data.unwrap() {
+        let expected = if reserve.box_id == "box-a-erg" { 100_000_000 } else { 0 };
+        assert_eq!(reserve.pending_redemption_amount, expected, "{}", reserve.box_id);
+    }
+    let (_, body) = crate::reserve_api::get_reserve_by_box_id(
+        axum::extract::State(state.clone()),
+        axum::extract::Path("box-a-erg".to_string()),
+    )
+    .await;
+    let one = body.0.data.unwrap().unwrap();
+    assert_eq!((one.total_debt, one.pending_redemption_amount), (500_000_000, 100_000_000));
 }

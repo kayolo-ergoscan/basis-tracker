@@ -102,7 +102,9 @@ fjall keyspace waits up to one fsync interval to close.
 ### Reserve Endpoints
 
 - `GET /reserves` - Get all reserve information; each reserve's `total_debt` is read through the
-  issuer index for the reserves' owners, never by scanning every note (round 5b)
+  issuer index for the reserves' owners, never by scanning every note, and
+  `pending_redemption_amount` notes the part of it that journaled redemptions are about to
+  redeem (round 5b)
 - `GET /reserves/issuer/{pubkey}` - Get reserves for a specific issuer
 - `GET /reserves/{box_id}` - Get a single reserve by its box id
 
