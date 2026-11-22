@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -23,11 +24,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use basis_canary::keys::{ApiKey, FileKey};
-use basis_canary::note::fetch_note;
-use basis_canary::redeem::{check_redemption, node_boxes, BuildResponse, Expectation};
+use basis_canary::note::{fetch_note, now_ms};
+use basis_canary::redeem::{
+    build_request_message, check_redemption, node_boxes, signed_build_request, submit,
+    BuildResponse, Expectation,
+};
 use basis_canary::{tx, Cli, Context, Report};
 use basis_server::config::{
-    AppConfig, AuthConfig, AuthMode, ConfirmationConfig, ErgoConfig, RedemptionConfig,
+    self, AppConfig, AuthConfig, AuthMode, ConfirmationConfig, ErgoConfig, RedemptionConfig,
     ServerConfig, TransactionConfig, WalletNodeConfig,
 };
 use basis_server::local_wallet;
@@ -313,10 +317,11 @@ async fn record(
 }
 
 /// The tracker thread of `basis_server`'s main, for the commands these flows use: the real
-/// note store, real proofs, and the live digest kept in `shared`.
+/// note store, real proofs, and the live digest kept in `shared`, refreshed as the server does
+/// (once per updater cycle, `RefreshDigest`, and after a completed redemption).
 fn tracker_thread(mut rx: mpsc::Receiver<TrackerCommand>, shared: SharedTrackerState) {
     use basis_store::{RedemptionManager, TrackerStateManager};
-    let tracker = TrackerStateManager::new_with_temp_storage();
+    let mut tracker = TrackerStateManager::new_with_temp_storage();
     shared.set_avl_root_digest(tracker.get_state().avl_root_digest);
     let mut m = RedemptionManager::new(tracker);
     while let Some(cmd) = rx.blocking_recv() {
@@ -326,11 +331,12 @@ fn tracker_thread(mut rx: mpsc::Receiver<TrackerCommand>, shared: SharedTrackerS
                 note,
                 response_tx,
             } => {
-                let result = m.tracker.add_note(&issuer_pubkey, &note);
-                if result.is_ok() {
-                    shared.set_avl_root_digest(m.tracker.get_state().avl_root_digest);
-                }
-                let _ = response_tx.send(result);
+                let _ = response_tx.send(m.tracker.add_note(&issuer_pubkey, &note));
+            }
+            TrackerCommand::RefreshDigest { response_tx } => {
+                let digest = m.tracker.get_state().avl_root_digest;
+                shared.set_avl_root_digest(digest);
+                let _ = response_tx.send(digest);
             }
             TrackerCommand::GetNotesByIssuer {
                 issuer_pubkey,
@@ -548,9 +554,18 @@ async fn start_tracker(
             },
             reserve_creation_max_erg_nano: 10 * ERG,
             reserve_creation_max_token_amount: 1_000_000_000,
+            // The production defaults.
             redemption_build_max_per_pair_per_hour: 60,
-            redemption_build_max_per_issuer_per_hour: 20,
-            redemption_build_max_per_hour: 30,
+            redemption_build_max_per_recipient_per_hour:
+                config::default_redemption_build_max_per_recipient_per_hour(),
+            redemption_build_max_per_issuer_per_hour:
+                config::default_redemption_build_max_per_issuer_per_hour(),
+            redemption_build_max_per_hour: config::default_redemption_build_max_per_hour(),
+            notes_require_reserve: config::default_notes_require_reserve(),
+            notes_max_recipients_per_issuer: config::default_notes_max_recipients_per_issuer(),
+            notes_max_updates_per_issuer_per_hour:
+                config::default_notes_max_updates_per_issuer_per_hour(),
+            notes_max_new_edges_per_hour: config::default_notes_max_new_edges_per_hour(),
         },
         ergo: ErgoConfig {
             scanner: basis_store::ergo_scanner::NodeConfig {
@@ -617,6 +632,7 @@ async fn start_tracker(
             basis_server::redemption_build::PendingRedemptionRegistry::new(),
         ),
         redemption_build_rate: Arc::new(basis_server::redemption_build::BuildRateLimiter::new()),
+        note_limits: Arc::new(basis_server::note_limits::NoteLimiter::new()),
     };
 
     use basis_server::api::*;
@@ -802,16 +818,14 @@ impl World {
         rx.await.unwrap()
     }
 
-    /// What the tracker box updater does when its commit is in a block: a new tracker box holds
-    /// the live digest (R4 tracker key, R5 the tree, R6 the NFT id), the notes it covers are
-    /// confirmed, and the shared state points at the box.
+    /// What the tracker box updater does when its commit is in a block: it asks the tracker
+    /// thread for the live digest (`RefreshDigest`), a new tracker box holds it (R4 tracker key,
+    /// R5 the tree, R6 the NFT id), the notes it covers are confirmed, and the shared state
+    /// points at the box.
     async fn commit(&self) {
         let digest = self
-            .state
-            .shared_tracker_state
-            .lock()
-            .await
-            .get_avl_root_digest();
+            .ask(|response_tx| TrackerCommand::RefreshDigest { response_tx })
+            .await;
         let tree = basis_offchain::ergo_tx::build_savl_tree_from_digest(&hex::encode(digest));
         let tracker_box = utxo_box(
             self.t.tree(),
@@ -965,6 +979,30 @@ impl World {
             .count()
     }
 
+    /// The body of the last `POST /redemption/build` the tracker received.
+    fn last_build_request(&self) -> Value {
+        let seen = self.tracker_seen.lock().unwrap();
+        let request = seen
+            .iter()
+            .rev()
+            .find(|s| s.target == "/redemption/build")
+            .expect("a build request");
+        serde_json::from_str(&request.body).unwrap()
+    }
+
+    /// Values of the token-free boxes at the tracker's address.
+    fn tracker_fee_boxes(&self) -> Vec<u64> {
+        let tree = self.t.tree();
+        self.node
+            .utxo
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.ergo_tree == tree && b.tokens.is_none())
+            .map(|b| *b.value.as_u64())
+            .collect()
+    }
+
     /// Every secret, in both hex cases, and both API keys.
     fn secrets(&self) -> Vec<String> {
         let mut all: Vec<String> = [self.a.secret, self.b.secret, self.t.secret]
@@ -1114,7 +1152,6 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
         format!("R5 = {empty_tree}"),
         format!("R6 = 0e20{nft}"),
         "R7 = 0500".to_string(),
-        "warning: payload R7 is 05000000000000000000".to_string(),
         "checks before signing: OK".to_string(),
         "unsigned transaction (node JSON):".to_string(),
         "signed locally with the owner key and validated in full".to_string(),
@@ -1122,7 +1159,29 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
     ] {
         assert!(out.contains(&expected), "missing {expected:?} in\n{out}");
     }
+    // The tracker's payload R7 is the canonical 0500 now: accepted as it is, no warning.
+    assert!(out.contains("\"R7\": \"0500\""), "{out}");
+    assert!(!out.contains("warning"), "{out}");
     assert!(w.node.applied().is_empty());
+
+    // POST /notes needs the issuer's active reserve under this tracker: A has none yet.
+    let e = w
+        .err(&[
+            "note",
+            "--secret-file",
+            &a_file,
+            "--recipient-pubkey",
+            &b_pk,
+            "--total",
+            "300000000",
+        ])
+        .await;
+    assert!(e.contains("POST /notes: HTTP 409"), "{e}");
+    assert!(e.contains("has no reserve under this tracker"), "{e}");
+    assert!(fetch_note(&w.context(), &w.a.pk, &w.b.pk)
+        .await
+        .unwrap()
+        .is_none());
 
     // reserve-create: signed with A's key, valid, applied.
     let out = w
@@ -1134,6 +1193,7 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
             "1000000000",
         ])
         .await;
+    assert!(!out.contains("warning"), "{out}");
     let create = w.last_applied();
     assert_eq!(w.node.applied().len(), 1);
     assert!(out.contains(&format!(
@@ -1228,11 +1288,19 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
         .ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
         .await;
     for expected in [
+        "build request signed by the recipient at request_timestamp",
+        "message (131 bytes: \"basis-build-v1\"",
+        "receiver signature (65 bytes: a, z), verified: ",
+        "\"receiver_signature\":",
+        "payout 99000000 nanoERG (the amount 100000000 minus the miner fee 1000000 nanoERG, fee \
+         paid by: recipient)",
         "first redemption: true",
         "checks before signing: OK",
+        "the tracker signed nothing",
         "unsigned transaction (exactly as the tracker built it):",
         "proved the reserve input with the recipient key and validated the transaction in full",
         "payout once submitted: output 1",
+        "99000000 nanoERG to P2PK(recipient)",
         "dry run: nothing submitted",
     ] {
         assert!(out.contains(expected), "missing {expected:?} in\n{out}");
@@ -1240,11 +1308,21 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
     assert_eq!(extension_order(&out), vec![0, 5, 1, 6, 2, 3, 8, 4]);
     assert_eq!(w.node.applied().len(), 1);
     assert_eq!(w.tracker_requests("/redemption/submit"), 0);
+    let dry_run_build = w.last_build_request();
+    assert_eq!(dry_run_build["denomination"], json!("erg"));
+
+    // The tracker builds only what the recipient signed, once per request_timestamp.
+    build_requests_must_be_signed_by_the_recipient(&w, &dry_run_build).await;
 
     // The checks refuse a build that is not what was asked for.
     tampered_builds_are_refused(&w).await;
 
-    // redeem: B gets 0.1 ERG; the tracker paid the fee and submitted it.
+    // A build that a newer build of the note replaced is refused by the tracker (409), and
+    // the canary then sends it nowhere.
+    a_replaced_build_is_not_submitted(&w).await;
+
+    // redeem after the dry run: a later request_timestamp, a new build. B gets 0.1 ERG minus
+    // the miner fee; the reserve is the only input, and the tracker submitted it.
     let args = redeem("100000000", false);
     let out = w
         .ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
@@ -1253,23 +1331,35 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
         out.contains("submitted through the tracker (POST /redemption/submit)"),
         "{out}"
     );
+    let real_build = w.last_build_request();
+    assert!(
+        real_build["request_timestamp"].as_u64().unwrap()
+            > dry_run_build["request_timestamp"].as_u64().unwrap()
+    );
     let first = w.last_applied();
     assert_eq!(w.node.applied().len(), 2);
+    assert_eq!(first.inputs.len(), 1, "the reserve is the only input");
     let payout = output(&first, 1);
     assert_eq!(
         (payout.ergo_tree.clone(), *payout.value.as_u64()),
-        (w.b.tree(), 100_000_000)
+        (w.b.tree(), 99_000_000)
     );
     assert!(payout.tokens.is_none());
     assert!(out.contains(&format!(
-        "payout: output 1, box {}",
+        "payout: output 1, box {}, 99000000 nanoERG to P2PK(recipient)",
         String::from(payout.box_id())
     )));
     assert_eq!(*output(&first, 0).value.as_u64(), 900_000_000);
-    // The fee and the change are the tracker's.
-    assert_eq!(output(&first, 2).ergo_tree, tx::fee_tree().unwrap());
-    assert_eq!(output(&first, 3).ergo_tree, w.t.tree());
-    assert_eq!(first.outputs.len(), 4);
+    // The miner fee came out of the payout: no change, and the tracker's box is untouched.
+    assert_eq!(
+        (
+            output(&first, 2).ergo_tree,
+            *output(&first, 2).value.as_u64()
+        ),
+        (tx::fee_tree().unwrap(), 1_000_000)
+    );
+    assert_eq!(first.outputs.len(), 3);
+    assert_eq!(w.tracker_fee_boxes(), vec![ERG]);
     let note = fetch_note(&w.context(), &w.a.pk, &w.b.pk)
         .await
         .unwrap()
@@ -1315,8 +1405,9 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
             output(&second, 1).ergo_tree,
             *output(&second, 1).value.as_u64()
         ),
-        (w.b.tree(), 250_000_000)
+        (w.b.tree(), 249_000_000)
     );
+    assert_eq!(second.inputs.len(), 1);
     let note = fetch_note(&w.context(), &w.a.pk, &w.b.pk)
         .await
         .unwrap()
@@ -1345,7 +1436,10 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
         .await;
     w.node.wallet_rejects.store(false, Ordering::SeqCst);
     for expected in [
-        "the tracker did not submit it: POST /redemption/submit: HTTP 500",
+        "the tracker did not submit it: POST /redemption/submit: HTTP 500: the node did not \
+         accept redemption",
+        "build it again with POST /redemption/build",
+        "submitting through the node instead",
         "submitted through the node (POST /transactions)",
         "warning: the tracker has not recorded this redemption",
     ] {
@@ -1354,6 +1448,7 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
     let third = w.last_applied();
     assert_eq!(w.node.applied().len(), 4);
     assert_eq!(*output(&third, 0).value.as_u64(), 550_000_000);
+    assert_eq!(*output(&third, 1).value.as_u64(), 99_000_000);
     w.admit_reserve(&output(&third, 0)).await;
     let note = fetch_note(&w.context(), &w.a.pk, &w.b.pk)
         .await
@@ -1407,6 +1502,121 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
     }
 }
 
+/// A request_timestamp later than every earlier one: the tracker wants each recipient's build
+/// requests strictly rising.
+async fn fresh_request_timestamp() -> u64 {
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    now_ms()
+}
+
+/// The note's issuer signature, as the tracker stores it.
+async fn issuer_signature(w: &World) -> [u8; 65] {
+    let note = fetch_note(&w.context(), &w.a.pk, &w.b.pk)
+        .await
+        .unwrap()
+        .unwrap();
+    hex::decode(&note.signature).unwrap().try_into().unwrap()
+}
+
+/// `POST /redemption/build` for `amount`, asked for with B's signature, through the canary's own
+/// request builder.
+async fn build_signed_by_b(w: &World, amount: u64) -> BuildResponse {
+    let key = FileKey::from_secret(w.b.secret).unwrap();
+    let request = signed_build_request(
+        &key,
+        &w.a.pk,
+        amount,
+        &issuer_signature(w).await,
+        &w.nft,
+        fresh_request_timestamp().await,
+    )
+    .unwrap();
+    let response = w
+        .context()
+        .tracker
+        .post("/redemption/build", &request.body)
+        .await
+        .unwrap();
+    serde_json::from_value(response.data("POST /redemption/build", 200).unwrap()).unwrap()
+}
+
+async fn post_build(w: &World, body: &Value) -> basis_canary::tracker::TrackerResponse {
+    w.context()
+        .tracker
+        .post("/redemption/build", body)
+        .await
+        .unwrap()
+}
+
+/// The tracker builds only for the recipient (round 4): every build request carries the
+/// recipient's Basis Schnorr signature over the build request message, and a request_timestamp
+/// within 120 s of the tracker's clock and above the recipient's previous build request.
+async fn build_requests_must_be_signed_by_the_recipient(w: &World, dry_run_build: &Value) {
+    let refused = |r: &basis_canary::tracker::TrackerResponse, status: u16, expected: &str| {
+        assert_eq!(r.status, status, "{}", r.body);
+        assert!(r.error_message().contains(expected), "{}", r.body);
+    };
+
+    // The dry run's request again, replayed as it was: its timestamp is not above the last one.
+    let r = post_build(w, dry_run_build).await;
+    refused(
+        &r,
+        409,
+        "is not greater than this recipient's previous build request",
+    );
+
+    // Unsigned.
+    let mut unsigned = dry_run_build.clone();
+    unsigned
+        .as_object_mut()
+        .unwrap()
+        .remove("receiver_signature");
+    refused(
+        &post_build(w, &unsigned).await,
+        400,
+        "receiver_signature and request_timestamp are required",
+    );
+
+    // The recipient's request, signed by another key (the issuer's).
+    let ts = fresh_request_timestamp().await;
+    let message = build_request_message(&w.nft, &w.a.pk, &w.b.pk, 100_000_000, ts);
+    let forged = basis_store::schnorr::schnorr_sign(&message, &w.a.secret, &w.a.pk).unwrap();
+    let mut body = dry_run_build.clone();
+    body["request_timestamp"] = json!(ts);
+    body["receiver_signature"] = json!(hex::encode(forged));
+    refused(
+        &post_build(w, &body).await,
+        400,
+        "receiver_signature does not verify",
+    );
+
+    // Signed by the recipient for another amount.
+    let key = FileKey::from_secret(w.b.secret).unwrap();
+    let signature = issuer_signature(w).await;
+    let ts = fresh_request_timestamp().await;
+    let mut body = signed_build_request(&key, &w.a.pk, 100_000_000, &signature, &w.nft, ts)
+        .unwrap()
+        .body;
+    body["amount"] = json!(200_000_000u64);
+    refused(
+        &post_build(w, &body).await,
+        400,
+        "receiver_signature does not verify",
+    );
+
+    // Signed by the recipient 200 s ago: outside the tracker's 120 s window.
+    let old = fresh_request_timestamp().await - 200_000;
+    let body = signed_build_request(&key, &w.a.pk, 100_000_000, &signature, &w.nft, old)
+        .unwrap()
+        .body;
+    refused(
+        &post_build(w, &body).await,
+        400,
+        "away from the tracker's clock",
+    );
+    assert_eq!(w.tracker_requests("/redemption/submit"), 0);
+}
+
 /// A real build passes the checks run before signing; each tampered copy is refused for the
 /// reason that matters.
 async fn tampered_builds_are_refused(w: &World) {
@@ -1415,24 +1625,13 @@ async fn tampered_builds_are_refused(w: &World) {
         .await
         .unwrap()
         .unwrap();
-    let response = context
-        .tracker
-        .post(
-            "/redemption/build",
-            &json!({
-                "issuer_pubkey": hex::encode(w.a.pk),
-                "recipient_pubkey": hex::encode(w.b.pk),
-                "amount": 100_000_000u64,
-                "timestamp": note.timestamp,
-                "issuer_signature": note.signature,
-                "emergency": false,
-                "denomination": "erg",
-            }),
-        )
-        .await
-        .unwrap();
-    let build: BuildResponse =
-        serde_json::from_value(response.data("POST /redemption/build", 200).unwrap()).unwrap();
+    let build = build_signed_by_b(w, 100_000_000).await;
+    assert_eq!(build.fee_paid_by, "recipient");
+    assert_eq!(
+        (build.recipient_output_value, build.fee, build.change_amount),
+        (99_000_000, 1_000_000, 0)
+    );
+    assert_eq!(build.input_box_binaries.len(), 1);
     let unsigned: UnsignedTransaction = serde_json::from_value(build.unsigned_tx.clone()).unwrap();
     let partial: Transaction = serde_json::from_value(build.partial_tx.clone()).unwrap();
     let (inputs, data_inputs) = node_boxes(&context.node, &unsigned, &build).await.unwrap();
@@ -1445,30 +1644,36 @@ async fn tampered_builds_are_refused(w: &World) {
         issuer_signature: hex::decode(&note.signature).unwrap().try_into().unwrap(),
         tracker_nft: w.nft,
         tracker_pubkey: w.t.pk,
+        max_fee: tx::FEE,
     };
     assert_eq!(
         check_redemption(&unsigned, &partial, &inputs, &data_inputs, &build, &expect),
         Ok(1)
     );
 
-    let check = |edit: &dyn Fn(&mut Value), expect: &Expectation| {
-        let mut unsigned_json = build.unsigned_tx.clone();
-        edit(&mut unsigned_json);
+    let check = |unsigned_json: Value,
+                 tampered: BuildResponse,
+                 inputs: &[ErgoBox],
+                 expect: &Expectation| {
         let unsigned: UnsignedTransaction = serde_json::from_value(unsigned_json.clone()).unwrap();
         let tampered = BuildResponse {
             unsigned_tx: unsigned_json,
-            ..build.clone()
+            ..tampered
         };
-        check_redemption(
-            &unsigned,
-            &partial,
-            &inputs,
-            &data_inputs,
-            &tampered,
-            expect,
-        )
-        .unwrap_err()
+        check_redemption(&unsigned, &partial, inputs, &data_inputs, &tampered, expect).unwrap_err()
     };
+    let tx_edit = |edit: &dyn Fn(&mut Value)| {
+        let mut v = build.unsigned_tx.clone();
+        edit(&mut v);
+        check(v, build.clone(), &inputs, &expect)
+    };
+    let build_edit = |edit: &dyn Fn(&mut BuildResponse)| {
+        let mut b = build.clone();
+        edit(&mut b);
+        check(build.unsigned_tx.clone(), b, &inputs, &expect)
+    };
+    let expect_edit = |e: Expectation| check(build.unsigned_tx.clone(), build.clone(), &inputs, &e);
+
     let ascending = |v: &mut Value| {
         let extension = v["inputs"][0]["extension"].as_object().unwrap().clone();
         let mut keys: Vec<String> = extension.keys().cloned().collect();
@@ -1479,47 +1684,165 @@ async fn tampered_builds_are_refused(w: &World) {
                 .collect(),
         );
     };
-    let e = check(&ascending, &expect);
+    let e = tx_edit(&ascending);
     assert!(e.contains("not Scala's"), "{e}");
 
     let issuer_tree = tx::tree_hex(&w.a.tree()).unwrap();
-    let to_issuer = |v: &mut Value| v["outputs"][1]["ergoTree"] = json!(issuer_tree);
-    let e = check(&to_issuer, &expect);
+    let e = tx_edit(&|v: &mut Value| v["outputs"][1]["ergoTree"] = json!(issuer_tree));
     assert!(e.contains("output 1 goes to an unexpected script"), "{e}");
 
-    let not_the_tracker = |v: &mut Value| {
+    let e = tx_edit(&|v: &mut Value| {
         v["inputs"][0]["extension"]["6"] = v["inputs"][0]["extension"]["2"].clone();
-    };
-    let e = check(&not_the_tracker, &expect);
+    });
     assert!(
         e.contains("context var #6 is not the tracker's signature"),
         "{e}"
     );
 
-    let unchanged = |_: &mut Value| {};
-    let less = Expectation {
-        amount: 90_000_000,
-        ..expect.clone()
-    };
-    let e = check(&unchanged, &less);
+    let e = tx_edit(&|v: &mut Value| v["outputs"][0]["value"] = json!(899_000_000u64));
     assert!(
-        e.contains("does not keep the reserve minus 90000000"),
+        e.contains("output 0 does not keep the reserve minus 100000000"),
         "{e}"
     );
 
-    let stale = Expectation {
+    // The fee is the recipient's: the payout is the amount minus the fee, not the amount.
+    let e = tx_edit(&|v: &mut Value| v["outputs"][1]["value"] = json!(100_000_000u64));
+    assert!(
+        e.contains("output 1 pays 100000000 nanoERG to the recipient; expected 99000000"),
+        "{e}"
+    );
+
+    // A fee above --max-fee-nano, even when everything else adds up.
+    let e = check(
+        {
+            let mut v = build.unsigned_tx.clone();
+            v["outputs"][1]["value"] = json!(98_000_000u64);
+            v["outputs"][2]["value"] = json!(2_000_000u64);
+            v
+        },
+        BuildResponse {
+            fee: 2_000_000,
+            recipient_output_value: 98_000_000,
+            ..build.clone()
+        },
+        &inputs,
+        &expect,
+    );
+    assert!(
+        e.contains("the miner fee 2000000 nanoERG is above the limit 1000000"),
+        "{e}"
+    );
+
+    // The tracker-paid layout of token reserves is not signed for an ERG reserve.
+    let e = build_edit(&|b: &mut BuildResponse| b.fee_paid_by = "tracker".to_string());
+    assert!(
+        e.contains("the build says the miner fee is paid by \"tracker\""),
+        "{e}"
+    );
+
+    // The tracker's own box as a second input: the recipient's proof would sign for it.
+    let fee_box = w
+        .node
+        .utxo
+        .lock()
+        .unwrap()
+        .values()
+        .find(|b| b.ergo_tree == w.t.tree() && b.tokens.is_none())
+        .cloned()
+        .unwrap();
+    let mut with_fee_box = build.unsigned_tx.clone();
+    with_fee_box["inputs"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({ "boxId": String::from(fee_box.box_id()), "extension": {} }));
+    let mut two_inputs = inputs.clone();
+    two_inputs.push(fee_box);
+    let e = check(with_fee_box, build.clone(), &two_inputs, &expect);
+    assert!(
+        e.contains("spends 2 inputs; an ERG redemption spends only the reserve"),
+        "{e}"
+    );
+
+    // A fourth output (change to the tracker).
+    let tracker_tree = tx::tree_hex(&w.t.tree()).unwrap();
+    let e = tx_edit(&|v: &mut Value| {
+        let mut change = v["outputs"][2].clone();
+        change["ergoTree"] = json!(tracker_tree);
+        v["outputs"].as_array_mut().unwrap().push(change);
+    });
+    assert!(
+        e.contains("4 outputs; an ERG redemption has exactly three"),
+        "{e}"
+    );
+
+    // A build for another amount than asked for.
+    let e = expect_edit(Expectation {
+        amount: 90_000_000,
+        ..expect.clone()
+    });
+    assert!(
+        e.contains("the build reports a payout of 99000000 nanoERG"),
+        "{e}"
+    );
+
+    let e = expect_edit(Expectation {
         total_debt: 250_000_000,
         ..expect.clone()
-    };
-    let e = check(&unchanged, &stale);
+    });
     assert!(e.contains("the note's committed total is 250000000"), "{e}");
 
-    let other_tracker = Expectation {
+    let e = expect_edit(Expectation {
         tracker_pubkey: w.a.pk,
         ..expect.clone()
-    };
-    let e = check(&unchanged, &other_tracker);
+    });
     assert!(e.contains("is not the key"), "{e}");
+}
+
+/// Only the newest build of a note can be submitted: `/redemption/submit` answers 409 for a
+/// build a newer one replaced, and the canary then sends it nowhere, not to the node either.
+async fn a_replaced_build_is_not_submitted(w: &World) {
+    let context = w.context();
+    let older = build_signed_by_b(w, 50_000_000).await;
+    let newer = build_signed_by_b(w, 60_000_000).await;
+    assert_ne!(older.unsigned_tx, newer.unsigned_tx);
+
+    let key = FileKey::from_secret(w.b.secret).unwrap();
+    let unsigned: UnsignedTransaction = serde_json::from_value(older.unsigned_tx.clone()).unwrap();
+    let partial: Transaction = serde_json::from_value(older.partial_tx.clone()).unwrap();
+    let (inputs, data_inputs) = node_boxes(&context.node, &unsigned, &older).await.unwrap();
+    let state = local_wallet::state_context_from_headers(older.headers.clone()).unwrap();
+    let signed = key
+        .prove_input(&unsigned, Some(&partial), &inputs, &data_inputs, &state, 0)
+        .unwrap();
+    tx::validate(&signed, &inputs, &data_inputs, &fixture_state()).unwrap();
+    let note = fetch_note(&context, &w.a.pk, &w.b.pk)
+        .await
+        .unwrap()
+        .unwrap();
+    let expect = Expectation {
+        issuer: w.a.pk,
+        recipient: w.b.pk,
+        amount: 50_000_000,
+        total_debt: note.amount_collected,
+        timestamp: note.timestamp,
+        issuer_signature: issuer_signature(w).await,
+        tracker_nft: w.nft,
+        tracker_pubkey: w.t.pk,
+        max_fee: tx::FEE,
+    };
+    let node_requests = w.node.seen.lock().unwrap().len();
+    let mut report = Report::new(false);
+    let e = submit(&context, &signed, &older, &expect, &mut report)
+        .await
+        .unwrap_err();
+    assert!(e.contains("POST /redemption/submit: HTTP 409"), "{e}");
+    assert!(
+        e.contains("not through the node either: run redeem again"),
+        "{e}"
+    );
+    assert!(!report.text().contains("submitting through the node"));
+    assert_eq!(w.node.seen.lock().unwrap().len(), node_requests);
+    assert_eq!(w.node.applied().len(), 1);
 }
 
 #[test]
