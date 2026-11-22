@@ -100,9 +100,30 @@ pub struct TrackerStorage {
 /// Key: recipient_pubkey (33 bytes), Value: (timestamp, policy_json, signature)
 #[derive(Clone)]
 pub struct AcceptancePolicyStorage {
-    /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]).
-    _keyspace: fjall::Keyspace,
+    /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]), and
+    /// makes a quarantine move one atomic batch.
+    keyspace: fjall::Keyspace,
     partition: fjall::Partition,
+    /// Policies the startup re-check refused (round 5, review 6), kept instead of deleted.
+    quarantine: fjall::Partition,
+}
+
+/// The partition of [`AcceptancePolicyStorage`] that holds the policies the startup re-check
+/// refused. It is created on first open; a data dir without it (written before round 5) opens
+/// unchanged, and an older binary leaves it alone.
+pub const POLICY_QUARANTINE_PARTITION: &str = "acceptance_policies_quarantine";
+
+/// A policy record the startup re-check moved out of service (round 5, review 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedPolicy {
+    /// The recipient the policy belonged to.
+    pub recipient_pubkey: PubKey,
+    /// Unix seconds of the move.
+    pub quarantined_at: u64,
+    /// Why the re-check refused it.
+    pub reason: String,
+    /// The record exactly as it was stored in `acceptance_policies`.
+    pub record: Vec<u8>,
 }
 
 /// Stored acceptance policy record
@@ -1482,11 +1503,107 @@ impl AcceptancePolicyStorage {
             .map_err(|e| {
                 NoteError::StorageError(format!("Failed to open policy partition: {}", e))
             })?;
+        let quarantine = keyspace
+            .open_partition(POLICY_QUARANTINE_PARTITION, PartitionCreateOptions::default())
+            .map_err(|e| {
+                NoteError::StorageError(format!(
+                    "Failed to open policy quarantine partition: {}",
+                    e
+                ))
+            })?;
 
         Ok(Self {
-            _keyspace: keyspace,
+            keyspace,
             partition,
+            quarantine,
         })
+    }
+
+    /// Move the stored policy of `recipient_pubkey`, byte for byte, into the quarantine
+    /// partition with `reason`, in one atomic batch (round 5, review 6: the startup re-check
+    /// keeps what it refuses instead of deleting it). Returns `false` when no policy is stored.
+    ///
+    /// Quarantine key: recipient (33 bytes) || quarantined_at (u64 BE, Unix seconds), so a
+    /// recipient refused twice keeps both records. Value: reason length (u32 BE) || reason ||
+    /// the original record.
+    pub fn quarantine_policy(
+        &self,
+        recipient_pubkey: &PubKey,
+        reason: &str,
+    ) -> Result<bool, NoteError> {
+        let record = match self.partition.get(recipient_pubkey) {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(false),
+            Err(e) => {
+                return Err(NoteError::StorageError(format!(
+                    "Failed to read policy for quarantine: {}",
+                    e
+                )))
+            }
+        };
+        let mut quarantined_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let key = loop {
+            let mut key = Vec::with_capacity(33 + 8);
+            key.extend_from_slice(recipient_pubkey);
+            key.extend_from_slice(&quarantined_at.to_be_bytes());
+            let taken = self.quarantine.contains_key(&key).map_err(|e| {
+                NoteError::StorageError(format!("Failed to read policy quarantine: {}", e))
+            })?;
+            if !taken {
+                break key;
+            }
+            quarantined_at += 1;
+        };
+        let reason = reason.as_bytes();
+        let mut value = Vec::with_capacity(4 + reason.len() + record.len());
+        value.extend_from_slice(&(reason.len() as u32).to_be_bytes());
+        value.extend_from_slice(reason);
+        value.extend_from_slice(&record);
+
+        let mut batch = self.keyspace.batch();
+        batch.insert(&self.quarantine, key, value);
+        batch.remove(&self.partition, recipient_pubkey.to_vec());
+        batch
+            .commit()
+            .map_err(|e| NoteError::StorageError(format!("Failed to quarantine policy: {}", e)))?;
+        Ok(true)
+    }
+
+    /// Every quarantined policy, oldest key first; unreadable entries are skipped with a
+    /// warning.
+    pub fn list_quarantined_policies(&self) -> Result<Vec<QuarantinedPolicy>, NoteError> {
+        let mut out = Vec::new();
+        for item in self.quarantine.iter() {
+            let (key, value) = item.map_err(|e| {
+                NoteError::StorageError(format!("Failed to read policy quarantine: {}", e))
+            })?;
+            let parsed = (|| {
+                let recipient_pubkey = PubKey::try_from(key.get(..33)?).ok()?;
+                let quarantined_at = u64::from_be_bytes(key.get(33..41)?.try_into().ok()?);
+                let reason_len =
+                    u32::from_be_bytes(value.get(..4)?.try_into().ok()?) as usize;
+                let reason_end = 4usize.checked_add(reason_len)?;
+                let reason = String::from_utf8(value.get(4..reason_end)?.to_vec()).ok()?;
+                let record = value.get(reason_end..)?.to_vec();
+                Some(QuarantinedPolicy {
+                    recipient_pubkey,
+                    quarantined_at,
+                    reason,
+                    record,
+                })
+            })();
+            match parsed {
+                Some(entry) => out.push(entry),
+                None => tracing::warn!(
+                    "Skipping an unreadable policy quarantine entry ({} key bytes)",
+                    key.len()
+                ),
+            }
+        }
+        Ok(out)
     }
 
     /// Store a signed acceptance policy for a recipient
@@ -1612,5 +1729,77 @@ impl AcceptancePolicyStorage {
             }
         }
         Ok(policies)
+    }
+}
+
+#[cfg(test)]
+mod policy_quarantine_tests {
+    use super::*;
+
+    const GOOD: &str = r#"{"root":"a","predicates":[{"type":"no_pending_refund","name":"a"}]}"#;
+
+    /// The record `store_policy` wrote at 6113b8d (and still writes): timestamp (u64 BE),
+    /// JSON length (u32 BE), JSON, signature length (u32 BE), signature.
+    fn record_6113b8d(timestamp: u64, json: &str, signature: &str) -> Vec<u8> {
+        let mut value = Vec::new();
+        value.extend_from_slice(&timestamp.to_be_bytes());
+        value.extend_from_slice(&(json.len() as u32).to_be_bytes());
+        value.extend_from_slice(json.as_bytes());
+        value.extend_from_slice(&(signature.len() as u32).to_be_bytes());
+        value.extend_from_slice(signature.as_bytes());
+        value
+    }
+
+    /// Round 5, review 6: a policy dir written by 6113b8d (only the `acceptance_policies`
+    /// partition) opens unchanged, its policies read as before, and the quarantine partition
+    /// is added next to them; a quarantined policy keeps its exact bytes and its reason.
+    #[test]
+    fn a_6113b8d_policy_dir_opens_and_a_quarantine_keeps_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (good, bad): (PubKey, PubKey) = ([0x02; 33], [0x03; 33]);
+        let bad_record = record_6113b8d(1_700_000_001, r#"{"predicates":[]"#, "sig-b");
+        {
+            // The 6113b8d layout, written with fjall directly.
+            let keyspace = Config::new(dir.path()).open().unwrap();
+            let partition = keyspace
+                .open_partition("acceptance_policies", PartitionCreateOptions::default())
+                .unwrap();
+            partition
+                .insert(good, record_6113b8d(1_700_000_000, GOOD, "sig-a"))
+                .unwrap();
+            partition.insert(bad, bad_record.clone()).unwrap();
+            keyspace.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+
+        let storage = AcceptancePolicyStorage::open(dir.path()).unwrap();
+        let stored = storage.get_policy(&good).unwrap().unwrap();
+        assert_eq!(stored.timestamp, 1_700_000_000);
+        assert_eq!(stored.policy_json, GOOD);
+        assert_eq!(stored.signature, "sig-a");
+        assert_eq!(storage.list_policies().unwrap().len(), 2);
+        assert!(storage.list_quarantined_policies().unwrap().is_empty());
+
+        assert!(storage.quarantine_policy(&bad, "root missing").unwrap());
+        assert!(!storage.quarantine_policy(&bad, "again").unwrap(), "nothing left to move");
+        assert!(storage.get_policy(&bad).unwrap().is_none());
+        assert!(storage.get_policy(&good).unwrap().is_some());
+        let quarantined = storage.list_quarantined_policies().unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].recipient_pubkey, bad);
+        assert_eq!(quarantined[0].reason, "root missing");
+        assert_eq!(quarantined[0].record, bad_record);
+
+        // A second refusal of the same recipient keeps both records.
+        storage.store_policy(&bad, GOOD, "sig-c").unwrap();
+        assert!(storage.quarantine_policy(&bad, "second").unwrap());
+        let quarantined = storage.list_quarantined_policies().unwrap();
+        assert_eq!(quarantined.len(), 2);
+        assert_eq!(quarantined[1].reason, "second");
+
+        // The moves survive a restart.
+        drop(storage);
+        let storage = AcceptancePolicyStorage::open(dir.path()).unwrap();
+        assert_eq!(storage.list_quarantined_policies().unwrap().len(), 2);
+        assert_eq!(storage.list_policies().unwrap().len(), 1);
     }
 }

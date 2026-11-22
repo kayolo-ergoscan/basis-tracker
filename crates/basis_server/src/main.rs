@@ -779,17 +779,27 @@ async fn main() {
             }
         };
     // Round 4 (C1): stored policies must pass the same validation as new uploads; invalid ones
-    // are dropped with a warning each.
-    let (kept, dropped) =
+    // are moved to the quarantine partition with a warning each (round 5: kept, not deleted).
+    let (kept, quarantined) =
         basis_server::acceptance::validate::recheck_stored_policies(&policy_storage);
-    if dropped > 0 {
+    let in_quarantine = policy_storage
+        .list_quarantined_policies()
+        .map(|q| q.len())
+        .unwrap_or_default();
+    if quarantined > 0 {
         tracing::warn!(
-            "Stored acceptance policies re-checked: {} kept, {} dropped",
+            "Stored acceptance policies re-checked: {} kept, {} moved to quarantine ({} in quarantine, partition {})",
             kept,
-            dropped
+            quarantined,
+            in_quarantine,
+            basis_store::persistence::POLICY_QUARANTINE_PARTITION
         );
     } else {
-        tracing::info!("Stored acceptance policies re-checked: {} kept", kept);
+        tracing::info!(
+            "Stored acceptance policies re-checked: {} kept ({} in quarantine)",
+            kept,
+            in_quarantine
+        );
     }
 
     let app_state = AppState {

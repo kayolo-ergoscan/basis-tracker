@@ -115,7 +115,11 @@ fjall keyspace waits up to one fsync interval to close.
   stored (round 4, C1): JSON at most 8 KiB, explicit `root`, unique names, a reference tree
   in which every predicate is referenced once and reachable from the root, depth at most 8, at
   most 32 predicates, 16 references per composite and 256 holders. Stored policies are
-  re-checked at startup and invalid ones dropped with a warning
+  re-checked at startup; an invalid or unreadable one is moved, byte for byte and with the
+  reason, from the `acceptance_policies` partition to `acceptance_policies_quarantine` (key:
+  recipient key ‖ Unix seconds of the move, u64 BE; value: reason length u32 BE ‖ reason ‖ the
+  original record) with a warning, instead of being deleted (round 5). The recipient then falls
+  back to the global policy until they upload a valid one
 - `GET /acceptance/policy/{pubkey}` - Get the stored acceptance policy for a public key
 
 ### Configuration Endpoints

@@ -2,7 +2,7 @@
 //!
 //! A policy is a tree of named predicates. A per-recipient policy is validated before
 //! `POST /acceptance/policy` stores it, and every stored policy again at startup
-//! ([`recheck_stored_policies`]):
+//! ([`recheck_stored_policies`], which moves a refused policy to the quarantine partition):
 //!
 //! * the JSON is at most [`MAX_POLICY_JSON_BYTES`] (8 KiB);
 //! * predicate names are unique and not empty, and `root` names one of them. An empty
@@ -206,11 +206,14 @@ pub fn validate_policy(config: &AcceptanceConfig) -> Result<(), PolicyError> {
         .map_err(|e| PolicyError::Build(e.to_string()))
 }
 
-/// Re-check every stored per-recipient policy and drop the ones that fail validation or
-/// cannot be read, each with a warning (round 4, C1; run at startup). A recipient whose
-/// policy is dropped falls back to the global policy until they upload a valid one.
+/// Re-check every stored per-recipient policy and take the ones that fail validation or
+/// cannot be read out of service, each with a warning (round 4, C1; run at startup, before the
+/// routes serve). A refused policy is moved, byte for byte and with its reason, to the
+/// quarantine partition (`basis_store::persistence::POLICY_QUARANTINE_PARTITION`) instead of
+/// being deleted (round 5, review 6). A recipient whose policy is quarantined falls back to the
+/// global policy until they upload a valid one.
 ///
-/// Returns `(kept, dropped)`.
+/// Returns `(kept, quarantined)`.
 pub fn recheck_stored_policies(storage: &AcceptancePolicyStorage) -> (usize, usize) {
     let listed = match storage.list_policies() {
         Ok(listed) => listed,
@@ -219,7 +222,7 @@ pub fn recheck_stored_policies(storage: &AcceptancePolicyStorage) -> (usize, usi
             return (0, 0);
         }
     };
-    let (mut kept, mut dropped) = (0, 0);
+    let (mut kept, mut quarantined) = (0, 0);
     for (recipient_hex, _uploaded_at) in listed {
         let Some(recipient) = hex::decode(&recipient_hex)
             .ok()
@@ -238,21 +241,24 @@ pub fn recheck_stored_policies(storage: &AcceptancePolicyStorage) -> (usize, usi
             Ok(None) => continue,
             Err(e) => format!("unreadable record: {e:?}"),
         };
-        match storage.remove_policy(&recipient) {
-            Ok(()) => {
-                dropped += 1;
+        match storage.quarantine_policy(&recipient, &reason) {
+            Ok(true) => {
+                quarantined += 1;
                 tracing::warn!(
-                    "Dropped the stored acceptance policy of {recipient_hex}: {reason}. The \
-                     recipient falls back to the global policy until they upload a valid one."
+                    "Moved the stored acceptance policy of {recipient_hex} to quarantine \
+                     (partition {}): {reason}. The recipient falls back to the global policy \
+                     until they upload a valid one.",
+                    basis_store::persistence::POLICY_QUARANTINE_PARTITION
                 );
             }
+            Ok(false) => {}
             Err(e) => tracing::warn!(
                 "Stored acceptance policy of {recipient_hex} is invalid ({reason}) but could not \
-                 be removed: {e:?}"
+                 be moved to quarantine: {e:?}"
             ),
         }
     }
-    (kept, dropped)
+    (kept, quarantined)
 }
 
 #[cfg(test)]
@@ -478,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_recheck_drops_invalid_stored_policies() {
+    fn startup_recheck_quarantines_invalid_stored_policies() {
         let dir = tempfile::tempdir().unwrap();
         let storage = AcceptancePolicyStorage::open(dir.path()).unwrap();
         let good: PubKey = [0x02; 33];
@@ -514,7 +520,17 @@ mod tests {
         assert!(storage.get_policy(&good).unwrap().is_some());
         assert!(storage.get_policy(&bad).unwrap().is_none());
         assert!(storage.get_policy(&cyclic).unwrap().is_none());
-        // A second run finds nothing more to drop.
+        // Round 5 (review 6): the refused policies are kept in quarantine, with their reason.
+        let quarantined = storage.list_quarantined_policies().unwrap();
+        let mut recipients: Vec<PubKey> =
+            quarantined.iter().map(|q| q.recipient_pubkey).collect();
+        recipients.sort_unstable();
+        let mut expected = vec![bad, cyclic];
+        expected.sort_unstable();
+        assert_eq!(recipients, expected);
+        assert!(quarantined.iter().all(|q| !q.reason.is_empty() && !q.record.is_empty()));
+        // A second run finds nothing more to move.
         assert_eq!(recheck_stored_policies(&storage), (1, 0));
+        assert_eq!(storage.list_quarantined_policies().unwrap().len(), 2);
     }
 }
