@@ -203,7 +203,11 @@ pub fn verify_reserve_input(
 /// - releases exactly `amount` from the reserve (context var #0 = redeem into output 0), so the
 ///   creditor's claim is not used up beyond what they are paid;
 /// - pays the recipient's P2PK at least `amount` (nanoERG, or the collateral token for a token
-///   note) in one output.
+///   note) in one output; for an ERG note, at least `amount - max_payout_fee`, because an ERG
+///   redemption built by the tracker pays the miner fee out of the payout (its `fee_paid_by` is
+///   `"recipient"`). Pass the most you accept to pay (0 for a tracker-paid fee); everything the
+///   reserve releases beyond the recipient's output is bounded by it.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_redemption_tx(
     unsigned: &UnsignedTransaction,
     input_boxes: &[ErgoBox],
@@ -212,6 +216,7 @@ pub fn verify_redemption_tx(
     recipient_pk: &[u8; 33],
     denomination: &DenomKey,
     amount: u64,
+    max_payout_fee: u64,
 ) -> Result<()> {
     let inputs = unsigned.inputs.as_slice();
     let input_ids: Vec<BoxId> = inputs.iter().map(|i| i.box_id).collect();
@@ -280,18 +285,59 @@ pub fn verify_redemption_tx(
             amount
         ));
     }
+    // Only ERG can pay the miner fee, so only an ERG payout may be short of `amount`.
+    let at_least = match denomination {
+        DenomKey::Erg => amount.saturating_sub(max_payout_fee),
+        DenomKey::Token(_) => amount,
+    };
     let pays_recipient = outputs.iter().any(|o| {
-        tree_bytes(&o.ergo_tree).ok().as_ref() == Some(&recipient_tree) && paid(o) >= amount
+        tree_bytes(&o.ergo_tree).ok().as_ref() == Some(&recipient_tree) && paid(o) >= at_least
     });
     if !pays_recipient {
         return Err(anyhow!(
             "no output pays the recipient {} at least {} {}",
             hex::encode(recipient_pk),
-            amount,
+            at_least,
             denomination.denomination_id()
         ));
     }
     Ok(())
+}
+
+/// Most a client of this crate accepts to have taken out of an ERG payout for the miner fee
+/// when the tracker builds the redemption (`fee_paid_by: "recipient"`): 0.01 ERG.
+pub const MAX_PAYOUT_FEE_NANOERG: u64 = 10_000_000;
+
+/// The recipient's signature (hex) over a `POST /redemption/build` request
+/// (`basis_store::schnorr::build_request_message`), for its `receiver_signature` field.
+pub fn sign_build_request(
+    receiver_secret: &[u8; 32],
+    tracker_nft_id: &[u8; 32],
+    issuer_pk: &[u8; 33],
+    receiver_pk: &[u8; 33],
+    denomination: &DenomKey,
+    amount: u64,
+    request_timestamp_ms: u64,
+) -> Result<String> {
+    let message = basis_store::schnorr::build_request_message(
+        tracker_nft_id,
+        issuer_pk,
+        receiver_pk,
+        denomination,
+        amount,
+        request_timestamp_ms,
+    );
+    let signature = basis_store::schnorr::schnorr_sign(&message, receiver_secret, receiver_pk)
+        .map_err(|e| anyhow!("signing the build request failed: {:?}", e))?;
+    Ok(hex::encode(signature))
+}
+
+/// Milliseconds since the Unix epoch: the `request_timestamp` of a build request signed now.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Issuer signature for redemption context var #2 over `message`
@@ -794,6 +840,10 @@ mod tests {
         }
 
         fn verify(&self) -> Result<()> {
+            self.verify_with_fee(0)
+        }
+
+        fn verify_with_fee(&self, max_payout_fee: u64) -> Result<()> {
             verify_redemption_tx(
                 &self.unsigned(),
                 &self.inputs,
@@ -802,7 +852,28 @@ mod tests {
                 &pk(RECIPIENT_PK),
                 &self.denomination,
                 AMOUNT,
+                max_payout_fee,
             )
+        }
+
+        /// The ERG redemption as the tracker builds it now: the reserve is the only input, the
+        /// recipient gets `AMOUNT - fee` and the miner `fee`.
+        fn fee_from_payout(fee: u64) -> Self {
+            let mut case = Case::honest(DenomKey::Erg);
+            case.inputs.truncate(1);
+            case.outputs[1] = candidate(
+                AMOUNT - fee,
+                p2pk(RECIPIENT_PK),
+                None,
+                NonMandatoryRegisters::empty(),
+            );
+            case.outputs[2] = candidate(
+                fee,
+                p2pk(TRACKER_PK),
+                None,
+                NonMandatoryRegisters::empty(),
+            );
+            case
         }
 
         fn err(&self) -> String {
@@ -816,6 +887,45 @@ mod tests {
     fn redemption_honest_erg_and_token_builds_pass() {
         Case::honest(DenomKey::Erg).verify().unwrap();
         Case::honest(token_denom()).verify().unwrap();
+    }
+
+    /// An ERG redemption that pays the miner fee out of the payout passes only when the client
+    /// accepts at least that fee, and never for a token note.
+    #[test]
+    fn redemption_fee_from_payout_is_bounded_by_the_clients_allowance() {
+        let fee = 1_000_000;
+        let case = Case::fee_from_payout(fee);
+        case.verify_with_fee(fee).unwrap();
+        case.verify_with_fee(MAX_PAYOUT_FEE_NANOERG).unwrap();
+        let err = case.verify_with_fee(fee - 1).unwrap_err().to_string();
+        assert!(err.contains("at least"), "{err}");
+        assert!(case.verify().is_err(), "a client that pays no fee refuses it");
+
+        // A token payout is never short, whatever the allowance.
+        let mut token = Case::honest(token_denom());
+        token.outputs[1] = candidate(
+            1_000_000,
+            p2pk(RECIPIENT_PK),
+            tokens(&[(TOKEN_ID, AMOUNT - 1)]),
+            NonMandatoryRegisters::empty(),
+        );
+        assert!(token.verify_with_fee(MAX_PAYOUT_FEE_NANOERG).is_err());
+    }
+
+    #[test]
+    fn build_request_signature_verifies_under_the_recipients_key() {
+        let (secret, receiver) = basis_store::schnorr::generate_keypair();
+        let issuer = pk(ISSUER_PK);
+        let nft = [0x11u8; 32];
+        let hex_sig =
+            sign_build_request(&secret, &nft, &issuer, &receiver, &DenomKey::Erg, 5, 7).unwrap();
+        let sig: [u8; 65] = hex::decode(hex_sig).unwrap().try_into().unwrap();
+        let message =
+            basis_store::schnorr::build_request_message(&nft, &issuer, &receiver, &DenomKey::Erg, 5, 7);
+        basis_store::schnorr::schnorr_verify(&sig, &message, &receiver).unwrap();
+        let other =
+            basis_store::schnorr::build_request_message(&nft, &issuer, &receiver, &DenomKey::Erg, 6, 7);
+        assert!(basis_store::schnorr::schnorr_verify(&sig, &other, &receiver).is_err());
     }
 
     #[test]
@@ -840,6 +950,7 @@ mod tests {
                 &pk(RECIPIENT_PK),
                 &DenomKey::Erg,
                 AMOUNT,
+                0,
             )
             .expect_err("box list must be rejected")
             .to_string()

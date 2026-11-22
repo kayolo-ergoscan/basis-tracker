@@ -1061,14 +1061,50 @@ paths:
     post:
       summary: Build a redemption transaction
       description: |
-        Build an unsigned redemption transaction and a fee-signed partial transaction.
-        The client must add the reserve input's proveDlog proof and submit the signed result.
+        Build an unsigned redemption transaction and a partial transaction. The
+        client must add the reserve input's proveDlog proof (input 0) and submit
+        the signed result.
+
+        **Only the recipient can ask for a build.** The request carries
+        `request_timestamp` (ms since the Unix epoch) and `receiver_signature`,
+        the recipient's 65-byte Basis Schnorr signature (the scheme notes use)
+        over
+
+            "basis-build-v1" (14 ASCII bytes)
+            ‖ tracker NFT id (32) ‖ issuer key (33) ‖ recipient key (33)
+            ‖ denomination id (UTF-8: "erg" or "token:<64 lowercase hex>")
+            ‖ amount (u64 big-endian) ‖ request_timestamp (u64 big-endian)
+
+        131 bytes for ERG, 198 for a token. `request_timestamp` must be within
+        120 s of the tracker's clock and greater than the recipient's previous
+        build request (remembered for 10 minutes). The signature is checked
+        before anything else is counted or fetched.
+
+        **Cheap checks before any node request:** the amount must not exceed the
+        committed outstanding debt (committed total minus already redeemed), the
+        issuer signature must verify over the committed note, and for an ERG
+        reserve the payout (amount minus the miner fee) must be at least the
+        minimum box value. Only then are the build budgets counted (per pair,
+        per recipient; 429), and the tracker's own budgets for signing its fee
+        inputs apply only to token reserves.
+
+        **Who pays the fee.** An ERG-reserve redemption pays the miner fee out of
+        the redeemed value: the transaction spends only the reserve box, the
+        recipient receives `amount - fee`, there is no change output and the
+        tracker signs no input (`fee_paid_by: "recipient"`). A token-reserve
+        redemption keeps tracker-paid fee inputs, signed in `partial_tx`
+        (`fee_paid_by: "tracker"`). Every build passes the tracker's local
+        checks of the whole transaction before it is returned.
 
         The tracker AVL proof is generated against the last on-chain-confirmed
         tracker state digest (not the live local tree), so the proof verifies
         against the digest stored in the tracker box. If no tracker state has
         been confirmed on-chain yet, or the note is not part of the confirmed
         state, the request is rejected with 400.
+
+        A caller `tracker_box_id` is used only when it equals a tracker box id
+        the tracker knows; caller input never reaches a node URL, and errors
+        never carry the node's URL or answer (they are logged instead).
       operationId: buildRedemption
       tags:
         - Redemption
@@ -1086,13 +1122,44 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseRedemptionBuild'
         '400':
-          description: Bad request - invalid input parameters
+          description: >-
+            Bad request - invalid input parameters, a missing or invalid
+            `receiver_signature`, a `request_timestamp` outside 120 s of the
+            tracker's clock, an amount above the committed outstanding debt, an
+            ERG payout below the minimum box value, an issuer signature that does
+            not verify, or a note not committed on-chain yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '409':
+          description: >-
+            `request_timestamp` not greater than the recipient's previous build
+            request (replay), the issuer has more than one tracked reserve, or
+            the committed state is ahead of a consented decrease
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '429':
+          description: >-
+            A build budget is used up (per pair, per recipient, or the tracker's
+            fee-signing budgets for token reserves), or too many recipients are
+            being tracked at once
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
         '500':
-          description: Internal server error
+          description: >-
+            Internal server error; node failures answer "the tracker could not
+            read ... from its node; try again later" without node details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '503':
+          description: The tracker box is not known yet (the tracker has just started); retry shortly
           content:
             application/json:
               schema:
@@ -1129,7 +1196,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
         '500':
-          description: Internal server error
+          description: >-
+            Internal server error, or the node did not accept the transaction
+            ("the node did not accept redemption <id>; build it again with POST
+            /redemption/build"); the node's URL and answer are logged, never returned
           content:
             application/json:
               schema:
@@ -2367,13 +2437,14 @@ components:
 
     RedemptionBuildRequest:
       type: object
-      description: Request to build a redemption transaction
+      description: Request to build a redemption transaction, signed by the recipient
       required:
         - issuer_pubkey
         - recipient_pubkey
         - amount
-        - timestamp
         - issuer_signature
+        - request_timestamp
+        - receiver_signature
       properties:
         issuer_pubkey:
           type: string
@@ -2388,27 +2459,36 @@ components:
         amount:
           type: integer
           format: uint64
-          description: Amount to redeem in nanoERG
+          description: >-
+            Amount the reserve releases, in nanoERG (or token units for a token
+            reserve). For an ERG reserve the recipient receives `amount - fee`.
           example: 500000000
         timestamp:
           type: integer
           format: uint64
-          description: Legacy field, ignored by the server — the stored note's payment timestamp is used for the signature, context extension, and reserve tree value
+          description: Legacy field, optional and ignored by the server — the stored note's payment timestamp is used for the signature, context extension, and reserve tree value
           example: 1234567890000
         issuer_signature:
           type: string
-          description: Hex-encoded issuer's 65-byte Schnorr signature
+          description: >-
+            Hex-encoded issuer's 65-byte Schnorr signature over the committed note
+            (checked before any node request)
           pattern: '^[0-9a-fA-F]{130}$'
           example: "0303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303"
         emergency:
           type: boolean
           default: false
-          description: Whether this is an emergency redemption
+          description: >-
+            Emergency redemption (after the 3-day window): context var #6 is empty
+            and the tracker signs no redemption message
           example: false
         tracker_box_id:
           type: string
           nullable: true
-          description: Optional tracker box id; fetched from storage if omitted
+          description: >-
+            Optional. Used only when it equals a tracker box id the tracker knows
+            (its live or last confirmed box, compared case-insensitively); any
+            other value is ignored and never reaches a node request
           example: "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
         change_address:
           type: string
@@ -2421,6 +2501,23 @@ components:
           type: string
           description: "Denomination of the debt: erg or token:<64-hex>."
           example: "erg"
+        request_timestamp:
+          type: integer
+          format: uint64
+          description: >-
+            When the recipient signed this request, in milliseconds since the Unix
+            epoch: within 120 s of the tracker's clock and greater than the
+            recipient's previous build request
+          example: 1795000000000
+        receiver_signature:
+          type: string
+          description: >-
+            The recipient's 65-byte Basis Schnorr signature (hex) over
+            "basis-build-v1" ‖ tracker NFT id (32) ‖ issuer key (33) ‖ recipient
+            key (33) ‖ denomination id (UTF-8) ‖ amount (u64 BE) ‖
+            request_timestamp (u64 BE)
+          pattern: '^[0-9a-fA-F]{130}$'
+          example: "0303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303"
     RedemptionBuildResponse:
       type: object
       description: Response for a built redemption transaction
@@ -2430,7 +2527,10 @@ components:
           description: Node-canonical unsigned transaction JSON
         partial_tx:
           type: object
-          description: Fee-signed transaction JSON (reserve input proof empty)
+          description: >-
+            The transaction with every input proof but the reserve's (input 0)
+            filled: the tracker's fee input proofs for a token reserve, none for an
+            ERG reserve (all proofs empty)
         input_box_binaries:
           type: array
           description: Sigma-serialized input boxes (hex), in transaction-input order
@@ -2446,9 +2546,9 @@ components:
         headers:
           type: array
           description: >-
-            Last 10 block headers, newest first, as the fee inputs were signed:
-            the PreHeader comes from headers[0], and the array is the ErgoStateContext's
-            headers unchanged
+            Last 10 block headers, newest first, as the transaction was built (and
+            any fee inputs signed): the PreHeader comes from headers[0], and the
+            array is the ErgoStateContext's headers unchanged
           items:
             type: object
         reserve_box_id:
@@ -2467,8 +2567,10 @@ components:
         recipient_output_value:
           type: integer
           format: uint64
-          description: Value sent to the recipient output
-          example: 500000000
+          description: >-
+            Value sent to the recipient output: `amount - fee` for an ERG reserve,
+            the minimum box value (with the redeemed tokens) for a token reserve
+          example: 499000000
         total_debt:
           type: integer
           format: uint64
@@ -2479,11 +2581,14 @@ components:
           format: uint64
           description: >-
             Change amount returned to the tracker; 0 (no change output) when the leftover is
-            below the minimum value of a box and went to the miner fee
+            below the minimum value of a box and went to the miner fee, and always 0 for an
+            ERG reserve (no tracker inputs)
           example: 123900000
         change_address:
           type: string
-          description: Address receiving change (always derived from the tracker's own wallet)
+          description: >-
+            Address receiving change (always derived from the tracker's own wallet);
+            empty for an ERG reserve (no change output)
           example: "9fD5TqXvN8Z3k2LmP7wR4sY6uH1jC8bA0eG9iK3oM5nQ2xV"
         recipient_address:
           type: string
@@ -2505,6 +2610,14 @@ components:
           format: uint64
           description: Cumulative already_redeemed value this redemption inserts into the reserve tree
           example: 500000000
+        fee_paid_by:
+          type: string
+          enum: [recipient, tracker]
+          description: >-
+            Who pays the miner fee: "recipient" (ERG reserve: out of the payout; the
+            transaction spends only the reserve and the tracker signs nothing) or
+            "tracker" (token reserve: tracker fee inputs signed in partial_tx)
+          example: "recipient"
 
     RedemptionSubmitRequest:
       type: object

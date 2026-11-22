@@ -28,6 +28,25 @@ database_url = "sqlite:data/basis.db"  # Legacy field, kept for compatibility (c
 
 `data_dir` controls where the server writes all persistent state. It defaults to a `data/` directory relative to the working directory from which the server is launched. You can override it with the `BASIS_SERVER_DATA_DIR` environment variable.
 
+#### Request limits
+
+```toml
+[server]
+reserve_creation_max_erg_nano = 10000000000      # max nanoERG one /reserves/create payload locks
+reserve_creation_max_token_amount = 1000000000   # max token units one /reserves/create payload locks
+redemption_build_max_per_pair_per_hour = 60       # /redemption/build per (issuer, recipient)
+redemption_build_max_per_recipient_per_hour = 30  # /redemption/build per recipient, across issuers
+redemption_build_max_per_issuer_per_hour = 6      # token-reserve builds that sign tracker fee inputs, per issuer
+redemption_build_max_per_hour = 30                # the same, all issuers together
+```
+
+All windows roll over one hour and answer `429` when reached. `/redemption/build` counts a
+request against the pair and recipient budgets only after the recipient's
+`receiver_signature` verifies and the cheap checks pass (committed outstanding debt, issuer
+signature, minimum payout), so nobody but the recipient can use them up. ERG-reserve builds pay
+the miner fee out of the payout and sign no tracker input, so only token-reserve builds use the
+two fee-signing budgets.
+
 ### Server Authentication & TLS
 
 The tracker server supports optional TLS and three authentication modes under

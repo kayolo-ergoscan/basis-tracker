@@ -15,11 +15,14 @@ database_url = "sqlite:data/basis.db"
 # reserve_creation_max_erg_nano = 10000000000
 # Maximum token units a single /reserves/create payload may carry in token-reserve mode.
 # reserve_creation_max_token_amount = 1000000000
-# Maximum /redemption/build calls per (issuer, recipient) pair per hour; bounds the
-# fee cost a self-redeeming user can impose on the tracker wallet (default 60).
+# Maximum /redemption/build calls per (issuer, recipient) pair per hour (default 60) and per
+# recipient across issuers (default 30). Only requests the recipient signed
+# (receiver_signature) that pass the cheap checks count, so nobody else can use them up.
 # redemption_build_max_per_pair_per_hour = 60
+# redemption_build_max_per_recipient_per_hour = 30
 # Maximum /redemption/build calls per issuer, and in total, per hour that get as far as
-# signing fee inputs (defaults 6 and 30). Requests that fail earlier do not count.
+# signing tracker fee inputs (token reserves only; defaults 6 and 30). Requests that fail
+# earlier, and ERG-reserve builds (the fee comes out of the payout), do not count.
 # redemption_build_max_per_issuer_per_hour = 6
 # redemption_build_max_per_hour = 30
 

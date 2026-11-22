@@ -180,6 +180,40 @@ pub fn signing_message(
     message
 }
 
+/// Domain tag that starts every redemption build request message (`POST /redemption/build`).
+pub const BUILD_REQUEST_DOMAIN: &[u8] = b"basis-build-v1";
+
+/// Message the RECEIVER signs to request a redemption build (`POST /redemption/build`).
+///
+/// message = "basis-build-v1" (14 bytes ASCII) || trackerNftId (32) || issuer key (33)
+///           || receiver key (33) || denomination id (UTF-8 of the canonical id: `erg` or
+///           `token:<64 lowercase hex>`) || amount (8 BE) || requestTimestamp (8 BE, ms)
+///
+/// It is signed with the same Basis Schnorr scheme as notes. The domain tag keeps it from
+/// ever being valid as a note or redemption message (those are exactly 80 bytes and start
+/// with a debt-tree key); the denomination id is the only variable-length field and sits
+/// between fixed-width ones, so the encoding is unambiguous. 131 bytes for ERG, 198 for a token.
+pub fn build_request_message(
+    tracker_nft_id: &[u8; 32],
+    issuer_key: &PubKey,
+    receiver_key: &PubKey,
+    denomination: &DenomKey,
+    amount: u64,
+    request_timestamp_ms: u64,
+) -> Vec<u8> {
+    let denomination_id = denomination.denomination_id();
+    let mut message =
+        Vec::with_capacity(BUILD_REQUEST_DOMAIN.len() + 32 + 33 + 33 + denomination_id.len() + 16);
+    message.extend_from_slice(BUILD_REQUEST_DOMAIN);
+    message.extend_from_slice(tracker_nft_id);
+    message.extend_from_slice(issuer_key);
+    message.extend_from_slice(receiver_key);
+    message.extend_from_slice(denomination_id.as_bytes());
+    message.extend_from_slice(&amount.to_be_bytes());
+    message.extend_from_slice(&request_timestamp_ms.to_be_bytes());
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +227,29 @@ mod tests {
         assert_eq!(s, format!("token:{}", hex::encode(id)));
         assert_eq!(DenomKey::parse(&s).unwrap(), key);
         assert_eq!(DenomKey::parse("ERG").unwrap(), DenomKey::Erg);
+    }
+
+    #[test]
+    fn build_request_message_layout() {
+        let nft = [0x11u8; 32];
+        let issuer = [0x02u8; 33];
+        let receiver = [0x03u8; 33];
+        let erg = build_request_message(&nft, &issuer, &receiver, &DenomKey::Erg, 7, 9);
+        assert_eq!(erg.len(), 131);
+        assert_eq!(&erg[..14], b"basis-build-v1");
+        assert_eq!(&erg[14..46], &nft);
+        assert_eq!(&erg[46..79], &issuer);
+        assert_eq!(&erg[79..112], &receiver);
+        assert_eq!(&erg[112..115], b"erg");
+        assert_eq!(&erg[115..123], &7u64.to_be_bytes());
+        assert_eq!(&erg[123..131], &9u64.to_be_bytes());
+
+        let token = DenomKey::Token([0xabu8; 32]);
+        let tok = build_request_message(&nft, &issuer, &receiver, &token, 7, 9);
+        assert_eq!(tok.len(), 198);
+        assert_eq!(&tok[112..182], format!("token:{}", "ab".repeat(32)).as_bytes());
+        // Never the 80-byte note/redemption message shape.
+        assert_ne!(erg.len(), 80);
     }
 
     #[test]

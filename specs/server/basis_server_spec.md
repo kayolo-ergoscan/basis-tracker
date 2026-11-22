@@ -72,7 +72,11 @@ fjall keyspace waits up to one fsync interval to close.
 - `POST /tracker/signature` - Request tracker signature for redemption (real Schnorr signature generation)
 - `POST /redemption/prepare` - Prepare redemption with all necessary data (real AVL proofs + tracker signature)
 - `POST /redemption/build` - Tracker-assisted redemption step 1: build the unsigned redemption
-  transaction and sign the fee inputs
+  transaction for a recipient-signed request (`request_timestamp`, `receiver_signature` over
+  `"basis-build-v1" ‖ trackerNft ‖ issuer ‖ recipient ‖ denominationId ‖ amount ‖ timestamp`);
+  ERG reserves pay the miner fee out of the payout (only the reserve is spent, the tracker signs
+  nothing, `fee_paid_by: "recipient"`), token reserves use tracker-signed fee inputs
+  (`fee_paid_by: "tracker"`)
 - `POST /redemption/submit` - Tracker-assisted redemption step 2: broadcast a signed redemption
   transaction and sync local state
 - `GET /proof/redemption` - Get redemption-specific proof with tracker state digest
@@ -334,12 +338,16 @@ Key configuration includes:
 - **`server.reserve_creation_max_erg_nano`** / **`server.reserve_creation_max_token_amount`**:
   caps on the collateral a single `/reserves/create` payload may lock (defaults 10 ERG and 1e9
   tokens); larger requests are rejected with HTTP 400.
-- **`server.redemption_build_max_per_pair_per_hour`**: per-(issuer, recipient) rate limit on
-  `POST /redemption/build` (default 60/hour, rolling window); excess requests get HTTP 429.
+- **`server.redemption_build_max_per_pair_per_hour`** / **`server.redemption_build_max_per_recipient_per_hour`**:
+  per-(issuer, recipient) and per-recipient rate limits on `POST /redemption/build` (defaults 60
+  and 30 per hour, rolling window); excess requests get HTTP 429. Only requests whose
+  `receiver_signature` verifies and that pass the cheap checks (committed outstanding debt,
+  issuer signature, minimum payout) are counted, so nobody but the recipient can spend them.
 - **`server.redemption_build_max_per_issuer_per_hour`** / **`server.redemption_build_max_per_hour`**:
-  per-issuer and total caps on the builds that get as far as signing fee inputs (defaults 6 and
-  30 per hour, rolling window); excess requests get HTTP 429. Requests that fail before signing
-  (no note, no reserve) do not use these budgets.
+  per-issuer and total caps on the builds that get as far as signing tracker fee inputs (token
+  reserves only; defaults 6 and 30 per hour, rolling window); excess requests get HTTP 429.
+  Requests that fail before signing (no note, no reserve) and ERG-reserve builds (the fee comes out
+  of the payout, no tracker input) do not use these budgets.
 - **`transaction.commit_reserve_nano`**: token-free nanoERG kept at the tracker address for
   commits and heartbeats (default 0.1 ERG; 0 disables). A build that would leave less there gets
   HTTP 503.

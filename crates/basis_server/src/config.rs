@@ -58,11 +58,15 @@ pub struct ServerConfig {
     /// token-reserve mode. Default: 1_000_000_000.
     #[serde(default = "default_reserve_creation_max_token_amount")]
     pub reserve_creation_max_token_amount: u64,
-    /// Maximum `/redemption/build` calls per (issuer, recipient) pair per hour.
-    /// Bounds the fee cost a self-redeeming user can impose on the tracker
-    /// wallet (the tracker pays the fee inputs). Default: 60.
+    /// Maximum `/redemption/build` calls per (issuer, recipient) pair per hour. Counted only
+    /// for requests the recipient signed (`receiver_signature`) that pass the cheap checks, so
+    /// nobody else can use up a pair's budget. Default: 60.
     #[serde(default = "default_redemption_build_max_per_pair_per_hour")]
     pub redemption_build_max_per_pair_per_hour: u32,
+    /// Maximum `/redemption/build` calls per verified recipient per hour, all issuers
+    /// together. Counted with the per-pair cap. Default: 30.
+    #[serde(default = "default_redemption_build_max_per_recipient_per_hour")]
+    pub redemption_build_max_per_recipient_per_hour: u32,
     /// Maximum `/redemption/build` calls per issuer per hour that get as far as signing fee
     /// inputs. Default: 6.
     #[serde(default = "default_redemption_build_max_per_issuer_per_hour")]
@@ -87,6 +91,7 @@ impl std::fmt::Debug for ServerConfig {
             reserve_creation_max_erg_nano,
             reserve_creation_max_token_amount,
             redemption_build_max_per_pair_per_hour,
+            redemption_build_max_per_recipient_per_hour,
             redemption_build_max_per_issuer_per_hour,
             redemption_build_max_per_hour,
         } = self;
@@ -113,6 +118,10 @@ impl std::fmt::Debug for ServerConfig {
                 redemption_build_max_per_pair_per_hour,
             )
             .field(
+                "redemption_build_max_per_recipient_per_hour",
+                redemption_build_max_per_recipient_per_hour,
+            )
+            .field(
                 "redemption_build_max_per_issuer_per_hour",
                 redemption_build_max_per_issuer_per_hour,
             )
@@ -134,6 +143,11 @@ fn default_reserve_creation_max_token_amount() -> u64 {
 
 fn default_redemption_build_max_per_pair_per_hour() -> u32 {
     60
+}
+
+/// Default `[server] redemption_build_max_per_recipient_per_hour`.
+pub fn default_redemption_build_max_per_recipient_per_hour() -> u32 {
+    30
 }
 
 /// Default `[server] redemption_build_max_per_issuer_per_hour`.
@@ -1208,6 +1222,8 @@ mod tests {
                 reserve_creation_max_token_amount: default_reserve_creation_max_token_amount(),
                 redemption_build_max_per_pair_per_hour:
                     default_redemption_build_max_per_pair_per_hour(),
+                redemption_build_max_per_recipient_per_hour:
+                    default_redemption_build_max_per_recipient_per_hour(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1302,6 +1318,8 @@ mod tests {
                 reserve_creation_max_token_amount: default_reserve_creation_max_token_amount(),
                 redemption_build_max_per_pair_per_hour:
                     default_redemption_build_max_per_pair_per_hour(),
+                redemption_build_max_per_recipient_per_hour:
+                    default_redemption_build_max_per_recipient_per_hour(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1452,6 +1470,8 @@ mod tests {
                 reserve_creation_max_token_amount: default_reserve_creation_max_token_amount(),
                 redemption_build_max_per_pair_per_hour:
                     default_redemption_build_max_per_pair_per_hour(),
+                redemption_build_max_per_recipient_per_hour:
+                    default_redemption_build_max_per_recipient_per_hour(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },

@@ -134,6 +134,7 @@ mod untested_handlers {
                 reserve_creation_max_erg_nano: 10_000_000_000,
                 reserve_creation_max_token_amount: 1_000_000_000,
                 redemption_build_max_per_pair_per_hour: 60,
+                redemption_build_max_per_recipient_per_hour: 30,
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -732,8 +733,14 @@ mod untested_handlers {
         assert!(!body.success);
         let msg = body.error.clone().unwrap_or_default();
         assert!(
-            msg.contains("broadcast failed"),
+            msg.contains("did not accept"),
             "a failed broadcast must be reported as such, got: {}",
+            msg
+        );
+        // Round 4 (C2): the node's URL and answer are logged, never returned.
+        assert!(
+            !msg.contains("127.0.0.1") && !msg.contains("http"),
+            "the client error must not carry the node URL, got: {}",
             msg
         );
     }

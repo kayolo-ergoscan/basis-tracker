@@ -14,6 +14,8 @@ pub mod tracker_box_updater;
 
 #[cfg(test)]
 mod create_reserve_tests;
+#[cfg(test)]
+mod redemption_build_e2e_tests;
 
 use tokio::sync::Mutex;
 

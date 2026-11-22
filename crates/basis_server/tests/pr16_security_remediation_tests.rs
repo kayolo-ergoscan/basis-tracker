@@ -2,7 +2,8 @@
 //!
 //! * H2 — fail-closed reserve selection: `/tracker/signature` and `/redemption/build` answer
 //!   409 when the issuer has more than one tracked reserve (`/redemption/prepare` is gone: 410).
-//! * M1 — `/redemption/build` is rate limited per (issuer, recipient) pair (429).
+//! * M1 — `/redemption/build` is rate limited per (issuer, recipient) pair (429); since round 4
+//!   (C2) only requests the recipient signed and that pass the cheap checks use the budget.
 
 mod pr16_security_remediation {
     use axum::http::StatusCode;
@@ -126,6 +127,7 @@ mod pr16_security_remediation {
                 reserve_creation_max_erg_nano: 10_000_000_000,
                 reserve_creation_max_token_amount: 1_000_000_000,
                 redemption_build_max_per_pair_per_hour: max_builds_per_pair_per_hour,
+                redemption_build_max_per_recipient_per_hour: 30,
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -262,8 +264,14 @@ mod pr16_security_remediation {
 
     /// Store a note for (issuer, recipient) with cumulative debt 10_000 and a fixed timestamp.
     async fn add_note(state: &AppState) -> ([u8; 33], [u8; 33]) {
+        let (issuer, recipient, _) = add_note_with_recipient_secret(state).await;
+        (issuer, recipient)
+    }
+
+    /// Like `add_note`, and also returns the recipient's secret (it signs build requests).
+    async fn add_note_with_recipient_secret(state: &AppState) -> ([u8; 33], [u8; 33], [u8; 32]) {
         let (secret, issuer) = generate_keypair();
-        let (_, recipient) = generate_keypair();
+        let (recipient_secret, recipient) = generate_keypair();
         let note = IouNote::create_and_sign(
             recipient,
             10_000,
@@ -283,7 +291,7 @@ mod pr16_security_remediation {
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        (issuer, recipient)
+        (issuer, recipient, recipient_secret)
     }
 
     /// Like `add_note`, but stores a token-denominated note.
@@ -468,14 +476,14 @@ mod pr16_security_remediation {
     #[tokio::test]
     async fn build_redemption_conflicts_when_issuer_has_two_reserves() {
         let state = mock_state(60).await;
-        let (issuer, recipient) = add_note(&state).await;
+        let (issuer, recipient, recipient_secret) = add_note_with_recipient_secret(&state).await;
         let issuer_hex = hex::encode(issuer);
         add_reserve(&state, &issuer_hex, "box_a").await;
         add_reserve(&state, &issuer_hex, "box_b").await;
 
         let (status, body) = build_redemption(
             axum::extract::State(state),
-            axum::extract::Json(build_request(&issuer_hex, &hex::encode(recipient))),
+            axum::extract::Json(build_request(&issuer, &recipient, &recipient_secret, 0)),
         )
         .await;
 
@@ -486,13 +494,13 @@ mod pr16_security_remediation {
     #[tokio::test]
     async fn build_redemption_single_reserve_passes_fail_closed_check() {
         let state = mock_state(60).await;
-        let (issuer, recipient) = add_note(&state).await;
+        let (issuer, recipient, recipient_secret) = add_note_with_recipient_secret(&state).await;
         let issuer_hex = hex::encode(issuer);
         add_reserve(&state, &issuer_hex, "box_a").await;
 
         let (status, _body) = build_redemption(
             axum::extract::State(state),
-            axum::extract::Json(build_request(&issuer_hex, &hex::encode(recipient))),
+            axum::extract::Json(build_request(&issuer, &recipient, &recipient_secret, 0)),
         )
         .await;
 
@@ -504,66 +512,82 @@ mod pr16_security_remediation {
     }
 
     // ------------------------------------------------------------------
-    // M1: per-pair rate limit on /redemption/build
+    // M1 / round 4 C2: /redemption/build budgets count only verified requests
     // ------------------------------------------------------------------
 
-    fn build_request(issuer_hex: &str, recipient_hex: &str) -> RedemptionBuildRequest {
+    /// The tracker NFT of `mock_state`'s config, which build request signatures bind to.
+    const CONFIG_TRACKER_NFT: &str =
+        "1af23d4e5f6a7b8c9daebfc0d1e2f30415263748596a7b8c9daebfc0d1e2f304";
+
+    /// A build request for (issuer, recipient), signed by the recipient `bump` ms after now.
+    fn build_request(
+        issuer: &[u8; 33],
+        recipient: &[u8; 33],
+        recipient_secret: &[u8; 32],
+        bump: u64,
+    ) -> RedemptionBuildRequest {
+        let request_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + bump;
+        let nft: [u8; 32] = hex::decode(CONFIG_TRACKER_NFT).unwrap().try_into().unwrap();
+        let amount = 1_000;
+        let message = basis_store::schnorr::build_request_message(
+            &nft,
+            issuer,
+            recipient,
+            &basis_store::DenomKey::Erg,
+            amount,
+            request_timestamp,
+        );
+        let signature =
+            basis_store::schnorr::schnorr_sign(&message, recipient_secret, recipient).unwrap();
         RedemptionBuildRequest {
-            issuer_pubkey: issuer_hex.to_string(),
-            recipient_pubkey: recipient_hex.to_string(),
-            amount: 1_000,
+            issuer_pubkey: hex::encode(issuer),
+            recipient_pubkey: hex::encode(recipient),
+            amount,
             timestamp: NOTE_TIMESTAMP,
             issuer_signature: "00".repeat(65),
             emergency: false,
             tracker_box_id: None,
             change_address: None,
-            denomination: String::new(),
+            denomination: "erg".to_string(),
+            request_timestamp,
+            receiver_signature: hex::encode(signature),
         }
     }
 
+    /// Requests the recipient did not sign, and signed requests that fail before the budgets
+    /// (no note here), never use the pair's budget: a third party cannot lock a pair out.
     #[tokio::test]
-    async fn build_redemption_rate_limits_per_pair() {
-        let state = mock_state(2).await;
+    async fn build_budgets_ignore_unverified_and_failing_requests() {
+        let state = mock_state(1).await;
         let (_, issuer) = generate_keypair();
-        let (_, recipient) = generate_keypair();
-        let (_, other_recipient) = generate_keypair();
-        let issuer_hex = hex::encode(issuer);
-        let recipient_hex = hex::encode(recipient);
+        let (recipient_secret, recipient) = generate_keypair();
+        let (stranger_secret, _) = generate_keypair();
 
-        // No note exists for the pair, so builds that pass the rate limiter fail with 400
-        // ("note not found"); the limit+1-th build must instead fail with 429.
-        for attempt in 0..2 {
+        for attempt in 0..3u64 {
+            // Not signed by the recipient: refused before any budget.
+            let forged = build_request(&issuer, &recipient, &stranger_secret, attempt);
             let (status, body) = build_redemption(
                 axum::extract::State(state.clone()),
-                axum::extract::Json(build_request(&issuer_hex, &recipient_hex)),
+                axum::extract::Json(forged),
             )
             .await;
-            assert_eq!(
-                status,
-                StatusCode::BAD_REQUEST,
-                "attempt {attempt} should pass the rate limiter, body: {:?}",
-                body
-            );
+            assert_eq!(status, StatusCode::BAD_REQUEST, "attempt {attempt}: {body:?}");
+            assert!(body.error.clone().unwrap().contains("receiver_signature"));
         }
-
-        let (status, body) = build_redemption(
-            axum::extract::State(state.clone()),
-            axum::extract::Json(build_request(&issuer_hex, &recipient_hex)),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::TOO_MANY_REQUESTS,
-            "limit+1 builds must be rate limited, body: {:?}",
-            body
-        );
-
-        // A different (issuer, recipient) pair is unaffected.
-        let (status, _) = build_redemption(
-            axum::extract::State(state),
-            axum::extract::Json(build_request(&issuer_hex, &hex::encode(other_recipient))),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        for attempt in 10..13u64 {
+            // Signed, but there is no note: refused before any budget.
+            let signed = build_request(&issuer, &recipient, &recipient_secret, attempt);
+            let (status, body) = build_redemption(
+                axum::extract::State(state.clone()),
+                axum::extract::Json(signed),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "attempt {attempt}: {body:?}");
+            assert!(body.error.clone().unwrap().contains("note not found"));
+        }
     }
 }

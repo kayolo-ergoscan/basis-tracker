@@ -1104,6 +1104,13 @@ pub struct RedemptionBuildRequest {
     /// Denomination of the note ("erg" or "token:<64-hex>"); default "erg".
     #[serde(default)]
     pub denomination: String,
+    /// Milliseconds since the Unix epoch when the recipient signed this request.
+    #[serde(default)]
+    pub request_timestamp: u64,
+    /// The recipient's signature (hex) over the request:
+    /// [`crate::verify::sign_build_request`].
+    #[serde(default)]
+    pub receiver_signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1126,6 +1133,10 @@ pub struct RedemptionBuildResponse {
     /// Cumulative reserve-tree `already_redeemed` proven by the build; round-trip to submit.
     #[serde(default)]
     pub new_already_redeemed: u64,
+    /// `"recipient"`: the miner fee comes out of the ERG payout (no tracker input);
+    /// `"tracker"`: the tracker's fee inputs pay it. Empty from older trackers (tracker-paid).
+    #[serde(default)]
+    pub fee_paid_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
