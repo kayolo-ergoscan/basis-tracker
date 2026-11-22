@@ -54,29 +54,30 @@ async fn main() {
     // (the documented `mode = "api_key"` did not match the serde name `apikey`), so an operator
     // who followed the documentation got a silently anonymous, Admin-everything server listening on
     // 0.0.0.0. Fail closed instead: a tracker holds other people's collateral.
+    //
+    // The error is printed without the values it quotes: a value can be a secret written into
+    // the wrong field.
     let config = match AppConfig::load() {
         Ok(config) => config,
-        Err(e) => {
-            tracing::error!("Failed to load configuration: {}", e);
-            tracing::error!(
-                "Refusing to start. Fix the configuration file (see config/basis.toml.example) \
-                 and start the tracker again; falling back to defaults could expose an \
-                 unauthenticated server."
-            );
-            std::process::exit(1);
-        }
+        Err(e) => exit_on_startup_error(&format!(
+            "Failed to load configuration: {}. Refusing to start. Fix the configuration file \
+             (see config/basis.toml.example) and start the tracker again; falling back to \
+             defaults could expose an unauthenticated server.",
+            basis_server::config::config_error_without_values(&e)
+        )),
     };
 
     // SECURITY: refuse an unauthenticated server reachable from outside this machine.
     if let Err(msg) = config.validate_startup() {
-        tracing::error!("{}", msg);
-        std::process::exit(1);
+        exit_on_startup_error(&msg);
     }
 
     // Validate that tracker NFT ID is properly configured
     if config.tracker_nft_bytes().is_err() {
-        tracing::error!("Tracker NFT ID is not properly configured in the configuration file. The server requires a valid tracker_nft_id value.");
-        std::process::exit(1); // Exit with error code if tracker NFT ID is not configured
+        exit_on_startup_error(
+            "Tracker NFT ID is not properly configured in the configuration file. The server \
+             requires a valid tracker_nft_id value.",
+        );
     }
 
     tracing::info!("Configuration loaded successfully");
@@ -97,11 +98,8 @@ async fn main() {
 
     // The tracker signs its commits and redemption signatures in-process: refuse to start
     // without a valid tracker secret key that belongs to the configured tracker public key.
-    // Printed to stderr as well, so the reason is visible whatever RUST_LOG says.
     if let Err(msg) = config.check_tracker_keys() {
-        eprintln!("{msg}");
-        tracing::error!("{}", msg);
-        std::process::exit(1);
+        exit_on_startup_error(&msg);
     }
 
     // Initialize real Ergo scanner with blockchain monitoring
@@ -1013,6 +1011,16 @@ async fn main() {
     }
 
     finish_shutdown(updater_task, tracker_thread).await
+}
+
+/// Stop a tracker that cannot start. Most of these checks run before tracing is initialised,
+/// when `tracing` output goes nowhere, so the reason is printed to stderr as well: `docker logs`
+/// and journald then show why the server exited, whatever RUST_LOG says. Callers never pass a
+/// secret value.
+fn exit_on_startup_error(msg: &str) -> ! {
+    eprintln!("basis_server: {msg}");
+    tracing::error!("{}", msg);
+    std::process::exit(1)
 }
 
 /// How long the shutdown waits for each of: open HTTP requests (TLS; plain HTTP requests are

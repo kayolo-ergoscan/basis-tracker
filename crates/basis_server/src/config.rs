@@ -375,6 +375,87 @@ fn reject_legacy_node_section(config: &config::Config) -> Result<(), config::Con
     Ok(())
 }
 
+/// Describe a configuration load error without the values it quotes.
+///
+/// The `config` crate and serde quote the value they could not use, and that value can be a
+/// secret written into the wrong field: `auth = "<api key>"` instead of `[server.auth]
+/// api_key = ...` gives `invalid type: string "<api key>", expected struct AuthConfig`. Startup
+/// prints this message to stderr, so strings, enum values and numbers from the configuration
+/// become `<redacted>`. Key and field names, the expected type and TOML line/column positions
+/// stay.
+pub fn config_error_without_values(e: &config::ConfigError) -> String {
+    match e {
+        config::ConfigError::Type {
+            origin,
+            expected,
+            key,
+            ..
+        } => {
+            let mut msg = format!("invalid type: <redacted>, expected {expected}");
+            if let Some(key) = key {
+                msg.push_str(&format!(" for key `{key}`"));
+            }
+            if let Some(origin) = origin {
+                msg.push_str(&format!(" in {origin}"));
+            }
+            msg
+        }
+        config::ConfigError::NotFound(key) => format!("configuration property `{key}` not found"),
+        other => {
+            let msg = other.to_string();
+            // `config` names an unknown enum value unquoted, at the end of the message.
+            const UNKNOWN_VARIANT: &str = "does not have variant constructor ";
+            match msg.find(UNKNOWN_VARIANT) {
+                Some(i) => format!("{}{UNKNOWN_VARIANT}<redacted>", &msg[..i]),
+                None => redact_quoted_values(&msg),
+            }
+        }
+    }
+}
+
+/// Replace every double-quoted string, and every backtick-quoted variant or number, with
+/// `<redacted>`. Backtick-quoted field and key names (`missing field `x``) are kept.
+fn redact_quoted_values(msg: &str) -> String {
+    // serde and `config` write a value in backticks after these words: "unknown variant `x`",
+    // "integer `5`", "integer 64 bit `5`", "floating point `1.5`", "character `c`".
+    const VALUE_BEFORE_BACKTICK: [&str; 5] =
+        ["variant ", "integer ", "bit ", "point ", "character "];
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(i) = rest.find(['"', '`']) {
+        let (before, from_quote) = rest.split_at(i);
+        out.push_str(before);
+        let quote = from_quote.as_bytes()[0] as char;
+        let body = &from_quote[1..];
+        // Debug-formatted strings escape `"` as `\"`; backticks are never escaped.
+        let mut end = None;
+        let mut escaped = false;
+        for (j, c) in body.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && quote == '"' {
+                escaped = true;
+            } else if c == quote {
+                end = Some(j);
+                break;
+            }
+        }
+        let Some(end) = end else {
+            // Unterminated: redact the rest rather than risk printing a value.
+            out.push(quote);
+            out.push_str("<redacted>");
+            return out;
+        };
+        let redact = quote == '"' || VALUE_BEFORE_BACKTICK.iter().any(|word| out.ends_with(word));
+        out.push(quote);
+        out.push_str(if redact { "<redacted>" } else { &body[..end] });
+        out.push(quote);
+        rest = &body[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 impl AppConfig {
     /// Load configuration from file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, config::ConfigError> {
@@ -1444,5 +1525,99 @@ mod tests {
         ] {
             assert!(!message.contains(&secret_hex[..16]), "{message}");
         }
+    }
+
+    /// Load `toml` the way the server does (file source, then deserialize into AppConfig) and
+    /// return the error as startup prints it.
+    fn printed_load_error(toml: &str) -> String {
+        let err = config::Config::builder()
+            .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+            .build()
+            .and_then(|c| c.try_deserialize::<AppConfig>())
+            .expect_err("config must not load");
+        config_error_without_values(&err)
+    }
+
+    const VALID_TOML: &str = r#"
+        [server]
+        host = "127.0.0.1"
+        port = 3048
+        [server.auth]
+        mode = "none"
+        [ergo]
+        basis_reserve_contract_p2s = "x"
+        basis_token_reserve_contract_p2s = ""
+        [ergo.scanner]
+        node_url = "http://127.0.0.1:9053"
+        [transaction]
+        fee = 1000000
+    "#;
+
+    #[test]
+    fn printed_config_errors_keep_the_key_but_not_the_value() {
+        const SECRET: &str = "Fake-Secret-4ad2b6f0";
+        // The base config loads, so each case below fails only on its own change.
+        config::Config::builder()
+            .add_source(config::File::from_str(VALID_TOML, config::FileFormat::Toml))
+            .build()
+            .unwrap()
+            .try_deserialize::<AppConfig>()
+            .unwrap();
+
+        let cases = [
+            // A secret where a table belongs: serde quotes the string.
+            (
+                VALID_TOML
+                    .replace("[server.auth]\n        mode = \"none\"", "")
+                    .replace(
+                        "port = 3048",
+                        &format!("port = 3048\n        auth = \"{SECRET}\""),
+                    ),
+                "auth",
+            ),
+            // A secret in a number field: the config crate quotes the string.
+            (
+                VALID_TOML.replace("port = 3048", &format!("port = \"{SECRET}\"")),
+                "server.port",
+            ),
+            // A secret as an enum value: `config` names it unquoted.
+            (
+                VALID_TOML.replace("mode = \"none\"", &format!("mode = \"{SECRET}\"")),
+                "authmode",
+            ),
+            // A string with an escaped quote must not end the redaction early.
+            (
+                VALID_TOML
+                    .replace("[server.auth]\n        mode = \"none\"", "")
+                    .replace(
+                        "port = 3048",
+                        &format!("port = 3048\n        auth = \"a\\\" {SECRET}\""),
+                    ),
+                "auth",
+            ),
+        ];
+        for (toml, kept) in cases {
+            let printed = printed_load_error(&toml);
+            assert!(!printed.contains(SECRET), "{printed}");
+            assert!(!printed.contains(&SECRET[5..15]), "{printed}");
+            assert!(printed.to_lowercase().contains(kept), "{printed}");
+            assert!(printed.contains("<redacted>"), "{printed}");
+        }
+
+        // A number where a table belongs is redacted too (a numeric API key).
+        let printed = printed_load_error(
+            &VALID_TOML
+                .replace("[server.auth]\n        mode = \"none\"", "")
+                .replace("port = 3048", "port = 3048\n        auth = 98765432123"),
+        );
+        assert!(!printed.contains("98765432123"), "{printed}");
+
+        // Names and positions are kept.
+        let printed = printed_load_error(&VALID_TOML.replace("fee = 1000000", ""));
+        assert!(printed.contains("missing field `fee`"), "{printed}");
+        let printed = printed_load_error(&VALID_TOML.replace("[ergo]", "[ergo]\n        typo = 1"));
+        assert!(printed.contains("unknown field `typo`"), "{printed}");
+        let printed = printed_load_error(&VALID_TOML.replace("port = 3048", "port = 3048 3049"));
+        assert!(printed.contains("line"), "{printed}");
     }
 }
