@@ -384,6 +384,8 @@ mod redemption_api_tests {
                 reserve_creation_max_erg_nano: 10_000_000_000,
                 reserve_creation_max_token_amount: 1_000_000_000,
                 redemption_build_max_per_pair_per_hour: 60,
+                redemption_build_max_per_issuer_per_hour: 6,
+                redemption_build_max_per_hour: 30,
             },
             ergo: basis_server::config::ErgoConfig {
                 scanner: basis_store::ergo_scanner::NodeConfig {
@@ -406,6 +408,7 @@ mod redemption_api_tests {
                 fee: 1000000,
                 change_address: None,
                 heartbeat_blocks: 720,
+                commit_reserve_nano: 100_000_000,
             },
             acceptance,
             redemption: basis_server::config::RedemptionConfig {

@@ -62,6 +62,14 @@ pub struct ServerConfig {
     /// wallet (the tracker pays the fee inputs). Default: 60.
     #[serde(default = "default_redemption_build_max_per_pair_per_hour")]
     pub redemption_build_max_per_pair_per_hour: u32,
+    /// Maximum `/redemption/build` calls per issuer per hour that get as far as signing fee
+    /// inputs. Default: 6.
+    #[serde(default = "default_redemption_build_max_per_issuer_per_hour")]
+    pub redemption_build_max_per_issuer_per_hour: u32,
+    /// Maximum `/redemption/build` calls per hour, all issuers together, that get as far as
+    /// signing fee inputs. Default: 30.
+    #[serde(default = "default_redemption_build_max_per_hour")]
+    pub redemption_build_max_per_hour: u32,
 }
 
 fn default_reserve_creation_max_erg_nano() -> u64 {
@@ -74,6 +82,16 @@ fn default_reserve_creation_max_token_amount() -> u64 {
 
 fn default_redemption_build_max_per_pair_per_hour() -> u32 {
     60
+}
+
+/// Default `[server] redemption_build_max_per_issuer_per_hour`.
+pub fn default_redemption_build_max_per_issuer_per_hour() -> u32 {
+    6
+}
+
+/// Default `[server] redemption_build_max_per_hour`.
+pub fn default_redemption_build_max_per_hour() -> u32 {
+    30
 }
 
 /// Authentication configuration.
@@ -303,11 +321,21 @@ pub struct TransactionConfig {
     /// window (`[transaction] heartbeat_blocks`, default 720; 0 disables).
     #[serde(default = "default_heartbeat_blocks")]
     pub heartbeat_blocks: u64,
+    /// Token-free nanoERG kept at the tracker address so commits and heartbeats can always pay
+    /// their fee: `/redemption/build` refuses (503) a build that would leave less there
+    /// (`[transaction] commit_reserve_nano`, default 100_000_000 = 0.1 ERG; 0 disables).
+    #[serde(default = "default_commit_reserve_nano")]
+    pub commit_reserve_nano: u64,
 }
 
 /// Default `[transaction] heartbeat_blocks`: 720 blocks, about a day.
 pub fn default_heartbeat_blocks() -> u64 {
     720
+}
+
+/// Default `[transaction] commit_reserve_nano`: 0.1 ERG, about a hundred commits.
+pub fn default_commit_reserve_nano() -> u64 {
+    100_000_000
 }
 
 /// Blocks after the tracker box creation height at which emergency redemption opens.
@@ -1036,6 +1064,8 @@ mod tests {
                 reserve_creation_max_token_amount: default_reserve_creation_max_token_amount(),
                 redemption_build_max_per_pair_per_hour:
                     default_redemption_build_max_per_pair_per_hour(),
+                redemption_build_max_per_issuer_per_hour: 6,
+                redemption_build_max_per_hour: 30,
             },
             ergo: ErgoConfig {
                 scanner: NodeConfig {
@@ -1062,6 +1092,7 @@ mod tests {
                 fee: 1000000,
                 change_address: None,
                 heartbeat_blocks: default_heartbeat_blocks(),
+                commit_reserve_nano: 100_000_000,
             },
             acceptance: AcceptanceConfig::empty(),
             redemption: RedemptionConfig::default(),
@@ -1127,6 +1158,8 @@ mod tests {
                 reserve_creation_max_token_amount: default_reserve_creation_max_token_amount(),
                 redemption_build_max_per_pair_per_hour:
                     default_redemption_build_max_per_pair_per_hour(),
+                redemption_build_max_per_issuer_per_hour: 6,
+                redemption_build_max_per_hour: 30,
             },
             ergo: ErgoConfig {
                 scanner: NodeConfig {
@@ -1153,6 +1186,7 @@ mod tests {
                 fee: 1000000,
                 change_address: None,
                 heartbeat_blocks: default_heartbeat_blocks(),
+                commit_reserve_nano: 100_000_000,
             },
             acceptance: AcceptanceConfig::empty(),
             redemption: RedemptionConfig::default(),
@@ -1274,6 +1308,8 @@ mod tests {
                 reserve_creation_max_token_amount: default_reserve_creation_max_token_amount(),
                 redemption_build_max_per_pair_per_hour:
                     default_redemption_build_max_per_pair_per_hour(),
+                redemption_build_max_per_issuer_per_hour: 6,
+                redemption_build_max_per_hour: 30,
             },
             ergo: ErgoConfig {
                 scanner: NodeConfig::default(),
@@ -1291,6 +1327,7 @@ mod tests {
                 fee: 1000000,
                 change_address: None,
                 heartbeat_blocks: default_heartbeat_blocks(),
+                commit_reserve_nano: 100_000_000,
             },
             acceptance: AcceptanceConfig::empty(),
             redemption: RedemptionConfig::default(),

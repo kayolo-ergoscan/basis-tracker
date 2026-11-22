@@ -18,6 +18,10 @@ database_url = "sqlite:data/basis.db"
 # Maximum /redemption/build calls per (issuer, recipient) pair per hour; bounds the
 # fee cost a self-redeeming user can impose on the tracker wallet (default 60).
 # redemption_build_max_per_pair_per_hour = 60
+# Maximum /redemption/build calls per issuer, and in total, per hour that get as far as
+# signing fee inputs (defaults 6 and 30). Requests that fail earlier do not count.
+# redemption_build_max_per_issuer_per_hour = 6
+# redemption_build_max_per_hour = 30
 
 [server.auth]
 # Authentication mode: "none", "api_key", or "signature".
@@ -103,6 +107,10 @@ fee = 1000000
 # tracker recommits the unchanged digest, so the box never reaches the 2160-block emergency
 # redemption window. Each heartbeat costs one fee. Default 720 (about a day); 0 disables.
 # heartbeat_blocks = 720
+# Token-free nanoERG kept at the tracker address for commits and heartbeats:
+# /redemption/build refuses (503) a build that would leave less there.
+# Default 100000000 (0.1 ERG); 0 disables.
+# commit_reserve_nano = 100000000
 
 [redemption]
 # Enforce acceptance-policy compliance at redemption time: reject redemptions that

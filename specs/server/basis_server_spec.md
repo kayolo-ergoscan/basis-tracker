@@ -321,6 +321,13 @@ Key configuration includes:
   tokens); larger requests are rejected with HTTP 400.
 - **`server.redemption_build_max_per_pair_per_hour`**: per-(issuer, recipient) rate limit on
   `POST /redemption/build` (default 60/hour, rolling window); excess requests get HTTP 429.
+- **`server.redemption_build_max_per_issuer_per_hour`** / **`server.redemption_build_max_per_hour`**:
+  per-issuer and total caps on the builds that get as far as signing fee inputs (defaults 6 and
+  30 per hour, rolling window); excess requests get HTTP 429. Requests that fail before signing
+  (no note, no reserve) do not use these budgets.
+- **`transaction.commit_reserve_nano`**: token-free nanoERG kept at the tracker address for
+  commits and heartbeats (default 0.1 ERG; 0 disables). A build that would leave less there gets
+  HTTP 503.
 - **Ergo node connection details**: `ergo.scanner.node_url` defaults to `http://127.0.0.1:9053`; point it at your Ergo node (with `extraIndex = true`) for real deployments. Only the `POST /transactions` broadcast goes to `ergo.wallet.node_url`, which falls back to the scanner node when unset; no `/wallet/*` or `/utils/schnorrSign` endpoint is used and no node API key is needed.
 - Reserve contract P2S address
 - Tracker NFT ID (for tracker scanner registration and state commitment monitoring)

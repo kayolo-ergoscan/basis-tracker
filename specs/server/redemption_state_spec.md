@@ -513,7 +513,17 @@ ignored for signing. The endpoint returns `404 Not Found` when there is no store
 (fail-closed against per-reserve replay), and `429 Too Many Requests` when the per-(issuer,
 recipient) rate limit is exceeded — `server.redemption_build_max_per_pair_per_hour`, default 60
 per hour over a rolling window (the tracker funds the fee inputs, so unbounded building would
-drain its wallet).
+drain its wallet). Builds that get as far as signing fee inputs also count against their issuer
+(`server.redemption_build_max_per_issuer_per_hour`, default 6) and against all builds together
+(`server.redemption_build_max_per_hour`, default 30), both per rolling hour and answered with
+`429` when reached; requests that fail before that do not use these budgets. The per-pair window
+forgets pairs with no build in the last hour and keeps at most 10 000 pairs.
+
+**Fee floor:** commits and heartbeats pay from the same token-free boxes as the build's fee
+inputs. The build counts those boxes (the fee scan reads on until it has seen the build's cost
+plus the reserve) and answers `503 Service Unavailable` when the build would leave less than
+`[transaction] commit_reserve_nano` (default 0.1 ERG; 0 disables) at the tracker address,
+counting the change that returns there.
 
 ### POST /redemption/submit
 

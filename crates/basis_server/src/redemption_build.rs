@@ -571,19 +571,105 @@ impl PendingRedemptionRegistry {
 
 // ----- per-pair build rate limiter (PR #16 M1) -----
 
-/// Sliding-window rate limiter for `/redemption/build`, keyed by (issuer, recipient).
+/// The rolling window of every `/redemption/build` limit.
+const BUILD_WINDOW: Duration = Duration::from_secs(3600);
+/// How often all windows are swept for keys with no attempt left in [`BUILD_WINDOW`].
+const BUILD_WINDOW_SWEEP_EVERY: Duration = Duration::from_secs(60);
+/// Most (issuer, recipient) pairs the per-pair window keeps. When it is full of pairs that
+/// built within the hour, the pair whose latest attempt is the oldest makes room: memory stays
+/// bounded, and the per-issuer and total caps still bound what builds cost the tracker.
+const MAX_TRACKED_BUILD_PAIRS: usize = 10_000;
+
+/// Rolling one-hour limits for `/redemption/build`.
 ///
 /// The tracker pays the fee inputs of every build out of its own wallet, so an unbounded
-/// caller could drain it one fee at a time with self-redemption builds.
+/// caller could drain it one fee at a time with self-redemption builds:
+/// - every attempt counts against its (issuer, recipient) pair
+///   (`server.redemption_build_max_per_pair_per_hour`, [`Self::check_and_record`]);
+/// - a build about to sign fee inputs also counts against its issuer
+///   (`server.redemption_build_max_per_issuer_per_hour`) and against all builds together
+///   (`server.redemption_build_max_per_hour`), [`Self::check_and_record_fee_signing`].
+///   Requests that fail before that point (no note, no reserve) use neither budget, so they
+///   cannot lock everyone else out.
+///
+/// Keys with no attempt in the last hour are dropped, so the maps stay bounded.
 #[derive(Debug, Default)]
 pub struct BuildRateLimiter {
-    buckets: std::sync::Mutex<HashMap<(String, String), Vec<Instant>>>,
+    windows: std::sync::Mutex<BuildWindows>,
+}
+
+#[derive(Debug, Default)]
+struct BuildWindows {
+    pairs: HashMap<(String, String), Vec<Instant>>,
+    issuers: HashMap<String, Vec<Instant>>,
+    all: Vec<Instant>,
+    swept_at: Option<Instant>,
+}
+
+/// Drop the attempts that left the window.
+fn keep_recent(attempts: &mut Vec<Instant>, now: Instant) {
+    attempts.retain(|t| now.duration_since(*t) < BUILD_WINDOW);
+}
+
+impl BuildWindows {
+    /// Drop every attempt that left the window, and every key left without one.
+    fn sweep(&mut self, now: Instant) {
+        self.pairs.retain(|_, attempts| {
+            keep_recent(attempts, now);
+            !attempts.is_empty()
+        });
+        self.issuers.retain(|_, attempts| {
+            keep_recent(attempts, now);
+            !attempts.is_empty()
+        });
+        keep_recent(&mut self.all, now);
+        self.swept_at = Some(now);
+    }
+
+    fn sweep_when_due(&mut self, now: Instant) {
+        let due = self
+            .swept_at
+            .is_none_or(|t| now.duration_since(t) >= BUILD_WINDOW_SWEEP_EVERY);
+        if due {
+            self.sweep(now);
+        }
+    }
+
+    /// Why a build for `issuer` may not sign fee inputs now, if it may not.
+    fn fee_signing_refusal(
+        &mut self,
+        issuer: &str,
+        now: Instant,
+        max_per_issuer: u32,
+        max_total: u32,
+    ) -> Option<String> {
+        keep_recent(&mut self.all, now);
+        if self.all.len() >= max_total as usize {
+            return Some(format!(
+                "rate limit exceeded: at most {max_total} redemption builds per hour in total"
+            ));
+        }
+        let issuer_builds = self.issuers.get_mut(issuer).map_or(0, |attempts| {
+            keep_recent(attempts, now);
+            attempts.len()
+        });
+        if issuer_builds >= max_per_issuer as usize {
+            return Some(format!(
+                "rate limit exceeded: at most {max_per_issuer} redemption builds per hour per issuer"
+            ));
+        }
+        None
+    }
 }
 
 impl BuildRateLimiter {
     /// Create an empty limiter.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BuildWindows> {
+        self.windows.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Record a build attempt for `(issuer, recipient)`; returns Err when the pair has reached
@@ -594,12 +680,25 @@ impl BuildRateLimiter {
         recipient: &str,
         max_per_hour: u32,
     ) -> Result<(), String> {
-        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut windows = self.lock();
         let now = Instant::now();
-        let window = Duration::from_secs(3600);
+        windows.sweep_when_due(now);
         let key = (issuer.to_string(), recipient.to_string());
-        let attempts = buckets.entry(key).or_default();
-        attempts.retain(|t| now.duration_since(*t) < window);
+        if !windows.pairs.contains_key(&key) && windows.pairs.len() >= MAX_TRACKED_BUILD_PAIRS {
+            windows.sweep(now);
+            if windows.pairs.len() >= MAX_TRACKED_BUILD_PAIRS {
+                let stalest = windows
+                    .pairs
+                    .iter()
+                    .min_by_key(|(_, attempts)| attempts.last().copied())
+                    .map(|(pair, _)| pair.clone());
+                if let Some(pair) = stalest {
+                    windows.pairs.remove(&pair);
+                }
+            }
+        }
+        let attempts = windows.pairs.entry(key).or_default();
+        keep_recent(attempts, now);
         if attempts.len() >= max_per_hour as usize {
             return Err(format!(
                 "rate limit exceeded: at most {} redemption builds per hour per \
@@ -610,6 +709,71 @@ impl BuildRateLimiter {
         attempts.push(now);
         Ok(())
     }
+
+    /// Err when a build for `issuer` could not sign fee inputs now (see
+    /// [`Self::check_and_record_fee_signing`]); records nothing. Lets a build stop before any
+    /// node request once a cap is reached.
+    pub fn check_fee_signing(
+        &self,
+        issuer: &str,
+        max_per_issuer: u32,
+        max_total: u32,
+    ) -> Result<(), String> {
+        let refusal =
+            self.lock()
+                .fee_signing_refusal(issuer, Instant::now(), max_per_issuer, max_total);
+        refusal.map_or(Ok(()), Err)
+    }
+
+    /// Record a build for `issuer` that is about to sign fee inputs; returns Err, recording
+    /// nothing, when `issuer` has had `max_per_issuer` such builds within the last rolling hour
+    /// or all issuers together `max_total`.
+    pub fn check_and_record_fee_signing(
+        &self,
+        issuer: &str,
+        max_per_issuer: u32,
+        max_total: u32,
+    ) -> Result<(), String> {
+        let mut windows = self.lock();
+        let now = Instant::now();
+        windows.sweep_when_due(now);
+        if let Some(refusal) = windows.fee_signing_refusal(issuer, now, max_per_issuer, max_total) {
+            return Err(refusal);
+        }
+        windows.all.push(now);
+        windows
+            .issuers
+            .entry(issuer.to_string())
+            .or_default()
+            .push(now);
+        Ok(())
+    }
+}
+
+/// Room kept on top of a build's cost when the fee scan counts the tracker's balance: change
+/// that cannot form a box goes to the fee (at most the minimum value of a change box, far
+/// below this), and the scan must see past it to compare the balance with the reserve.
+const FEE_FLOOR_SCAN_MARGIN: u64 = 1_000_000;
+
+/// Why a build may not spend the tracker's fee boxes, if it may not: `seen` is the token-free
+/// value the fee scan counted at the tracker address (a lower bound: the scan stops once it has
+/// enough), `spent` the selected fee inputs, and `change_back` the change that returns to the
+/// tracker address. Commits and heartbeats pay from the same boxes, so a build that would leave
+/// less than `commit_reserve` there is refused.
+fn fee_floor_refusal(
+    seen: u64,
+    spent: u64,
+    change_back: u64,
+    commit_reserve: u64,
+) -> Option<String> {
+    let after = seen.saturating_sub(spent).saturating_add(change_back);
+    (after < commit_reserve).then(|| {
+        format!(
+            "the tracker is low on fee funds: this build would leave {after} nanoERG at the \
+             tracker address, below the {commit_reserve} nanoERG kept for its commits \
+             ([transaction] commit_reserve_nano). Try again once the tracker address is funded."
+        )
+    })
 }
 
 /// Select wallet boxes covering the required fee, excluding the reserve box and token-bearing boxes.
@@ -915,6 +1079,15 @@ async fn build_redemption_inner(
         &hex::encode(issuer_pk),
         &hex::encode(recipient_pk),
         state.config.server.redemption_build_max_per_pair_per_hour,
+    ) {
+        return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
+    }
+    // The per-issuer and total caps count builds that sign fee inputs (recorded right before
+    // signing); once one is reached, stop here, before any node request.
+    if let Err(msg) = state.redemption_build_rate.check_fee_signing(
+        &hex::encode(issuer_pk),
+        state.config.server.redemption_build_max_per_issuer_per_hour,
+        state.config.server.redemption_build_max_per_hour,
     ) {
         return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
@@ -1470,12 +1643,14 @@ async fn build_redemption_inner(
         .map(String::as_str)
         .chain([tracker_box_id.as_str(), reserve_box_id.as_str()])
         .collect();
+    // The scan reads on until it has counted the reserve kept for commits on top of what this
+    // build spends, so the fee floor below can be checked from the boxes it returns.
+    let commit_reserve = state.config.transaction.commit_reserve_nano;
+    let scan_enough = fee_input_required
+        .saturating_add(commit_reserve)
+        .saturating_add(FEE_FLOOR_SCAN_MARGIN);
     let wallet_boxes = match chain_node
-        .tracker_fee_boxes(
-            &tracker_pubkey_for_fees,
-            fee_input_required,
-            &fee_exclusions,
-        )
+        .tracker_fee_boxes(&tracker_pubkey_for_fees, scan_enough, &fee_exclusions)
         .await
     {
         Ok(b) => b,
@@ -1715,6 +1890,22 @@ async fn build_redemption_inner(
             Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
         };
 
+    // Commits and heartbeats pay from the same token-free boxes: never leave less than
+    // `[transaction] commit_reserve_nano` there.
+    let tracker_tree_hex = crate::local_wallet::p2pk_tree_hex(&tracker_pubkey_for_fees);
+    let fee_funds_seen = wallet_boxes
+        .iter()
+        .fold(0u64, |acc, b| acc.saturating_add(b.value));
+    let change_back = if change_ergo_tree.eq_ignore_ascii_case(&tracker_tree_hex) {
+        change_amount
+    } else {
+        0
+    };
+    if let Some(msg) = fee_floor_refusal(fee_funds_seen, fee_total, change_back, commit_reserve) {
+        tracing::warn!("Refusing a redemption build: {msg}");
+        return api_err(StatusCode::SERVICE_UNAVAILABLE, msg);
+    }
+
     // Inputs: reserve (index 0) then fee inputs.
     let mut inputs = vec![json!({ "boxId": reserve_box_id, "extension": context_extension })];
     for fb in &fee_boxes {
@@ -1836,7 +2027,6 @@ async fn build_redemption_inner(
     input_boxes.extend(fee_eboxes);
     let data_boxes = vec![tracker_ebox];
 
-    let tracker_tree_hex = crate::local_wallet::p2pk_tree_hex(&tracker_pubkey_for_fees);
     if let Err(e) =
         check_before_fee_signing(&unsigned, &input_boxes, &tracker_tree_hex, current_height)
     {
@@ -1845,6 +2035,13 @@ async fn build_redemption_inner(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("refusing to sign the fee inputs: {e}"),
         );
+    }
+    if let Err(msg) = state.redemption_build_rate.check_and_record_fee_signing(
+        &hex::encode(issuer_pk),
+        state.config.server.redemption_build_max_per_issuer_per_hour,
+        state.config.server.redemption_build_max_per_hour,
+    ) {
+        return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
     }
 
     let pre_header = state_context.pre_header.clone();
@@ -2417,13 +2614,132 @@ mod tests {
     fn build_rate_limiter_prunes_attempts_older_than_an_hour() {
         let limiter = BuildRateLimiter::new();
         {
-            let mut buckets = limiter.buckets.lock().unwrap();
-            buckets.insert(
+            let mut windows = limiter.windows.lock().unwrap();
+            windows.pairs.insert(
                 ("issuer".to_string(), "recipient".to_string()),
                 vec![Instant::now() - Duration::from_secs(3601)],
             );
         }
         assert!(limiter.check_and_record("issuer", "recipient", 1).is_ok());
+    }
+
+    fn an_hour_ago() -> Instant {
+        Instant::now() - Duration::from_secs(3601)
+    }
+
+    /// Pairs with no build in the last hour are dropped, and a full window makes room for a new
+    /// pair by dropping the pair whose latest build is the oldest: the map stays bounded.
+    #[test]
+    fn build_rate_limiter_forgets_old_pairs_and_stays_bounded() {
+        let limiter = BuildRateLimiter::new();
+        {
+            let mut windows = limiter.windows.lock().unwrap();
+            for i in 0..100 {
+                windows
+                    .pairs
+                    .insert((format!("old-{i}"), "r".to_string()), vec![an_hour_ago()]);
+            }
+        }
+        limiter.check_and_record("issuer", "recipient", 5).unwrap();
+        assert_eq!(limiter.windows.lock().unwrap().pairs.len(), 1, "swept");
+
+        // Fill the window with pairs that built within the hour.
+        {
+            let mut windows = limiter.windows.lock().unwrap();
+            let start = Instant::now() - Duration::from_secs(1800);
+            for i in 0..MAX_TRACKED_BUILD_PAIRS - 1 {
+                let at = start + Duration::from_millis(i as u64);
+                windows
+                    .pairs
+                    .insert((format!("p-{i}"), "r".to_string()), vec![at]);
+            }
+            assert_eq!(windows.pairs.len(), MAX_TRACKED_BUILD_PAIRS);
+        }
+        limiter.check_and_record("new", "pair", 5).unwrap();
+        let windows = limiter.windows.lock().unwrap();
+        assert_eq!(windows.pairs.len(), MAX_TRACKED_BUILD_PAIRS);
+        assert!(!windows
+            .pairs
+            .contains_key(&("p-0".to_string(), "r".to_string())));
+        assert!(windows
+            .pairs
+            .contains_key(&("new".to_string(), "pair".to_string())));
+        assert!(windows
+            .pairs
+            .contains_key(&("issuer".to_string(), "recipient".to_string())));
+    }
+
+    #[test]
+    fn fee_signing_is_capped_per_issuer_and_in_total() {
+        let limiter = BuildRateLimiter::new();
+        for _ in 0..2 {
+            limiter.check_and_record_fee_signing("a", 2, 3).unwrap();
+        }
+        let err = limiter.check_fee_signing("a", 2, 3).unwrap_err();
+        assert!(
+            err.contains("2 redemption builds per hour per issuer"),
+            "{err}"
+        );
+        let err = limiter.check_and_record_fee_signing("a", 2, 3).unwrap_err();
+        assert!(err.contains("per issuer"), "{err}");
+
+        // Another issuer has its own budget, until the total is used up.
+        limiter.check_fee_signing("b", 2, 3).unwrap();
+        limiter.check_and_record_fee_signing("b", 2, 3).unwrap();
+        let err = limiter.check_and_record_fee_signing("c", 2, 3).unwrap_err();
+        assert!(
+            err.contains("3 redemption builds per hour in total"),
+            "{err}"
+        );
+        assert!(limiter.check_fee_signing("c", 2, 3).is_err());
+
+        // Refusals recorded nothing; builds older than an hour no longer count.
+        {
+            let mut windows = limiter.windows.lock().unwrap();
+            assert_eq!(windows.all.len(), 3);
+            windows.all = vec![an_hour_ago(); 3];
+            windows
+                .issuers
+                .insert("a".to_string(), vec![an_hour_ago(); 2]);
+        }
+        limiter.check_and_record_fee_signing("a", 2, 3).unwrap();
+        limiter.check_and_record_fee_signing("c", 2, 3).unwrap();
+    }
+
+    /// Per-pair attempts (builds that may still fail before fee signing) do not use the
+    /// issuer's or the total budget.
+    #[test]
+    fn per_pair_attempts_do_not_use_the_signing_budgets() {
+        let limiter = BuildRateLimiter::new();
+        for i in 0..50 {
+            limiter
+                .check_and_record("issuer", &format!("recipient-{i}"), 60)
+                .unwrap();
+        }
+        limiter
+            .check_and_record_fee_signing("issuer", 1, 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_fee_floor_keeps_the_commit_reserve_at_the_tracker_address() {
+        let reserve = 100_000_000;
+        // 0.2 ERG seen, a 0.05 ERG box spent, 0.049 ERG change back: 0.199 ERG left.
+        assert_eq!(
+            fee_floor_refusal(200_000_000, 50_000_000, 49_000_000, reserve),
+            None
+        );
+        // Exactly the reserve left.
+        assert_eq!(fee_floor_refusal(101_000_000, 1_000_000, 0, reserve), None);
+        // 1 nanoERG short.
+        let msg = fee_floor_refusal(100_999_999, 1_000_000, 0, reserve).unwrap();
+        assert!(msg.contains("leave 99999999 nanoERG"), "{msg}");
+        assert!(msg.contains("commit_reserve_nano"), "{msg}");
+        // Change sent elsewhere: the tracker address loses the whole box.
+        assert!(fee_floor_refusal(150_000_000, 100_000_000, 0, reserve).is_some());
+        assert!(fee_floor_refusal(150_000_000, 100_000_000, 99_000_000, reserve).is_none());
+        // 0 disables the floor.
+        assert_eq!(fee_floor_refusal(1_000_000, 1_000_000, 0, 0), None);
     }
 
     // ------------------------------------------------------------------

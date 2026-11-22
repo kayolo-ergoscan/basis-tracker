@@ -132,6 +132,7 @@ for fees.
 fee = 1000000              # Miner fee in nanoERG for the tracker's own transactions (0.001 ERG)
 # change_address = "9..."  # Change of the fee boxes; default: P2PK(tracker_public_key)
 # heartbeat_blocks = 720   # Recommit an unchanged digest at this tracker box age; 0 disables
+# commit_reserve_nano = 100000000  # Kept at the tracker address for commits; 0 disables
 ```
 
 The tracker commits its AVL root digest to the tracker box whenever the digest changes.
@@ -157,6 +158,11 @@ confirmations do not change.
 
 `change_address`, when set, receives the change of the fee boxes. Leave it unset to keep
 the change at the tracker address, where the next commit can spend it.
+
+`commit_reserve_nano` (default 0.1 ERG) keeps commits and heartbeats paid: redemption
+builds pay their fee inputs from the same token-free boxes at the tracker address, and
+`POST /redemption/build` answers 503 when a build would leave less than this there. Fund
+the tracker address above it; `0` disables the floor.
 
 ### Redemption Configuration
 

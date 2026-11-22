@@ -695,6 +695,8 @@ async fn create_test_app(
             reserve_creation_max_erg_nano: 10_000_000_000,
             reserve_creation_max_token_amount: 1_000_000_000,
             redemption_build_max_per_pair_per_hour: 60,
+            redemption_build_max_per_issuer_per_hour: 6,
+            redemption_build_max_per_hour: 30,
         },
         ergo: config::ErgoConfig {
             scanner: NodeConfig {
@@ -713,6 +715,7 @@ async fn create_test_app(
             fee: 1000000,
             change_address: None,
             heartbeat_blocks: 720,
+            commit_reserve_nano: 100_000_000,
         },
         acceptance: acceptance::config::AcceptanceConfig::empty(),
         redemption: config::RedemptionConfig::default(),
@@ -800,6 +803,8 @@ async fn create_test_app_with_policy_routes(
             reserve_creation_max_erg_nano: 10_000_000_000,
             reserve_creation_max_token_amount: 1_000_000_000,
             redemption_build_max_per_pair_per_hour: 60,
+            redemption_build_max_per_issuer_per_hour: 6,
+            redemption_build_max_per_hour: 30,
         },
         ergo: config::ErgoConfig {
             scanner: NodeConfig {
@@ -818,6 +823,7 @@ async fn create_test_app_with_policy_routes(
             fee: 1000000,
             change_address: None,
             heartbeat_blocks: 720,
+            commit_reserve_nano: 100_000_000,
         },
         acceptance: acceptance::config::AcceptanceConfig::empty(),
         redemption: config::RedemptionConfig::default(),
@@ -911,6 +917,8 @@ async fn create_test_app_with_all_routes(
             reserve_creation_max_erg_nano: 10_000_000_000,
             reserve_creation_max_token_amount: 1_000_000_000,
             redemption_build_max_per_pair_per_hour: 60,
+            redemption_build_max_per_issuer_per_hour: 6,
+            redemption_build_max_per_hour: 30,
         },
         ergo: config::ErgoConfig {
             scanner: NodeConfig {
@@ -929,6 +937,7 @@ async fn create_test_app_with_all_routes(
             fee: 1000000,
             change_address: None,
             heartbeat_blocks: 720,
+            commit_reserve_nano: 100_000_000,
         },
         acceptance: acceptance::config::AcceptanceConfig::empty(),
         redemption: config::RedemptionConfig::default(),
