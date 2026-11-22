@@ -1951,18 +1951,22 @@ pub async fn upload_policy(
     let mut signature: Signature = [0u8; 65];
     signature.copy_from_slice(&signature_bytes);
 
-    // Parse policy JSON to validate structure
+    // Round 4 (C1): validate the policy completely before anything is stored: at most 8 KiB,
+    // an explicit root, unique names, a reference tree reachable from the root, depth <= 8,
+    // <= 32 predicates, <= 16 references per composite, <= 256 holders, valid holder keys.
     let policy_config: basis_core::acceptance::AcceptanceConfig =
-        match parse_acceptance_policy_json(&payload.policy_json) {
+        match crate::acceptance::validate::parse_and_validate_policy_json(&payload.policy_json) {
             Ok(config) => config,
             Err(e) => {
+                let message = if e.is_json_error() {
+                    format!("Invalid policy JSON: {}", e)
+                } else {
+                    format!("Invalid policy structure: {}", e)
+                };
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(crate::models::error_response(format!(
-                        "Invalid policy JSON: {}",
-                        e
-                    ))),
-                )
+                    Json(crate::models::error_response(message)),
+                );
             }
         };
 
@@ -2029,27 +2033,14 @@ pub async fn upload_policy(
         }
     }
 
-    // Build a new predicate tree from the uploaded policy for validation
-    match crate::acceptance::builder::build_predicate_tree(policy_config) {
-        Ok(Some(predicate)) => {
-            tracing::info!(
-                "Built predicate tree from uploaded policy: '{}'",
-                predicate.name()
-            );
-        }
-        Ok(None) => {
-            tracing::info!("Empty policy uploaded for {}", payload.recipient_pubkey);
-        }
-        Err(e) => {
-            tracing::warn!("Failed to build predicate tree from uploaded policy: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(crate::models::error_response(format!(
-                    "Invalid policy structure: {}",
-                    e
-                ))),
-            );
-        }
+    match policy_config.root.as_deref() {
+        Some(root) => tracing::info!(
+            "Stored policy for {}: root '{}', {} predicates",
+            payload.recipient_pubkey,
+            root,
+            policy_config.predicates.len()
+        ),
+        None => tracing::info!("Empty policy uploaded for {}", payload.recipient_pubkey),
     }
 
     let response = UploadPolicyResponse {

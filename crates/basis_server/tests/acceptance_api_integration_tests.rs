@@ -502,6 +502,88 @@ async fn test_get_policy_invalid_pubkey() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+/// Round 4 (C1): an invalid policy is refused BEFORE anything is stored. Before, the policy was
+/// stored first and its structure checked after, so a 400 left the cyclic policy in storage,
+/// where the redemption check recursed on it.
+#[tokio::test]
+async fn an_invalid_policy_is_refused_and_not_stored() {
+    use secp256k1::{Secp256k1, SecretKey};
+
+    let app = create_test_app_with_policy_routes(None).await;
+    let secp = Secp256k1::new();
+    let recipient_secret = SecretKey::new(&mut secp256k1::rand::thread_rng());
+    let recipient_pubkey_hex = hex::encode(
+        secp256k1::PublicKey::from_secret_key(&secp, &recipient_secret).serialize(),
+    );
+
+    let upload = |policy_json: String| {
+        let signature_hex = hex::encode(sign_policy_with_key(
+            policy_json.as_bytes(),
+            &recipient_secret,
+        ));
+        Request::builder()
+            .method(Method::POST)
+            .uri("/acceptance/policy")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                json!({
+                    "recipient_pubkey": recipient_pubkey_hex,
+                    "policy_json": policy_json,
+                    "signature": signature_hex
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let cases = [
+        // A cycle through the root.
+        (
+            r#"{"root":"a","predicates":[{"type":"not","name":"a","predicate":"a"}]}"#.to_string(),
+            "Invalid policy structure: root 'a' is referenced",
+        ),
+        // No explicit root.
+        (
+            r#"{"predicates":[{"type":"no_pending_refund","name":"a"}]}"#.to_string(),
+            "Invalid policy structure: the policy has predicates but no root",
+        ),
+        // Over 8 KiB.
+        (
+            format!(
+                r#"{{"root":"a","predicates":[{{"type":"no_pending_refund","name":"{}"}}]}}"#,
+                "a".repeat(9000)
+            ),
+            "Invalid policy JSON: policy JSON is",
+        ),
+    ];
+    for (policy_json, expected) in cases {
+        let response = app.clone().oneshot(upload(policy_json)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains(expected), "{error}");
+
+        let get = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/acceptance/policy/{}", recipient_pubkey_hex))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a refused policy must not be stored"
+        );
+    }
+
+    // A valid tree is stored.
+    let valid = r#"{"root":"top","predicates":[{"type":"no_pending_refund","name":"calm"},{"type":"collateralization","name":"full","min_ratio":1.0},{"type":"all_of","name":"top","predicates":["calm","full"]}]}"#;
+    let response = app.clone().oneshot(upload(valid.to_string())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 // ============================================================================
 // Per-recipient policy integration with check_acceptance
 // ============================================================================

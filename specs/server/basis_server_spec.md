@@ -103,7 +103,11 @@ fjall keyspace waits up to one fsync interval to close.
 ### Acceptance Policy Endpoints
 
 - `POST /acceptance/check` - Check whether a hypothetical note would be accepted by the issuer's policy
-- `POST /acceptance/policy` - Upload or replace an acceptance policy
+- `POST /acceptance/policy` - Upload or replace an acceptance policy. Validated before it is
+  stored (round 4, C1): JSON at most 8 KiB, explicit `root`, unique names, a reference tree
+  in which every predicate is referenced once and reachable from the root, depth at most 8, at
+  most 32 predicates, 16 references per composite and 256 holders. Stored policies are
+  re-checked at startup and invalid ones dropped with a warning
 - `GET /acceptance/policy/{pubkey}` - Get the stored acceptance policy for a public key
 
 ### Configuration Endpoints

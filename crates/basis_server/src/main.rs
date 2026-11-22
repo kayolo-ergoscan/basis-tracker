@@ -776,6 +776,19 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+    // Round 4 (C1): stored policies must pass the same validation as new uploads; invalid ones
+    // are dropped with a warning each.
+    let (kept, dropped) =
+        basis_server::acceptance::validate::recheck_stored_policies(&policy_storage);
+    if dropped > 0 {
+        tracing::warn!(
+            "Stored acceptance policies re-checked: {} kept, {} dropped",
+            kept,
+            dropped
+        );
+    } else {
+        tracing::info!("Stored acceptance policies re-checked: {} kept", kept);
+    }
 
     let app_state = AppState {
         tx,

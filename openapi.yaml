@@ -1276,7 +1276,17 @@ paths:
   /acceptance/policy:
     post:
       summary: Upload acceptance policy
-      description: Upload or update a recipient's acceptance policy JSON, signed by the recipient.
+      description: >-
+        Upload or update a recipient's acceptance policy JSON, signed by the recipient. The policy
+        is validated before anything is stored (400 otherwise): `policy_json` at most 8192 bytes;
+        unique, non-empty predicate names; `root` naming the top predicate (an empty policy, with
+        no predicates, names no root and rejects every note); the references form a tree, so
+        every reference names a predicate of the policy, every predicate except the root is
+        referenced exactly once, the root never, and every predicate is reachable from the root;
+        at most 8 predicates on any root-to-leaf path, at most 32 predicates, at most 16
+        references per composite and at most 256 whitelist and blacklist holders in all; holder
+        keys are 33-byte hex. Stored policies are re-checked at startup, and invalid ones are
+        dropped with a warning (the recipient then falls back to the global policy).
       operationId: uploadPolicy
       tags:
         - Acceptance
@@ -1294,7 +1304,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseUploadPolicy'
         '400':
-          description: Bad request - invalid input parameters
+          description: >-
+            Bad request - invalid input parameters. "Invalid policy JSON: ..." when policy_json
+            is over 8192 bytes or does not parse; "Invalid policy structure: ..." when the policy
+            breaks a structural rule, which the message names
           content:
             application/json:
               schema:
