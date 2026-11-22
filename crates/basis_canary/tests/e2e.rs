@@ -165,9 +165,11 @@ impl MockNode {
             ("POST", "/transactions") => self.submit(body),
             ("POST", "/wallet/transactions") => {
                 if self.wallet_rejects.load(Ordering::SeqCst) {
+                    // A definite refusal: a 4xx. Since round 5b (F7) a 5xx leaves the tracker
+                    // unsure whether the node has the transaction, so it keeps it journaled.
                     (
-                        503,
-                        json!({"error": 503, "reason": "broadcast node unavailable"}).to_string(),
+                        400,
+                        json!({"error": 400, "reason": "broadcast refused"}).to_string(),
                     )
                 } else {
                     self.submit(body)
