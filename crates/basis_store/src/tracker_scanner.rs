@@ -15,7 +15,7 @@ use reqwest::Client;
 use crate::{
     ergo_scanner::{IndexedErgoBox, ScanBox},
     persistence::{ScannerMetadataStorage, TrackerStorage},
-    TrackerBoxInfo, TrackerStateManager,
+    TrackerBoxInfo,
 };
 
 #[derive(Error, Debug)]
@@ -71,11 +71,14 @@ pub struct TrackerServerStateInner {
 
 /// Server state for tracker scanner
 /// Uses real blockchain integration with proper synchronization
+///
+/// It holds no note store: `data/notes` belongs to the tracker thread alone, because two
+/// fjall keyspaces on one directory (fjall takes no directory lock) can corrupt it. The
+/// `TrackerStateManager` this struct used to open (and re-open on every clone) was unused.
 pub struct TrackerServerState {
     pub config: TrackerNodeConfig,
     pub inner: Arc<Mutex<TrackerServerStateInner>>,
     pub client: Client,
-    pub tracker_state: TrackerStateManager,
     pub metadata_storage: ScannerMetadataStorage,
     pub tracker_storage: TrackerStorage,
     pub data_dir: PathBuf,
@@ -87,7 +90,6 @@ impl Clone for TrackerServerState {
             config: self.config.clone(),
             inner: Arc::clone(&self.inner),
             client: self.client.clone(),
-            tracker_state: TrackerStateManager::new(&self.data_dir), // Create new instance since it doesn't implement Clone
             metadata_storage: self.metadata_storage.clone(),
             tracker_storage: self.tracker_storage.clone(),
             data_dir: self.data_dir.clone(),
@@ -499,7 +501,6 @@ pub fn create_tracker_server_state(
         config,
         inner: Arc::new(Mutex::new(inner)),
         client: crate::http::bounded_client(),
-        tracker_state: TrackerStateManager::new(&data_dir),
         metadata_storage,
         tracker_storage,
         data_dir: data_dir.as_ref().to_path_buf(),

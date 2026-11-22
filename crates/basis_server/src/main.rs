@@ -154,6 +154,18 @@ async fn main() {
     tracing::info!("Initializing shared tracker state...");
     let shared_tracker_state_for_updater = SharedTrackerState::new_with_tracker_key(tracker_pubkey);
 
+    // Every fjall directory is opened exactly once per process: fjall takes no directory
+    // lock, and two keyspaces on one directory can corrupt its journal and segments.
+    // data/tracker_boxes is shared by the tracker scanner and the API (AppState).
+    let tracker_storage =
+        match basis_store::persistence::TrackerStorage::open(data_dir.join("tracker_boxes")) {
+            Ok(storage) => storage,
+            Err(e) => {
+                tracing::error!("Failed to initialize tracker storage: {:?}", e);
+                std::process::exit(1);
+            }
+        };
+
     // Initialize tracker scanner for monitoring tracker state commitment boxes
     tracing::debug!(
         "Tracker NFT ID from config: {:?}",
@@ -177,7 +189,6 @@ async fn main() {
 
         // Create tracker scanner state with persistent storage paths (similar to reserve scanner)
         let metadata_storage_path = data_dir.join("tracker_scanner_metadata");
-        let tracker_storage_path = data_dir.join("tracker_boxes");
 
         // Ensure data directory exists
         std::fs::create_dir_all(metadata_storage_path.parent().unwrap_or(&data_dir))
@@ -188,54 +199,38 @@ async fn main() {
         match basis_store::persistence::ScannerMetadataStorage::open(metadata_storage_path.clone())
         {
             Ok(metadata_storage) => {
-                match basis_store::persistence::TrackerStorage::open(tracker_storage_path.clone()) {
-                    Ok(tracker_storage) => {
-                        let tracker_scanner = create_tracker_server_state(
-                            tracker_scanner_config,
-                            metadata_storage,
-                            tracker_storage,
-                            &data_dir,
-                        );
+                let tracker_scanner = create_tracker_server_state(
+                    tracker_scanner_config,
+                    metadata_storage,
+                    tracker_storage.clone(),
+                    &data_dir,
+                );
 
-                        // Process tracker boxes directly, no scan registration required
-                        match tracker_scanner.process_tracker_boxes().await {
-                            Ok(tracker_boxes) => {
-                                tracing::info!("Processed {} tracker boxes", tracker_boxes.len());
-                                if let Err(e) =
-                                    tracker_scanner.update_tracker_state(&tracker_boxes).await
-                                {
-                                    tracing::error!("Failed to update tracker state: {}", e);
-                                }
-
-                                // Set the latest tracker box ID in shared state for the updater
-                                if let Some(latest_box) =
-                                    tracker_boxes.iter().max_by_key(|b| b.last_verified_height)
-                                {
-                                    tracing::info!(
-                                        "Setting latest tracker box ID in shared state: {}",
-                                        latest_box.box_id
-                                    );
-                                    shared_tracker_state_for_updater
-                                        .set_tracker_box_id(latest_box.box_id.clone());
-                                }
-
-                                tracing::info!(
-                                    "Tracker scanner initialization completed successfully"
-                                );
-                                true
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to process tracker boxes: {:?}", e);
-                                tracing::info!("Continuing without tracker scanner...");
-                                false
-                            }
+                // Process tracker boxes directly, no scan registration required
+                match tracker_scanner.process_tracker_boxes().await {
+                    Ok(tracker_boxes) => {
+                        tracing::info!("Processed {} tracker boxes", tracker_boxes.len());
+                        if let Err(e) = tracker_scanner.update_tracker_state(&tracker_boxes).await {
+                            tracing::error!("Failed to update tracker state: {}", e);
                         }
+
+                        // Set the latest tracker box ID in shared state for the updater
+                        if let Some(latest_box) =
+                            tracker_boxes.iter().max_by_key(|b| b.last_verified_height)
+                        {
+                            tracing::info!(
+                                "Setting latest tracker box ID in shared state: {}",
+                                latest_box.box_id
+                            );
+                            shared_tracker_state_for_updater
+                                .set_tracker_box_id(latest_box.box_id.clone());
+                        }
+
+                        tracing::info!("Tracker scanner initialization completed successfully");
+                        true
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to create tracker storage for tracker scanner: {:?}",
-                            e
-                        );
+                        tracing::warn!("Failed to process tracker boxes: {:?}", e);
                         tracing::info!("Continuing without tracker scanner...");
                         false
                     }
@@ -266,17 +261,14 @@ async fn main() {
     // Create channel for communicating with tracker thread
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TrackerCommand>(100);
 
-    // Initialize tracker manager outside of the blocking task so it can be shared
+    // The tracker thread is the only opener of data/notes (TrackerStateManager): the
+    // tracker scanner keeps no note store, and nothing else opens one.
     use basis_store::TrackerStateManager;
-    #[allow(clippy::arc_with_non_send_sync)]
-    let shared_tracker_state =
-        std::sync::Arc::new(std::sync::Mutex::new(TrackerStateManager::new(&data_dir)));
 
     // Clone the data directory for the tracker thread before the async move.
     let data_dir_for_tracker_thread = data_dir.clone();
 
     // Spawn tracker thread (using tokio::task::spawn_blocking for CPU-bound work)
-    let _shared_tracker_state_clone = shared_tracker_state.clone();
     let shared_state_for_tracker = shared_tracker_state_for_updater.clone(); // Also pass shared state for updater
     tokio::task::spawn_blocking(move || {
         use basis_store::RedemptionManager;
@@ -719,17 +711,6 @@ async fn main() {
 
     // Extract the reserve tracker from the scanner before wrapping in Arc/Mutex
     let scanner_reserve_tracker = ergo_scanner.reserve_tracker.clone();
-
-    // Initialize tracker storage for the new API endpoint
-    let tracker_storage_path = data_dir.join("tracker_boxes");
-    let tracker_storage = match basis_store::persistence::TrackerStorage::open(tracker_storage_path)
-    {
-        Ok(storage) => storage,
-        Err(e) => {
-            tracing::error!("Failed to initialize tracker storage: {:?}", e);
-            std::process::exit(1);
-        }
-    };
 
     // Build acceptance predicate from configuration
     let acceptance_predicate =
