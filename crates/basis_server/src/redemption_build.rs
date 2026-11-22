@@ -318,6 +318,24 @@ impl NodeClient {
         crate::local_wallet::state_context_from_headers(self.last_headers().await?)
     }
 
+    /// `GET {path}`: true on 200, false on 404, an error on anything else.
+    async fn knows(&self, path: &str) -> Result<bool, String> {
+        let client = basis_store::http::bounded_client();
+        let url = format!("{}{}", self.url, path);
+        let mut req = client.get(&url);
+        if let Some(ref k) = self.api_key {
+            req = req.header("api_key", k);
+        }
+        let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
+        match resp.status().as_u16() {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => Err(format!("GET {url} HTTP {status}")),
+        }
+    }
+
+    /// `POST /transactions`, classified (round 5b, F7): only a 4xx answer is a refusal; no
+    /// answer, a transport error or a 5xx says nothing about whether the node has it.
     async fn broadcast(&self, tx: &Value) -> Result<String, BroadcastFailure> {
         let client = basis_store::http::bounded_client();
         let url = format!("{}/transactions", self.url);
@@ -325,34 +343,37 @@ impl NodeClient {
         if let Some(ref k) = self.api_key {
             req = req.header("api_key", k);
         }
-        let resp = req.send().await.map_err(|e| {
-            if e.is_connect() {
-                BroadcastFailure::Refused(format!("broadcast: {e}"))
-            } else {
-                BroadcastFailure::NoAnswer(format!("broadcast: {e}"))
-            }
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| BroadcastFailure::NoAnswer(format!("broadcast: {e}")))?;
         let status = resp.status();
         let body = basis_store::http::read_body_capped(resp)
             .await
             .unwrap_or_default();
-        if !status.is_success() {
-            return Err(BroadcastFailure::Refused(format!(
-                "broadcast rejected HTTP {status}: {body}"
-            )));
+        if status.is_success() {
+            return Ok(parse_broadcast_tx_id(&body));
         }
-        Ok(parse_broadcast_tx_id(&body))
+        let answer = format!(
+            "broadcast answered HTTP {status}: {}",
+            body.chars().take(500).collect::<String>()
+        );
+        if status.is_client_error() {
+            Err(BroadcastFailure::Refused(answer))
+        } else {
+            Err(BroadcastFailure::NoAnswer(answer))
+        }
     }
 }
 
-/// Why a broadcast failed (round 5, C8): it decides whether the redemption journal keeps the
-/// redemption.
+/// Why a broadcast failed (round 5, C8; round 5b, F7): it decides whether the redemption
+/// journal keeps the redemption.
 #[derive(Debug)]
 enum BroadcastFailure {
-    /// The node answered with an error, or no connection was made: it does not have the
-    /// transaction.
+    /// A 4xx answer: the node refused the transaction (unless it has it already, which
+    /// [`broadcast_outcome`] checks).
     Refused(String),
-    /// The request went out but no answer came back: the node may have the transaction.
+    /// No answer, a transport error or a 5xx: the node may have the transaction.
     NoAnswer(String),
 }
 
@@ -361,6 +382,63 @@ impl std::fmt::Display for BroadcastFailure {
         match self {
             BroadcastFailure::Refused(e) | BroadcastFailure::NoAnswer(e) => f.write_str(e),
         }
+    }
+}
+
+/// What became of a redemption broadcast (round 5b, F7). Only [`Broadcast::Refused`] lets
+/// `/redemption/submit` forget the redemption: after every other outcome the transaction may
+/// be mined, so the journal keeps it and the confirmer follows it.
+#[derive(Debug, PartialEq, Eq)]
+enum Broadcast {
+    /// A 2xx answer, with the id it named (only logged: the redemption is followed under the
+    /// signed transaction's id).
+    Accepted(String),
+    /// A refusal from a node that has the transaction in its pool already (the node refuses a
+    /// transaction whose inputs its pool spends), or that says so.
+    AlreadyInPool(String),
+    /// No answer, a 5xx, or a refusal while the reserve box is spent already: the transaction
+    /// may be in a mempool or a block.
+    Unknown(String),
+    /// A 4xx refusal from a node that does not have the transaction, while the reserve box is
+    /// unspent: the node will not take it.
+    Refused(String),
+}
+
+/// Broadcast `signed_tx` (the redemption `tx_id`, spending `reserve_box_id`) to `node` and
+/// classify the outcome (see [`Broadcast`]). A refusal is checked twice before it counts: the
+/// node may have the transaction in its pool already, and the reserve box may be spent already
+/// (the transaction, broadcast elsewhere first, may be in a block). A lookup that fails leaves
+/// the outcome unknown.
+async fn broadcast_outcome(
+    node: &NodeClient,
+    chain: &NodeClient,
+    signed_tx: &Value,
+    tx_id: &str,
+    reserve_box_id: &str,
+) -> Broadcast {
+    let refusal = match node.broadcast(signed_tx).await {
+        Ok(reported) => return Broadcast::Accepted(reported),
+        Err(BroadcastFailure::NoAnswer(e)) => return Broadcast::Unknown(e),
+        Err(BroadcastFailure::Refused(e)) => e,
+    };
+    let lowered = refusal.to_ascii_lowercase();
+    if lowered.contains("already") && lowered.contains("pool") {
+        return Broadcast::AlreadyInPool(refusal);
+    }
+    match node
+        .knows(&format!("/transactions/unconfirmed/byTransactionId/{tx_id}"))
+        .await
+    {
+        Ok(true) => return Broadcast::AlreadyInPool(refusal),
+        Ok(false) => {}
+        Err(e) => return Broadcast::Unknown(format!("{refusal}; the node's pool: {e}")),
+    }
+    match chain.knows(&format!("/utxo/byId/{reserve_box_id}")).await {
+        Ok(true) => Broadcast::Refused(refusal),
+        Ok(false) => Broadcast::Unknown(format!(
+            "{refusal}; reserve box {reserve_box_id} is spent already"
+        )),
+        Err(e) => Broadcast::Unknown(format!("{refusal}; reserve box {reserve_box_id}: {e}")),
     }
 }
 
@@ -2739,7 +2817,8 @@ pub async fn submit_redemption(
     };
 
     // Round 5, item 3: the updater holds back a commit that would spend the tracker box this
-    // redemption reads as its data input while the redemption waits in the mempool.
+    // redemption reads as its data input while the redemption waits in the mempool. Lower-cased
+    // (round 5b, F10): box ids are compared and stored in lower case.
     let data_input_ids: Vec<String> = payload
         .signed_tx
         .get("dataInputs")
@@ -2748,7 +2827,7 @@ pub async fn submit_redemption(
             inputs
                 .iter()
                 .filter_map(|input| input.get("boxId").and_then(Value::as_str))
-                .map(str::to_string)
+                .map(str::to_ascii_lowercase)
                 .collect()
         })
         .unwrap_or_default();
@@ -2759,7 +2838,7 @@ pub async fn submit_redemption(
     // tree value is the cumulative amount the build proved on chain.
     let journaled = basis_store::persistence::JournaledRedemption {
         tx_id: pending.unsigned_tx_id.to_ascii_lowercase(),
-        reserve_box_id: pending.reserve_box_id.clone(),
+        reserve_box_id: pending.reserve_box_id.to_ascii_lowercase(),
         issuer_pubkey: hex::encode(issuer_pubkey),
         recipient_pubkey: hex::encode(recipient_pubkey),
         denomination: pending.denomination.denomination_id(),
@@ -2773,12 +2852,27 @@ pub async fn submit_redemption(
         missing_checks: 0,
         apply_error: None,
     };
-    if let Err(e) = state.tracker_storage.journal_redemption(&journaled) {
+    // Round 5b (F9): the entry is on disk before the node can have the transaction.
+    if let Err(e) = state
+        .tracker_storage
+        .journal_redemption(&journaled)
+        .and_then(|()| state.tracker_storage.persist_journal())
+    {
         tracing::error!(
             "redemption {} cannot be journaled, so it is not broadcast: {:?}",
             pending.unsigned_tx_id,
             e
         );
+        if let Err(e) = state
+            .tracker_storage
+            .remove_journaled_redemption(&journaled.tx_id)
+        {
+            tracing::error!(
+                "unbroadcast redemption {} may stay journaled: {:?}",
+                journaled.tx_id,
+                e
+            );
+        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(error_response(format!(
@@ -2789,16 +2883,32 @@ pub async fn submit_redemption(
         );
     }
 
-    let node = NodeClient::wallet(&state);
-    let tx_id = match node.broadcast(&payload.signed_tx).await {
-        Ok(tx_id) => tx_id,
-        Err(BroadcastFailure::Refused(e)) => {
+    // Round 5b (F7): only a definite refusal forgets the redemption; after any other outcome
+    // the transaction may be mined, and the confirmer follows it.
+    let outcome = broadcast_outcome(
+        &NodeClient::wallet(&state),
+        &NodeClient::chain(&state),
+        &payload.signed_tx,
+        &journaled.tx_id,
+        &journaled.reserve_box_id,
+    )
+    .await;
+    let reported_tx_id = match outcome {
+        Broadcast::Accepted(reported_tx_id) => reported_tx_id,
+        Broadcast::AlreadyInPool(answer) => {
+            tracing::info!(
+                "redemption {} is in the node's pool already ({answer}); following it",
+                journaled.tx_id
+            );
+            journaled.tx_id.clone()
+        }
+        Broadcast::Refused(e) => {
             // SECURITY (round 4, C2): the node's URL and answer stay in the log.
             tracing::warn!(
-                "redemption {} broadcast failed: {e}",
+                "redemption {} broadcast refused: {e}",
                 pending.unsigned_tx_id
             );
-            // The node does not have it: there is nothing to follow.
+            // The node does not have it and its reserve box is unspent: nothing to follow.
             if let Err(e) = state
                 .tracker_storage
                 .remove_journaled_redemption(&journaled.tx_id)
@@ -2818,9 +2928,9 @@ pub async fn submit_redemption(
                 ))),
             );
         }
-        Err(BroadcastFailure::NoAnswer(e)) => {
+        Broadcast::Unknown(e) => {
             tracing::warn!(
-                "redemption {} broadcast got no answer: {e}; it stays journaled",
+                "redemption {} broadcast outcome unknown: {e}; it stays journaled",
                 pending.unsigned_tx_id
             );
             // The node may have it: the confirmer follows it like a broadcast one.
@@ -2834,38 +2944,24 @@ pub async fn submit_redemption(
                 Json(error_response(format!(
                     "the node did not answer for redemption {}; the tracker watches the chain \
                      for it and records it if it is mined. Its reserve builds nothing until \
-                     then, or until it is dropped (about {} minutes in no mempool)",
-                    pending.unsigned_tx_id,
-                    crate::redemption_confirmer::MAX_REDEMPTION_MISSING_CHECKS as u64
-                        * crate::redemption_confirmer::REDEMPTION_CHECK_INTERVAL.as_secs()
-                        / 60
+                     then, or until it can no longer be mined",
+                    pending.unsigned_tx_id
                 ))),
             );
         }
     };
-    if !tx_id.eq_ignore_ascii_case(&journaled.tx_id) {
-        // A signed transaction has the id of its unsigned one; follow what the node reports.
+    // Round 5b (F2): the redemption is followed under the id `validate_and_consume` proved to be
+    // the signed transaction's (a signed transaction has its unsigned one's id), never under the
+    // id the node's answer names: an empty or garbage answer must not become a journal key.
+    if !reported_tx_id.eq_ignore_ascii_case(&journaled.tx_id) {
         tracing::warn!(
-            "redemption {} was accepted under id {}; journaling that id",
+            "redemption {} was accepted, but the node answered with id {:?}; it is followed under {}",
             journaled.tx_id,
-            tx_id
+            reported_tx_id.chars().take(100).collect::<String>(),
+            journaled.tx_id
         );
-        let renamed = basis_store::persistence::JournaledRedemption {
-            tx_id: tx_id.to_ascii_lowercase(),
-            ..journaled.clone()
-        };
-        if let Err(e) = state
-            .tracker_storage
-            .journal_redemption(&renamed)
-            .and_then(|()| {
-                state
-                    .tracker_storage
-                    .remove_journaled_redemption(&journaled.tx_id)
-            })
-        {
-            tracing::error!("journaling redemption {} failed: {:?}", tx_id, e);
-        }
     }
+    let tx_id = journaled.tx_id.clone();
 
     state
         .shared_tracker_state

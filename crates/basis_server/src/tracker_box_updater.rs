@@ -212,6 +212,12 @@ impl SharedTrackerState {
         data_input_ids: Vec<String>,
         submitted_at: std::time::Instant,
     ) {
+        // Round 5b (F10): ids are kept in lower case, as the node writes them.
+        let tx_id = tx_id.to_ascii_lowercase();
+        let data_input_ids = data_input_ids
+            .iter()
+            .map(|id| id.to_ascii_lowercase())
+            .collect();
         let mut submitted = self
             .submitted_redemptions
             .write()
@@ -1113,7 +1119,11 @@ impl TrackerBoxUpdater {
         let mut forget = Vec::new();
         let mut waiting = Vec::new();
         for redemption in submitted {
-            if !redemption.data_input_ids.contains(&tracker_box.box_id) {
+            if !redemption
+                .data_input_ids
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(&tracker_box.box_id))
+            {
                 // It read an older tracker box, already spent: in a block already, or invalid.
                 forget.push(redemption.tx_id);
             } else if redemption.submitted_at.elapsed() >= config.max_commit_deferral {
@@ -3288,9 +3298,10 @@ mod tests {
             lookup,
             height,
             |_, shared, fx| {
+                // Round 5b (F10): the data input id matches in any case.
                 shared.record_submitted_redemption(
                     REDEMPTION_TX.to_string(),
-                    vec![fx.tracker_api.box_id.clone()],
+                    vec![fx.tracker_api.box_id.to_ascii_uppercase()],
                 );
                 shared.record_submitted_redemption("cd".repeat(32), vec!["ff".repeat(32)]);
             },
@@ -3389,6 +3400,18 @@ mod tests {
         assert!(!commit_may_wait(1_000 + window + 5, 1_000));
         // A box "created" above the node height (a lagging node) is young, not old.
         assert!(commit_may_wait(900, 1_000));
+    }
+
+    /// Round 5b, F10: submitted redemption ids are kept in lower case and forgotten in any.
+    #[test]
+    fn submitted_redemption_ids_are_kept_in_lower_case() {
+        let shared = SharedTrackerState::new();
+        shared.record_submitted_redemption("AB".repeat(32), vec!["CD".repeat(32)]);
+        let all = shared.get_submitted_redemptions();
+        assert_eq!(all[0].tx_id, "ab".repeat(32));
+        assert_eq!(all[0].data_input_ids, vec!["cd".repeat(32)]);
+        shared.forget_submitted_redemptions(&["Ab".repeat(32)]);
+        assert!(shared.get_submitted_redemptions().is_empty());
     }
 
     #[test]

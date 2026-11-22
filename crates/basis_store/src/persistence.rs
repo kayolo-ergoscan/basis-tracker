@@ -18,6 +18,41 @@ use std::path::Path;
 /// which is why every storage below keeps its `Keyspace`.
 pub const JOURNAL_FSYNC_MS: u16 = 1000;
 
+/// Longest key fjall takes. lsm-tree asserts that a key is 1 to 65535 bytes long only AFTER the
+/// write-ahead log took the write: an empty or longer key panics on the write and again on every
+/// restart, while the log is replayed (round 5b, F2). Every key that comes from outside input
+/// (the node's answers, request bodies) is checked with [`storable_key`] first.
+pub const MAX_STORABLE_KEY_LEN: usize = u16::MAX as usize;
+
+/// `key` if fjall can hold it (1 to [`MAX_STORABLE_KEY_LEN`] bytes), else an error naming `what`.
+fn storable_key<'a>(what: &str, key: &'a [u8]) -> Result<&'a [u8], NoteError> {
+    if key.is_empty() || key.len() > MAX_STORABLE_KEY_LEN {
+        return Err(NoteError::StorageError(format!(
+            "refusing a {what} of {} bytes as a key: keys are 1 to {MAX_STORABLE_KEY_LEN} bytes",
+            key.len()
+        )));
+    }
+    Ok(key)
+}
+
+/// Whether fjall can hold `key` (see [`storable_key`]). A key it cannot hold was never stored,
+/// so a read finds nothing and a removal has nothing to do.
+fn is_storable_key(key: &[u8]) -> bool {
+    !key.is_empty() && key.len() <= MAX_STORABLE_KEY_LEN
+}
+
+/// A transaction id as the redemption journal keys it: 64 hex characters, lower-cased.
+fn journal_key(tx_id: &str) -> Result<String, NoteError> {
+    if tx_id.len() == 64 && tx_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(tx_id.to_ascii_lowercase())
+    } else {
+        Err(NoteError::StorageError(format!(
+            "{:?} is not a transaction id (64 hex characters)",
+            tx_id.chars().take(80).collect::<String>()
+        )))
+    }
+}
+
 /// Fixed-width note record length: issuer(33) ‖ collected(8) ‖ redeemed(8) ‖
 /// timestamp(8) ‖ signature(65) ‖ recipient(33) ‖ tracker_nft_id(32) ‖
 /// denomination(33) = 220 bytes.
@@ -89,12 +124,17 @@ pub struct ReserveStorage {
 /// Database storage for tracker information
 #[derive(Clone)]
 pub struct TrackerStorage {
-    /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]).
-    _keyspace: fjall::Keyspace,
+    /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]), and
+    /// syncs the redemption journal to disk before a broadcast ([`Self::persist_journal`]).
+    keyspace: fjall::Keyspace,
     partition: fjall::Partition,
     /// Redemptions submitted through `/redemption/submit` that the chain has not confirmed yet
     /// (round 5, C8; see [`JournaledRedemption`]).
     redemption_journal: fjall::Partition,
+    /// Serializes the journal writes, so a write-back of an entry read earlier
+    /// ([`Self::update_journaled_redemption`]) never brings back an entry removed meanwhile
+    /// (round 5b, F8). Shared by the clones of this storage.
+    journal_writes: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 /// The partition of [`TrackerStorage`] that holds the submitted redemptions. It is created on
@@ -200,13 +240,16 @@ impl ScannerMetadataStorage {
     pub fn store_scan_id(&self, scan_name: &str, scan_id: i32) -> Result<(), NoteError> {
         let value_bytes = scan_id.to_be_bytes().to_vec();
         self.partition
-            .insert(scan_name.as_bytes(), &value_bytes)
+            .insert(storable_key("scan name", scan_name.as_bytes())?, &value_bytes)
             .map_err(|e| NoteError::StorageError(format!("Failed to store scan ID: {}", e)))?;
         Ok(())
     }
 
     /// Retrieve scan ID for a specific scan name
     pub fn get_scan_id(&self, scan_name: &str) -> Result<Option<i32>, NoteError> {
+        if !is_storable_key(scan_name.as_bytes()) {
+            return Ok(None);
+        }
         match self.partition.get(scan_name.as_bytes()) {
             Ok(Some(value_bytes)) => {
                 if value_bytes.len() == 4 {
@@ -228,6 +271,9 @@ impl ScannerMetadataStorage {
 
     /// Remove scan ID for a specific scan name
     pub fn remove_scan_id(&self, scan_name: &str) -> Result<(), NoteError> {
+        if !is_storable_key(scan_name.as_bytes()) {
+            return Ok(());
+        }
         self.partition
             .remove(scan_name.as_bytes())
             .map_err(|e| NoteError::StorageError(format!("Failed to remove scan ID: {}", e)))?;
@@ -1319,7 +1365,8 @@ impl ReserveStorage {
 
     /// Store a reserve in the database
     pub fn store_reserve(&self, reserve: &ExtendedReserveInfo) -> Result<(), NoteError> {
-        let key = reserve.box_id.as_bytes();
+        // The box id comes from the node's answer.
+        let key = storable_key("reserve box id", reserve.box_id.as_bytes())?;
         let value = serde_json::to_vec(reserve)
             .map_err(|e| NoteError::StorageError(format!("Failed to serialize reserve: {}", e)))?;
 
@@ -1332,6 +1379,9 @@ impl ReserveStorage {
 
     /// Retrieve a reserve by box ID
     pub fn get_reserve(&self, box_id: &str) -> Result<Option<ExtendedReserveInfo>, NoteError> {
+        if !is_storable_key(box_id.as_bytes()) {
+            return Ok(None);
+        }
         match self.partition.get(box_id.as_bytes()) {
             Ok(Some(value_bytes)) => {
                 let reserve: ExtendedReserveInfo =
@@ -1370,6 +1420,9 @@ impl ReserveStorage {
 
     /// Remove a reserve from the database
     pub fn remove_reserve(&self, box_id: &str) -> Result<(), NoteError> {
+        if !is_storable_key(box_id.as_bytes()) {
+            return Ok(());
+        }
         self.partition
             .remove(box_id.as_bytes())
             .map_err(|e| NoteError::StorageError(format!("Failed to remove reserve: {}", e)))?;
@@ -1383,8 +1436,9 @@ impl ReserveStorage {
             NoteError::StorageError(format!("Failed to serialize quarantined reserve: {}", e))
         })?;
 
+        // The box id comes from the node's answer.
         self.quarantine_partition
-            .insert(record.box_id.as_bytes(), &value)
+            .insert(storable_key("reserve box id", record.box_id.as_bytes())?, &value)
             .map_err(|e| {
                 NoteError::StorageError(format!("Failed to store quarantined reserve: {}", e))
             })?;
@@ -1394,6 +1448,9 @@ impl ReserveStorage {
 
     /// Retrieve a quarantined reserve box by box ID, if quarantined.
     pub fn get_quarantined(&self, box_id: &str) -> Result<Option<QuarantinedReserve>, NoteError> {
+        if !is_storable_key(box_id.as_bytes()) {
+            return Ok(None);
+        }
         match self.quarantine_partition.get(box_id.as_bytes()) {
             Ok(Some(value_bytes)) => {
                 let record: QuarantinedReserve =
@@ -1454,22 +1511,68 @@ impl TrackerStorage {
             })?;
 
         Ok(Self {
-            _keyspace: keyspace,
+            keyspace,
             partition,
             redemption_journal,
+            journal_writes: Default::default(),
         })
     }
 
-    /// Write (or replace) the journal entry of `entry.tx_id`.
+    /// Write (or replace) the journal entry of `entry.tx_id`, which must be a transaction id
+    /// (64 hex characters; round 5b, F2: an empty or oversized key would panic inside fjall after
+    /// its write-ahead log took the write, and again at every restart).
     pub fn journal_redemption(&self, entry: &JournaledRedemption) -> Result<(), NoteError> {
-        let value = serde_json::to_vec(entry).map_err(|e| {
-            NoteError::StorageError(format!("Failed to serialize a journaled redemption: {}", e))
-        })?;
-        self.redemption_journal
-            .insert(entry.tx_id.to_ascii_lowercase().as_bytes(), value)
+        let key = journal_key(&entry.tx_id)?;
+        let value = Self::journal_value(entry)?;
+        let _writes = self.lock_journal_writes();
+        self.insert_journal_entry(&key, value)
+    }
+
+    /// Write back `entry`, read from the journal earlier, ONLY if the journal still has an entry
+    /// under its transaction id (round 5b, F8): an entry removed meanwhile (refused at submit,
+    /// dropped or applied by an operator) is not brought back. Returns whether it was written.
+    pub fn update_journaled_redemption(
+        &self,
+        entry: &JournaledRedemption,
+    ) -> Result<bool, NoteError> {
+        let key = journal_key(&entry.tx_id)?;
+        let value = Self::journal_value(entry)?;
+        let _writes = self.lock_journal_writes();
+        let present = self
+            .redemption_journal
+            .contains_key(key.as_bytes())
             .map_err(|e| {
-                NoteError::StorageError(format!("Failed to journal a redemption: {}", e))
-            })
+                NoteError::StorageError(format!("Failed to read the redemption journal: {}", e))
+            })?;
+        if !present {
+            return Ok(false);
+        }
+        self.insert_journal_entry(&key, value)?;
+        Ok(true)
+    }
+
+    /// The journal entry of `tx_id`, if there is one (`None` too for an id that is no
+    /// transaction id: none is ever stored under it).
+    pub fn journaled_redemption(
+        &self,
+        tx_id: &str,
+    ) -> Result<Option<JournaledRedemption>, NoteError> {
+        let Ok(key) = journal_key(tx_id) else {
+            return Ok(None);
+        };
+        match self.redemption_journal.get(key.as_bytes()) {
+            Ok(Some(value)) => serde_json::from_slice(&value).map(Some).map_err(|e| {
+                NoteError::StorageError(format!(
+                    "Failed to read journaled redemption {}: {}",
+                    key, e
+                ))
+            }),
+            Ok(None) => Ok(None),
+            Err(e) => Err(NoteError::StorageError(format!(
+                "Failed to read the redemption journal: {}",
+                e
+            ))),
+        }
     }
 
     /// Every journaled redemption, in transaction id order. An entry that cannot be read is
@@ -1492,10 +1595,13 @@ impl TrackerStorage {
         Ok(entries)
     }
 
-    /// Remove the journal entry of `tx_id` (nothing when there is none).
+    /// Remove the journal entry of `tx_id` (nothing when there is none). `tx_id` must be a
+    /// transaction id, as in [`Self::journal_redemption`].
     pub fn remove_journaled_redemption(&self, tx_id: &str) -> Result<(), NoteError> {
+        let key = journal_key(tx_id)?;
+        let _writes = self.lock_journal_writes();
         self.redemption_journal
-            .remove(tx_id.to_ascii_lowercase().as_bytes())
+            .remove(key.as_bytes())
             .map_err(|e| {
                 NoteError::StorageError(format!(
                     "Failed to remove a journaled redemption: {}",
@@ -1504,9 +1610,46 @@ impl TrackerStorage {
             })
     }
 
+    /// Sync this storage's journal (the redemption journal with it) to disk (round 5b, F9).
+    /// `/redemption/submit` calls it once, after journaling and before broadcasting: a redemption
+    /// the node may have must survive a power loss, not only a crash.
+    pub fn persist_journal(&self) -> Result<(), NoteError> {
+        self.keyspace
+            .persist(fjall::PersistMode::SyncAll)
+            .map_err(|e| {
+                NoteError::StorageError(format!(
+                    "Failed to sync the redemption journal to disk: {}",
+                    e
+                ))
+            })
+    }
+
+    fn journal_value(entry: &JournaledRedemption) -> Result<Vec<u8>, NoteError> {
+        serde_json::to_vec(entry).map_err(|e| {
+            NoteError::StorageError(format!("Failed to serialize a journaled redemption: {}", e))
+        })
+    }
+
+    fn insert_journal_entry(&self, key: &str, value: Vec<u8>) -> Result<(), NoteError> {
+        self.redemption_journal
+            .insert(key.as_bytes(), value)
+            .map_err(|e| {
+                NoteError::StorageError(format!("Failed to journal a redemption: {}", e))
+            })
+    }
+
+    /// The journal write lock; a panic while it was held leaves nothing half-written (each
+    /// write is one fjall insert or removal), so a poisoned lock is taken over.
+    fn lock_journal_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.journal_writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Store tracker box information in the database
     pub fn store_tracker_box(&self, tracker_box: &TrackerBoxInfo) -> Result<(), NoteError> {
-        let key = tracker_box.box_id.as_bytes();
+        // The box id comes from the node's answer.
+        let key = storable_key("tracker box id", tracker_box.box_id.as_bytes())?;
         let value = serde_json::to_vec(tracker_box).map_err(|e| {
             NoteError::StorageError(format!("Failed to serialize tracker box: {}", e))
         })?;
@@ -1520,6 +1663,9 @@ impl TrackerStorage {
 
     /// Retrieve tracker box by box ID
     pub fn get_tracker_box(&self, box_id: &str) -> Result<Option<TrackerBoxInfo>, NoteError> {
+        if !is_storable_key(box_id.as_bytes()) {
+            return Ok(None);
+        }
         match self.partition.get(box_id.as_bytes()) {
             Ok(Some(value_bytes)) => {
                 let tracker_box: TrackerBoxInfo =
@@ -1574,6 +1720,9 @@ impl TrackerStorage {
 
     /// Remove a tracker box from the database
     pub fn remove_tracker_box(&self, box_id: &str) -> Result<(), NoteError> {
+        if !is_storable_key(box_id.as_bytes()) {
+            return Ok(());
+        }
         self.partition
             .remove(box_id.as_bytes())
             .map_err(|e| NoteError::StorageError(format!("Failed to remove tracker box: {}", e)))?;
@@ -1894,6 +2043,95 @@ mod redemption_journal_tests {
         assert_eq!(read.len(), 2);
         assert_eq!(read[1].missing_checks, 0);
         assert_eq!(read[1].apply_error, None);
+    }
+
+    /// Round 5b, F8 and F9: a write-back of an entry read earlier lands only while the entry
+    /// is still journaled, so an entry removed meanwhile stays removed; one entry reads by id;
+    /// the journal syncs to disk on demand.
+    #[test]
+    fn a_write_back_never_brings_back_a_removed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TrackerStorage::open(dir.path()).unwrap();
+        let tx = "ab".repeat(32);
+        let read_earlier = entry(&tx);
+        assert!(!storage.update_journaled_redemption(&read_earlier).unwrap());
+        assert!(storage.journaled_redemptions().unwrap().is_empty());
+
+        storage.journal_redemption(&read_earlier).unwrap();
+        storage.persist_journal().unwrap();
+        let mut counted = read_earlier.clone();
+        counted.missing_checks = 3;
+        assert!(storage.update_journaled_redemption(&counted).unwrap());
+        assert_eq!(
+            storage.journaled_redemption(&tx.to_ascii_uppercase()).unwrap(),
+            Some(counted.clone())
+        );
+
+        // Removed (say, refused at submit) while the confirmer was looking at it.
+        storage.remove_journaled_redemption(&tx).unwrap();
+        counted.missing_checks = 4;
+        assert!(!storage.update_journaled_redemption(&counted).unwrap());
+        assert!(storage.journaled_redemptions().unwrap().is_empty());
+        assert_eq!(storage.journaled_redemption(&tx).unwrap(), None);
+        assert_eq!(storage.journaled_redemption("").unwrap(), None);
+    }
+
+    /// Round 5b, F2: lsm-tree asserts a key's length only after fjall's write-ahead log took
+    /// the write, so an empty or oversized key would panic now and at every restart. The journal
+    /// takes transaction ids only, and the box-id keyed partitions (ids from the node) refuse
+    /// what fjall cannot hold; nothing reaches the log, and the dir reopens.
+    #[test]
+    fn keys_from_outside_input_are_checked_before_fjall_sees_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = TrackerStorage::open(dir.path()).unwrap();
+        let huge = "a".repeat(MAX_STORABLE_KEY_LEN + 1);
+        for bad in [
+            String::new(),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            "zz".repeat(32),
+            huge.clone(),
+        ] {
+            assert!(storage.journal_redemption(&entry(&bad)).is_err(), "{}", bad.len());
+            assert!(storage.remove_journaled_redemption(&bad).is_err(), "{}", bad.len());
+        }
+        for bad in [String::new(), huge.clone()] {
+            let tracker_box = TrackerBoxInfo {
+                box_id: bad.clone(),
+                tracker_pubkey: String::new(),
+                state_commitment: String::new(),
+                last_verified_height: 1,
+                value: 1,
+                creation_height: 1,
+                tracker_nft_id: String::new(),
+            };
+            assert!(storage.store_tracker_box(&tracker_box).is_err());
+            assert!(storage.get_tracker_box(&bad).unwrap().is_none());
+            storage.remove_tracker_box(&bad).unwrap();
+        }
+        drop(storage);
+        let storage = TrackerStorage::open(dir.path()).unwrap();
+        assert!(storage.journaled_redemptions().unwrap().is_empty());
+        assert!(storage.get_all_tracker_boxes().unwrap().is_empty());
+
+        let reserves_dir = tempfile::tempdir().unwrap();
+        let reserves = ReserveStorage::open(reserves_dir.path()).unwrap();
+        for bad in [String::new(), huge] {
+            let quarantined = QuarantinedReserve {
+                box_id: bad.clone(),
+                owner_pubkey: String::new(),
+                denomination: "ERG".to_string(),
+                reason: "test".to_string(),
+                quarantined_at: 1,
+            };
+            assert!(reserves.store_quarantined(&quarantined).is_err());
+            assert!(reserves.get_quarantined(&bad).unwrap().is_none());
+            assert!(reserves.get_reserve(&bad).unwrap().is_none());
+            reserves.remove_reserve(&bad).unwrap();
+        }
+        drop(reserves);
+        let reserves = ReserveStorage::open(reserves_dir.path()).unwrap();
+        assert!(reserves.get_all_quarantined().unwrap().is_empty());
     }
 }
 

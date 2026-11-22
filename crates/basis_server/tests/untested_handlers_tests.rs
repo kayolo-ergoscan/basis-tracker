@@ -480,25 +480,35 @@ mod untested_handlers {
     /// Reserve box id the pending entries below are recorded against.
     const RESERVE_BOX_ID: &str = "abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123";
 
-    /// Node stub that accepts any broadcast and returns a fixed tx id.
+    /// Node stub that accepts any broadcast and answers with another transaction's id.
     async fn spawn_accepting_node() -> String {
+        spawn_node(|_| (200, format!("{{\"id\":\"{}\"}}", "ab".repeat(32)))).await
+    }
+
+    /// Node stub on 127.0.0.1 that answers each request with `answer(request line)`
+    /// (`(status, body)`, the body sent as JSON).
+    async fn spawn_node(answer: impl Fn(&str) -> (u16, String) + Send + Sync + 'static) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock node");
         let addr = listener.local_addr().unwrap();
+        let answer = Arc::new(answer);
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = match listener.accept().await {
                     Ok(s) => s,
                     Err(_) => return,
                 };
+                let answer = answer.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = vec![0u8; 8192];
-                    let _ = socket.read(&mut buf).await;
-                    let body = format!("{{\"id\":\"{}\"}}", "ab".repeat(32));
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let line = request.lines().next().unwrap_or_default().to_string();
+                    let (status, body) = answer(&line);
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -690,6 +700,43 @@ mod untested_handlers {
         );
     }
 
+    /// Round 5b (F2): the redemption is journaled, followed and reported under the signed
+    /// transaction's id whatever id the node's answer names: another id, an empty answer, or
+    /// garbage longer than a storage key can be.
+    #[tokio::test]
+    async fn test_submit_redemption_keeps_the_signed_id_whatever_the_node_answers() {
+        for answer in [
+            format!("\"{}\"", "ab".repeat(32)),
+            String::new(),
+            "x".repeat(70_000),
+        ] {
+            let reply = answer.clone();
+            let node_url = spawn_node(move |_| (200, reply.clone())).await;
+            let state = mock_state_with_config(&node_url).await;
+            let (unsigned_tx, signed_tx) =
+                record_pending(&state, ISSUER_HEX, RECIPIENT_HEX, 1_000);
+            let built = basis_server::redemption_build::unsigned_tx_id(&unsigned_tx).unwrap();
+            let (status, body) = submit_redemption(
+                axum::extract::State(state.clone()),
+                axum::extract::Json(submit_request(unsigned_tx, signed_tx)),
+            )
+            .await;
+            let shown: String = answer.chars().take(20).collect();
+            assert_eq!(status, StatusCode::OK, "{shown}: {body:?}");
+            assert_eq!(body.data.as_ref().unwrap().tx_id, built, "{shown}");
+            let journaled = state.tracker_storage.journaled_redemptions().unwrap();
+            assert_eq!(journaled.len(), 1, "{shown}");
+            assert_eq!(journaled[0].tx_id, built, "{shown}");
+            let submitted = state
+                .shared_tracker_state
+                .lock()
+                .await
+                .get_submitted_redemptions();
+            assert_eq!(submitted.len(), 1, "{shown}");
+            assert_eq!(submitted[0].tx_id, built, "{shown}");
+        }
+    }
+
     async fn note_redeemed(
         state: &basis_server::AppState,
         issuer: basis_store::PubKey,
@@ -778,10 +825,11 @@ mod untested_handlers {
         );
     }
 
+    /// Round 5b (F7): a node that cannot be reached may still get the transaction from the
+    /// client, so the redemption stays journaled and the client is told so.
     #[tokio::test]
-    async fn test_submit_redemption_failed_broadcast_returns_500() {
-        // Port 1 is reserved and refuses connections, so this exercises the upstream-failure
-        // branch without needing a live node.
+    async fn test_submit_redemption_unreachable_node_keeps_it_journaled() {
+        // Port 1 is reserved and refuses connections.
         let state = mock_state_with_config("http://127.0.0.1:1").await;
 
         let (unsigned_tx, signed_tx) = record_pending(&state, ISSUER_HEX, RECIPIENT_HEX, 1_000);
@@ -798,20 +846,132 @@ mod untested_handlers {
             "body: {:?}",
             body
         );
-        // Round 5 (C8): the node does not have it, so nothing stays journaled.
-        assert!(state.tracker_storage.journaled_redemptions().unwrap().is_empty());
+        assert_eq!(state.tracker_storage.journaled_redemptions().unwrap().len(), 1);
         assert!(!body.success);
         let msg = body.error.clone().unwrap_or_default();
-        assert!(
-            msg.contains("did not accept"),
-            "a failed broadcast must be reported as such, got: {}",
-            msg
-        );
+        assert!(msg.contains("did not answer"), "got: {}", msg);
         // Round 4 (C2): the node's URL and answer are logged, never returned.
         assert!(
             !msg.contains("127.0.0.1") && !msg.contains("http"),
             "the client error must not carry the node URL, got: {}",
             msg
         );
+    }
+
+    /// Round 5b (F7): only a definite refusal forgets the redemption: a 4xx from a node whose
+    /// pool does not have it, while its reserve box is unspent. A 5xx says nothing; a refusal
+    /// that says the pool has it already, or from a node whose pool has it, means the node took
+    /// it; a refusal while the reserve box is spent may mean it is in a block already.
+    #[tokio::test]
+    async fn test_submit_redemption_forgets_only_a_definite_refusal() {
+        struct Case {
+            name: &'static str,
+            broadcast: (u16, &'static str),
+            in_pool: bool,
+            reserve_unspent: bool,
+            status: StatusCode,
+            journaled: usize,
+            says: &'static str,
+        }
+        let malformed = r#"{"error":400,"reason":"bad.request","detail":"Malformed transaction"}"#;
+        let cases = [
+            Case {
+                name: "a definite refusal",
+                broadcast: (400, malformed),
+                in_pool: false,
+                reserve_unspent: true,
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                journaled: 0,
+                says: "did not accept",
+            },
+            Case {
+                name: "a 5xx",
+                broadcast: (503, "{}"),
+                in_pool: false,
+                reserve_unspent: true,
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                journaled: 1,
+                says: "did not answer",
+            },
+            Case {
+                name: "a refusal that says it is in the pool already",
+                broadcast: (400, r#"{"detail":"transaction is already in the pool"}"#),
+                in_pool: false,
+                reserve_unspent: true,
+                status: StatusCode::OK,
+                journaled: 1,
+                says: "",
+            },
+            Case {
+                name: "a refusal from a node whose pool has it",
+                broadcast: (400, malformed),
+                in_pool: true,
+                reserve_unspent: true,
+                status: StatusCode::OK,
+                journaled: 1,
+                says: "",
+            },
+            Case {
+                name: "a refusal while the reserve box is spent",
+                broadcast: (400, malformed),
+                in_pool: false,
+                reserve_unspent: false,
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                journaled: 1,
+                says: "did not answer",
+            },
+        ];
+        for case in cases {
+            let Case {
+                broadcast,
+                in_pool,
+                reserve_unspent,
+                ..
+            } = case;
+            let node_url = spawn_node(move |line| {
+                let found = |yes: bool| {
+                    if yes {
+                        (200, "{}".to_string())
+                    } else {
+                        (404, r#"{"error":404}"#.to_string())
+                    }
+                };
+                if line.starts_with("POST /transactions ") {
+                    (broadcast.0, broadcast.1.to_string())
+                } else if line.starts_with("GET /transactions/unconfirmed/byTransactionId/") {
+                    found(in_pool)
+                } else if line.starts_with(&format!("GET /utxo/byId/{RESERVE_BOX_ID} ")) {
+                    found(reserve_unspent)
+                } else {
+                    (500, format!(r#"{{"unexpected":"{line}"}}"#))
+                }
+            })
+            .await;
+            let state = mock_state_with_config(&node_url).await;
+            let (unsigned_tx, signed_tx) =
+                record_pending(&state, ISSUER_HEX, RECIPIENT_HEX, 1_000);
+            let built = basis_server::redemption_build::unsigned_tx_id(&unsigned_tx).unwrap();
+            let (status, body) = submit_redemption(
+                axum::extract::State(state.clone()),
+                axum::extract::Json(submit_request(unsigned_tx, signed_tx)),
+            )
+            .await;
+            assert_eq!(status, case.status, "{}: {:?}", case.name, body);
+            let journaled = state.tracker_storage.journaled_redemptions().unwrap();
+            assert_eq!(journaled.len(), case.journaled, "{}", case.name);
+            let followed = state
+                .shared_tracker_state
+                .lock()
+                .await
+                .get_submitted_redemptions();
+            assert_eq!(followed.len(), case.journaled, "{}", case.name);
+            if status == StatusCode::OK {
+                assert_eq!(body.data.as_ref().unwrap().tx_id, built, "{}", case.name);
+            } else {
+                let msg = body.error.clone().unwrap_or_default();
+                assert!(msg.contains(case.says), "{}: {msg}", case.name);
+                assert!(!msg.contains("127.0.0.1"), "{}: {msg}", case.name);
+            }
+        }
     }
 }
