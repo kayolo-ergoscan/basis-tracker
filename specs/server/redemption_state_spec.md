@@ -479,7 +479,7 @@ tree entry; the on-chain contract only sees the spent reserve's tree.
   "partial_tx": { "...": "fee-signed tx; reserve input proof empty" },
   "input_box_binaries": ["sigma-serialized boxes, tx-input order"],
   "data_box_binaries": ["tracker box"],
-  "headers": ["last 10 block headers for PreHeader/ErgoStateContext"],
+  "headers": ["last 10 block headers, newest first: PreHeader from headers[0]"],
   "reserve_box_id": "...",
   "new_already_redeemed": 100000000,
   "is_first_redemption": true,

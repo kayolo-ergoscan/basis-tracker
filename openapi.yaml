@@ -2409,7 +2409,10 @@ components:
           example: ["91a2b3c4"]
         headers:
           type: array
-          description: Last 10 block headers for deriving PreHeader and ErgoStateContext
+          description: >-
+            Last 10 block headers, newest first, as the fee inputs were signed:
+            the PreHeader comes from headers[0], and the array is the ErgoStateContext's
+            headers unchanged
           items:
             type: object
         reserve_box_id:

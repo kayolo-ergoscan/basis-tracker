@@ -29,10 +29,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ergo_lib::chain::ergo_state_context::ErgoStateContext;
-use ergo_lib::chain::parameters::Parameters;
 use ergo_lib::chain::transaction::unsigned::UnsignedTransaction;
 use ergo_lib::chain::transaction::Transaction;
-use ergo_lib::ergo_chain_types::{Header, PreHeader};
+use ergo_lib::ergo_chain_types::Header;
 use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
 use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 use ergo_lib::wallet::secret_key::SecretKey;
@@ -95,8 +94,9 @@ pub struct RedemptionBuildResponse {
     pub input_box_binaries: Vec<String>,
     /// Sigma-serialized data-input boxes (hex).
     pub data_box_binaries: Vec<String>,
-    /// Last 10 block headers; the client derives the `PreHeader` and `ErgoStateContext` from these
-    /// to finish signing without needing its own node connection.
+    /// Last 10 block headers, newest first: the order the fee inputs were signed with.
+    /// `PreHeader::from(headers[0])` and `ErgoStateContext::new(pre_header, headers, ..)` give the
+    /// client the same context, so it can finish signing without its own node connection.
     pub headers: Vec<Header>,
     pub reserve_box_id: String,
     pub tracker_box_id: String,
@@ -280,6 +280,14 @@ impl NodeClient {
     async fn last_headers(&self) -> Result<Vec<Header>, String> {
         let v = self.get_json("/blocks/lastHeaders/10").await?;
         serde_json::from_value(v).map_err(|e| format!("parse last headers: {e}"))
+    }
+
+    /// Signing context from the node's last 10 headers: newest first, with the pre-header
+    /// taken from the newest. The node lists them oldest first;
+    /// [`crate::local_wallet::state_context_from_headers`] orders them, as for the tracker's
+    /// own commits.
+    async fn state_context(&self) -> Result<ErgoStateContext, String> {
+        crate::local_wallet::state_context_from_headers(self.last_headers().await?)
     }
 
     async fn broadcast(&self, tx: &Value) -> Result<String, String> {
@@ -1615,29 +1623,14 @@ async fn build_redemption_inner(
     input_boxes.extend(fee_eboxes);
     let data_boxes = vec![tracker_ebox];
 
-    // State context for proving (contract does not read headers/params; height from PreHeader).
-    let headers = match chain_node.last_headers().await {
-        Ok(h) if h.len() >= 10 => h,
-        Ok(h) => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("need >=10 headers, got {}", h.len()),
-            )
-        }
+    // State context for proving (contract does not read headers/params; height from PreHeader):
+    // the newest header first, and the pre-header from the newest.
+    let state_context = match chain_node.state_context().await {
+        Ok(context) => context,
         Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("headers: {e}")),
     };
-    let pre_header = PreHeader::from(headers[0].clone());
-    let headers_array: [Header; 10] = headers[..10].to_vec().try_into().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(error_response("headers array".to_string())),
-        )
-    })?;
-    let _state_context = ErgoStateContext::new(
-        pre_header.clone(),
-        headers_array.clone(),
-        Parameters::default(),
-    );
+    let pre_header = state_context.pre_header.clone();
+    let headers_array = state_context.headers.clone();
 
     // Sign the fee input(s) locally with the tracker secret.
     let fee_secret = match state.config.tracker_secret_key_bytes() {
@@ -2303,5 +2296,43 @@ mod tests {
         assert!(
             basis_store::schnorr::schnorr_verify(&sig, &token_message, &tracker_pubkey).is_err()
         );
+    }
+
+    /// The node lists its last headers oldest first. The redemption's signing context (and the
+    /// headers returned to the client) must still start with the newest header, and the
+    /// pre-header must come from it, not from the oldest.
+    #[tokio::test]
+    async fn redemption_signing_context_starts_with_the_newest_header() {
+        use crate::local_wallet::tests::{mock_node, LAST_HEADERS_JSON};
+
+        let (url, seen) = mock_node(|method, target, _| match (method, target) {
+            ("GET", "/blocks/lastHeaders/10") => (200, LAST_HEADERS_JSON.to_string()),
+            _ => (404, "{}".to_string()),
+        })
+        .await;
+        let node = NodeClient { url, api_key: None };
+
+        let raw: Vec<u32> = node
+            .last_headers()
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.height)
+            .collect();
+        assert_eq!(
+            raw,
+            (123_405..=123_414).collect::<Vec<_>>(),
+            "fixture is oldest first"
+        );
+
+        let context = node.state_context().await.unwrap();
+        assert_eq!(context.pre_header.height, 123_414);
+        let heights: Vec<u32> = context.headers.iter().map(|h| h.height).collect();
+        assert_eq!(heights, (123_405..=123_414).rev().collect::<Vec<_>>());
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r.target == "/blocks/lastHeaders/10"));
     }
 }
