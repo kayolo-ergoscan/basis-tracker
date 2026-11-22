@@ -375,14 +375,16 @@ fn tracker_thread(mut rx: mpsc::Receiver<TrackerCommand>, shared: SharedTrackerS
                 denomination,
                 redeemed_amount,
                 new_already_redeemed,
+                reserve_tree_timestamp,
                 response_tx,
             } => {
-                let result = m.complete_redemption(
+                let result = m.complete_redemption_at(
                     &issuer_pubkey,
                     &recipient_pubkey,
                     &denomination,
                     redeemed_amount,
                     new_already_redeemed,
+                    reserve_tree_timestamp,
                 );
                 if result.is_ok() {
                     shared.set_avl_root_digest(m.tracker.get_state().avl_root_digest);

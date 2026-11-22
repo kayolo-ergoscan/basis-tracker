@@ -103,14 +103,16 @@ mod untested_handlers {
                         redeemed_amount,
                         new_already_redeemed,
                         denomination,
+                        reserve_tree_timestamp,
                         response_tx,
                     } => {
-                        let r = redemption_manager.complete_redemption(
+                        let r = redemption_manager.complete_redemption_at(
                             &issuer_pubkey,
                             &recipient_pubkey,
                             &basis_store::DenomKey::Erg,
                             redeemed_amount,
                             new_already_redeemed,
+                            reserve_tree_timestamp,
                         );
                         let _ = response_tx.send(r);
                     }
@@ -480,6 +482,10 @@ mod untested_handlers {
     /// Reserve box id the pending entries below are recorded against.
     const RESERVE_BOX_ID: &str = "abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123abcd0123";
 
+    /// The note timestamp the pending entries below were built with (the note the
+    /// state-advancing test adds carries it).
+    const RESERVE_TREE_TIMESTAMP: u64 = 1_700_000_000_000;
+
     /// Node stub that accepts any broadcast and answers with another transaction's id.
     async fn spawn_accepting_node() -> String {
         spawn_node(|_| (200, format!("{{\"id\":\"{}\"}}", "ab".repeat(32)))).await
@@ -568,6 +574,7 @@ mod untested_handlers {
             redeemed_amount,
             vec![0x11; 33],
             basis_store::DenomKey::Erg,
+            RESERVE_TREE_TIMESTAMP,
         );
         let fingerprint = unsigned_tx_fingerprint(&unsigned_tx).expect("fingerprint");
         assert!(

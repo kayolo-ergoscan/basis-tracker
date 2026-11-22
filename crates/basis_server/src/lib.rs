@@ -186,6 +186,9 @@ pub enum TrackerCommand {
         /// Explicit cumulative reserve-tree value to sync (from the on-chain build).
         /// Falls back to the note's cumulative redeemed amount when `None`.
         new_already_redeemed: Option<u64>,
+        /// The timestamp the build wrote into the reserve tree value (round 5b, F1): the note's
+        /// timestamp at build time. Falls back to the note's current timestamp when `None`.
+        reserve_tree_timestamp: Option<u64>,
         response_tx: tokio::sync::oneshot::Sender<Result<(), basis_store::RedemptionError>>,
     },
     GenerateProof {

@@ -286,6 +286,13 @@ pub struct CompleteRedemptionRequest {
     /// When omitted, the note's cumulative redeemed amount is used.
     #[serde(default)]
     pub new_already_redeemed: Option<u64>,
+    /// Optional timestamp the redemption's build wrote into the reserve tree value (round 5b,
+    /// F1): the note's timestamp when it was built (a journal entry's `reserve_tree_timestamp`).
+    /// When omitted, the note's current timestamp is used, as before, with a warning: a note
+    /// re-signed after the build then leaves the tracker's reserve tree out of step with the
+    /// reserve's R5.
+    #[serde(default)]
+    pub reserve_tree_timestamp: Option<u64>,
 }
 
 // Redemption response

@@ -3091,12 +3091,23 @@ pub async fn complete_redemption(
         }
     };
 
+    // Round 5b (F1): the reserve tree must take the timestamp the build proved on chain.
+    if payload.reserve_tree_timestamp.is_none() {
+        tracing::warn!(
+            "POST /redeem/complete for {} -> {} without reserve_tree_timestamp: the reserve tree \
+             takes the note's current timestamp; if the note was re-signed after the redemption \
+             was built, the tracker's reserve tree no longer matches the reserve's R5",
+            payload.issuer_pubkey,
+            payload.recipient_pubkey
+        );
+    }
     let cmd = TrackerCommand::CompleteRedemption {
         issuer_pubkey,
         recipient_pubkey,
         denomination,
         redeemed_amount: payload.redeemed_amount,
         new_already_redeemed: payload.new_already_redeemed,
+        reserve_tree_timestamp: payload.reserve_tree_timestamp,
         response_tx,
     };
 

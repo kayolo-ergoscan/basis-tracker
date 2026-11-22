@@ -96,14 +96,16 @@ mod pr16_security_remediation {
                         redeemed_amount,
                         new_already_redeemed,
                         denomination,
+                        reserve_tree_timestamp,
                         response_tx,
                     } => {
-                        let r = redemption_manager.complete_redemption(
+                        let r = redemption_manager.complete_redemption_at(
                             &issuer_pubkey,
                             &recipient_pubkey,
                             &basis_store::DenomKey::Erg,
                             redeemed_amount,
                             new_already_redeemed,
+                            reserve_tree_timestamp,
                         );
                         let _ = response_tx.send(r);
                     }

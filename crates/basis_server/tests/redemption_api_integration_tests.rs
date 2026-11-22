@@ -145,14 +145,16 @@ mod redemption_api_tests {
                         redeemed_amount,
                         new_already_redeemed,
                         denomination: _,
+                        reserve_tree_timestamp,
                         response_tx,
                     } => {
-                        let result = redemption_manager.complete_redemption(
+                        let result = redemption_manager.complete_redemption_at(
                             &issuer_pubkey,
                             &recipient_pubkey,
                             &basis_store::DenomKey::Erg,
                             redeemed_amount,
                             new_already_redeemed,
+                            reserve_tree_timestamp,
                         );
                         let _ = response_tx.send(result);
                     }
@@ -1286,7 +1288,7 @@ mod redemption_api_tests {
                 .to_string(),
             redeemed_amount: 1000,
             new_already_redeemed: None,
-
+            reserve_tree_timestamp: None,
             denomination: String::new(),
         };
 
@@ -1314,7 +1316,7 @@ mod redemption_api_tests {
                 .to_string(),
             redeemed_amount: 1000,
             new_already_redeemed: None,
-
+            reserve_tree_timestamp: None,
             denomination: String::new(),
         };
 
@@ -1340,7 +1342,7 @@ mod redemption_api_tests {
                 .to_string(),
             redeemed_amount: 1000,
             new_already_redeemed: None,
-
+            reserve_tree_timestamp: None,
             denomination: String::new(),
         };
 
@@ -1352,6 +1354,70 @@ mod redemption_api_tests {
         let body = &response.1;
         assert!(!body.success);
         assert!(body.error.is_some());
+    }
+
+    /// Round 5b (F1): `/redeem/complete` takes the reserve tree timestamp the redemption's
+    /// build proved (`reserve_tree_timestamp`). With it, a note re-signed since the build is
+    /// still applied with the build's timestamp: the same values again change nothing, and the
+    /// same amount with another timestamp, or without one (the note's current timestamp), is
+    /// refused because the tree holds the build's.
+    #[tokio::test]
+    async fn test_complete_redemption_takes_the_build_timestamp() {
+        let state = create_mock_app_state().await;
+        let (issuer_secret, issuer_pubkey) = generate_keypair();
+        let (_, recipient_pubkey) = generate_keypair();
+        let (built_at, re_signed_at) = (1_700_000_000_000u64, 1_700_000_060_000u64);
+        for timestamp in [built_at, re_signed_at] {
+            let note = basis_store::IouNote::create_and_sign(
+                recipient_pubkey,
+                1_000,
+                timestamp,
+                &issuer_secret,
+                &[0x42; 32],
+                basis_store::DenomKey::Erg,
+            )
+            .unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            state
+                .tx
+                .send(TrackerCommand::AddNote {
+                    issuer_pubkey,
+                    note,
+                    response_tx: tx,
+                })
+                .await
+                .unwrap();
+            rx.await.unwrap().unwrap();
+        }
+        let request = |reserve_tree_timestamp: Option<u64>| CompleteRedemptionRequest {
+            redemption_id: "repair-1".to_string(),
+            issuer_pubkey: hex::encode(issuer_pubkey),
+            recipient_pubkey: hex::encode(recipient_pubkey),
+            redeemed_amount: 300,
+            new_already_redeemed: Some(300),
+            reserve_tree_timestamp,
+            denomination: "erg".to_string(),
+        };
+
+        for (timestamp, applied) in [
+            (Some(built_at), true),
+            (Some(built_at), true),
+            (Some(re_signed_at), false),
+            (None, false),
+        ] {
+            let (status, body) = complete_redemption(
+                axum::extract::State(state.clone()),
+                axum::extract::Json(request(timestamp)),
+            )
+            .await;
+            if applied {
+                assert_eq!(status, StatusCode::OK, "{timestamp:?}: {:?}", body.error);
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{timestamp:?}");
+                let error = body.error.clone().unwrap_or_default();
+                assert!(error.contains("another timestamp"), "{timestamp:?}: {error}");
+            }
+        }
     }
 
     // ============================================================================
@@ -1701,6 +1767,13 @@ mod redemption_api_tests {
             "020202020202020202020202020202020202020202020202020202020202020202"
         );
         assert_eq!(request.redeemed_amount, 500);
+        // Round 5b (F1): the optional reserve tree timestamp.
+        assert_eq!(request.reserve_tree_timestamp, None);
+        let with_timestamp: CompleteRedemptionRequest = serde_json::from_str(
+            &json.replace("\"redeemed_amount\": 500", "\"redeemed_amount\": 500, \"reserve_tree_timestamp\": 1700000000000"),
+        )
+        .unwrap();
+        assert_eq!(with_timestamp.reserve_tree_timestamp, Some(1_700_000_000_000));
     }
 
     #[tokio::test]

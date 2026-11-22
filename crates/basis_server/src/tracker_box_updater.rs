@@ -441,6 +441,9 @@ struct ConfirmingTx {
     /// Confirmation depth counts from here, never from the creation height: a transaction
     /// that waited in the mempool was built many blocks before it was included.
     inclusion_height: u64,
+    /// The first output's R5 register (serialized, hex), when it has one: for a redemption,
+    /// the reserve tree digest the reserve output carries (round 5b, F1).
+    first_output_r5: Option<String>,
 }
 
 impl ConfirmingTx {
@@ -463,6 +466,11 @@ impl ConfirmingTx {
                 .get("inclusionHeight")
                 .and_then(|h| h.as_u64())
                 .unwrap_or(0),
+            first_output_r5: first
+                .and_then(|b| b.get("additionalRegisters"))
+                .and_then(|r| r.get("R5"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         }
     }
 }
@@ -1031,6 +1039,76 @@ impl TrackerBoxUpdater {
         tx_id: &str,
     ) -> Result<bool, TrackerBoxUpdaterError> {
         Ok(Self::poll_pending_commit(config, tx_id).await?.is_some())
+    }
+
+    /// Round 5b (F1): [`Self::confirmed_deep_enough`] that also returns the first output's R5
+    /// register (serialized, hex) as the blockchain index reports it: `Some(r5)` once `tx_id`
+    /// is in a block deep enough (`r5` is `None` when the output has no R5), `None` while it is
+    /// not.
+    pub async fn confirmed_first_output_r5(
+        config: &TrackerBoxUpdateConfig,
+        tx_id: &str,
+    ) -> Result<Option<Option<String>>, TrackerBoxUpdaterError> {
+        Ok(Self::poll_pending_commit(config, tx_id)
+            .await?
+            .map(|confirming| confirming.first_output_r5))
+    }
+
+    /// Round 5b (F4): whether `box_id` is in the scanner node's UTXO set
+    /// (`GET /utxo/byId/{box_id}`, which follows the chain without index lag).
+    pub async fn box_is_unspent(
+        config: &TrackerBoxUpdateConfig,
+        box_id: &str,
+    ) -> Result<bool, TrackerBoxUpdaterError> {
+        Self::node_knows(
+            config.scanner_node_url.trim_end_matches('/'),
+            config.scanner_api_key.as_deref(),
+            &format!("/utxo/byId/{box_id}"),
+        )
+        .await
+    }
+
+    /// Round 5b (F4): the transaction that spent `box_id`, as the scanner node's blockchain
+    /// index names it (`spentTransactionId` of `GET /blockchain/box/byId/{box_id}`). `None`
+    /// when the index does not name one: the box is unspent, or the index has not reached the
+    /// block that spent it.
+    pub async fn box_spent_by(
+        config: &TrackerBoxUpdateConfig,
+        box_id: &str,
+    ) -> Result<Option<String>, TrackerBoxUpdaterError> {
+        let client = basis_store::http::bounded_client();
+        let path = format!("/blockchain/box/byId/{box_id}");
+        let mut request = client.get(format!(
+            "{}{path}",
+            config.scanner_node_url.trim_end_matches('/')
+        ));
+        if let Some(ref api_key) = config.scanner_api_key {
+            request = request.header("api_key", api_key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| TrackerBoxUpdaterError::HttpError(e.to_string()))?;
+        match response.status().as_u16() {
+            200 => {}
+            404 => return Ok(None),
+            status => {
+                let body = basis_store::http::read_body_capped(response)
+                    .await
+                    .unwrap_or_default();
+                return Err(TrackerBoxUpdaterError::HttpError(format!(
+                    "HTTP {status} from {path}: {body}"
+                )));
+            }
+        }
+        let body = basis_store::http::read_json_capped(response)
+            .await
+            .map_err(|e| TrackerBoxUpdaterError::HttpError(format!("JSON parse error: {}", e)))?;
+        Ok(body
+            .get("spentTransactionId")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string))
     }
 
     /// Whether the commit `tx_id`, in a block at `confirming.inclusion_height`, is at least
@@ -3135,7 +3213,21 @@ mod tests {
                 box_id: "ee".repeat(32),
                 height: 123_470,
                 inclusion_height: 123_500,
+                first_output_r5: None,
             }
+        );
+        // Round 5b (F1): the first output's R5, as the index serializes it.
+        let with_r5 = serde_json::json!({
+            "inclusionHeight": 123_500,
+            "outputs": [{
+                "boxId": "ee".repeat(32),
+                "creationHeight": 123_470,
+                "additionalRegisters": { "R4": "0e01aa", "R5": "64abcd" }
+            }]
+        });
+        assert_eq!(
+            ConfirmingTx::from_indexed_tx(&with_r5, "tx").first_output_r5,
+            Some("64abcd".to_string())
         );
         // Unknown heights are 0 (depth 0: not deep enough), the box falls back to the tx id.
         assert_eq!(
@@ -3144,6 +3236,7 @@ mod tests {
                 box_id: "tx".to_string(),
                 height: 0,
                 inclusion_height: 0,
+                first_output_r5: None,
             }
         );
     }

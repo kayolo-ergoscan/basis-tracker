@@ -467,14 +467,16 @@ async fn main() {
                     denomination,
                     redeemed_amount,
                     new_already_redeemed,
+                    reserve_tree_timestamp,
                     response_tx,
                 } => {
-                    let result = redemption_manager.complete_redemption(
+                    let result = redemption_manager.complete_redemption_at(
                         &issuer_pubkey,
                         &recipient_pubkey,
                         &denomination,
                         redeemed_amount,
                         new_already_redeemed,
+                        reserve_tree_timestamp,
                     );
 
                     // Update shared state for tracker box updater if successful

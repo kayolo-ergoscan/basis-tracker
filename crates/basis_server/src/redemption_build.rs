@@ -191,12 +191,7 @@ impl NodeBox {
     /// The 33-byte reserve AVL tree digest held in R5, if present. R5 serializes as
     /// `0x64 || 33-byte digest || flags || keylen || valuelen`, so the digest is hex chars [2..68].
     fn r5_digest_hex(&self) -> Option<String> {
-        let r5 = self.additional_registers.get("R5")?;
-        if r5.len() >= 68 && r5.starts_with("64") {
-            Some(r5[2..68].to_string())
-        } else {
-            None
-        }
+        crate::redemption_confirmer::r5_digest_hex(self.additional_registers.get("R5")?)
     }
 }
 
@@ -518,6 +513,10 @@ pub struct PendingRedemption {
     pub reserve_r5_digest: Vec<u8>,
     /// Denomination of the note being redeemed.
     pub denomination: basis_store::DenomKey,
+    /// The timestamp the build wrote into the note's reserve tree value (`timestamp ‖
+    /// new_already_redeemed`, behind `reserve_r5_digest`): the note's timestamp at build time.
+    /// The redemption is applied with exactly this value (round 5b, F1).
+    pub reserve_tree_timestamp: u64,
     issued_at: Instant,
 }
 
@@ -540,6 +539,7 @@ impl PendingRedemption {
         new_already_redeemed: u64,
         reserve_r5_digest: Vec<u8>,
         denomination: basis_store::DenomKey,
+        reserve_tree_timestamp: u64,
     ) -> Self {
         Self {
             unsigned_tx_id,
@@ -550,6 +550,7 @@ impl PendingRedemption {
             new_already_redeemed,
             reserve_r5_digest,
             denomination,
+            reserve_tree_timestamp,
             issued_at: Instant::now(),
         }
     }
@@ -1597,14 +1598,9 @@ async fn build_redemption_inner(
             return api_err(
                 StatusCode::CONFLICT,
                 format!(
-                    "the reserve of issuer {issuer_hex} in {} has redemption {} waiting for the \
-                     chain; build again once it is confirmed, or once it is dropped (about {} \
-                     minutes in no mempool)",
+                    "the reserve of issuer {issuer_hex} in {}: {}",
                     denomination.denomination_id(),
-                    waiting.tx_id,
-                    crate::redemption_confirmer::MAX_REDEMPTION_MISSING_CHECKS as u64
-                        * crate::redemption_confirmer::REDEMPTION_CHECK_INTERVAL.as_secs()
-                        / 60
+                    crate::redemption_confirmer::waiting_reason(&waiting)
                 ),
             )
         }
@@ -2739,6 +2735,7 @@ async fn build_redemption_inner(
             new_already_redeemed,
             new_reserve_digest.clone(),
             denomination,
+            note.timestamp,
         ),
     ) {
         return api_err(
@@ -2851,7 +2848,11 @@ pub async fn submit_redemption(
             .unwrap_or_default(),
         missing_checks: 0,
         apply_error: None,
-        ..Default::default()
+        // Round 5b (F1): the build's reserve tree value and digest, applied and checked as built.
+        reserve_tree_timestamp: Some(pending.reserve_tree_timestamp),
+        reserve_r5_digest: Some(hex::encode(&pending.reserve_r5_digest)),
+        digest_mismatch: None,
+        next_check_at_ms: 0,
     };
     // Round 5b (F9): the entry is on disk before the node can have the transaction.
     if let Err(e) = state
@@ -3163,6 +3164,7 @@ mod tests {
             new_already_redeemed: 2_000,
             reserve_r5_digest: vec![0x11; 33],
             denomination: basis_store::DenomKey::Erg,
+            reserve_tree_timestamp: 1_700_000_000_000,
             issued_at: Instant::now(),
         }
     }

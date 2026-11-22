@@ -103,14 +103,16 @@ mod http_api_tests {
                         redeemed_amount,
                         new_already_redeemed,
                         denomination,
+                        reserve_tree_timestamp,
                         response_tx,
                     } => {
-                        let result = redemption_manager.complete_redemption(
+                        let result = redemption_manager.complete_redemption_at(
                             &issuer_pubkey,
                             &recipient_pubkey,
                             &basis_store::DenomKey::Erg,
                             redeemed_amount,
                             new_already_redeemed,
+                            reserve_tree_timestamp,
                         );
                         let _ = response_tx.send(result);
                     }
