@@ -2697,6 +2697,26 @@ pub async fn submit_redemption(
         }
     };
 
+    // Round 5, item 3: the updater holds back a commit that would spend the tracker box this
+    // redemption reads as its data input while the redemption waits in the mempool.
+    let data_input_ids: Vec<String> = payload
+        .signed_tx
+        .get("dataInputs")
+        .and_then(Value::as_array)
+        .map(|inputs| {
+            inputs
+                .iter()
+                .filter_map(|input| input.get("boxId").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    state
+        .shared_tracker_state
+        .lock()
+        .await
+        .record_submitted_redemption(tx_id.clone(), data_input_ids);
+
     // Sync local note + reserve tree state with the broadcast transaction. The reserve
     // tree value must be the cumulative amount proven on-chain (from the build), which
     // can differ from the note's cumulative redeemed amount when reserves were created

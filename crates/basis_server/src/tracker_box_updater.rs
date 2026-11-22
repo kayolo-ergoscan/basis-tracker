@@ -41,6 +41,24 @@ pub struct PendingState {
     pub submitted_height: Option<u64>,
 }
 
+/// A redemption broadcast through `/redemption/submit` that the updater has not seen leave the
+/// mempool yet (round 5, item 3). A commit spends the tracker box such a redemption reads as a
+/// data input, which would invalidate it, so the updater holds the commit back for a while.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmittedRedemption {
+    /// Id of the broadcast redemption transaction.
+    pub tx_id: String,
+    /// The boxes the redemption reads as data inputs (the tracker box).
+    pub data_input_ids: Vec<String>,
+    /// When `/redemption/submit` broadcast it.
+    pub submitted_at: std::time::Instant,
+}
+
+/// Most submitted redemptions [`SharedTrackerState`] keeps for the commit deferral; the oldest
+/// make room. Each needed a build within its budgets, and a redemption defers a commit for at
+/// most [`MAX_COMMIT_DEFERRAL`] anyway.
+pub const MAX_SUBMITTED_REDEMPTIONS: usize = 1024;
+
 /// Shared state for the tracker box updater
 #[derive(Debug, Clone)]
 pub struct SharedTrackerState {
@@ -50,6 +68,9 @@ pub struct SharedTrackerState {
     pub tracker_nft_id: Arc<RwLock<Option<String>>>,
     pub confirmed: Arc<RwLock<ConfirmedState>>,
     pub pending: Arc<RwLock<PendingState>>,
+    /// Redemptions submitted through `/redemption/submit` and not yet seen out of the mempool
+    /// (see [`SubmittedRedemption`]).
+    pub submitted_redemptions: Arc<RwLock<Vec<SubmittedRedemption>>>,
 }
 
 impl Default for SharedTrackerState {
@@ -69,6 +90,7 @@ impl SharedTrackerState {
             tracker_nft_id: Arc::new(RwLock::new(None)),
             confirmed: Arc::new(RwLock::new(ConfirmedState::default())),
             pending: Arc::new(RwLock::new(PendingState::default())),
+            submitted_redemptions: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -80,6 +102,7 @@ impl SharedTrackerState {
             tracker_nft_id: Arc::new(RwLock::new(None)),
             confirmed: Arc::new(RwLock::new(ConfirmedState::default())),
             pending: Arc::new(RwLock::new(PendingState::default())),
+            submitted_redemptions: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -173,6 +196,43 @@ impl SharedTrackerState {
     pub fn get_confirmed(&self) -> ConfirmedState {
         self.confirmed.read().map(|c| c.clone()).unwrap_or_default()
     }
+
+    /// Remember a redemption `/redemption/submit` just broadcast (round 5, item 3), so the
+    /// updater does not spend the tracker box it reads while it waits in the mempool.
+    pub fn record_submitted_redemption(&self, tx_id: String, data_input_ids: Vec<String>) {
+        let mut submitted = self
+            .submitted_redemptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        submitted.retain(|r| r.tx_id != tx_id);
+        submitted.push(SubmittedRedemption {
+            tx_id,
+            data_input_ids,
+            submitted_at: std::time::Instant::now(),
+        });
+        let excess = submitted.len().saturating_sub(MAX_SUBMITTED_REDEMPTIONS);
+        submitted.drain(..excess);
+    }
+
+    /// Snapshot the submitted redemptions, oldest first.
+    pub fn get_submitted_redemptions(&self) -> Vec<SubmittedRedemption> {
+        self.submitted_redemptions
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// Forget the submitted redemptions with these ids.
+    pub fn forget_submitted_redemptions(&self, tx_ids: &[String]) {
+        if tx_ids.is_empty() {
+            return;
+        }
+        let mut submitted = self
+            .submitted_redemptions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        submitted.retain(|r| !tx_ids.contains(&r.tx_id));
+    }
 }
 
 /// Configuration for the tracker box updater. `Debug` redacts the tracker secret key.
@@ -202,7 +262,24 @@ pub struct TrackerBoxUpdateConfig {
     /// Recommit the unchanged digest once the tracker box is this many blocks old and nothing
     /// else is pending, so the box never reaches the 2160-block emergency window. 0 disables.
     pub heartbeat_blocks: u64,
+    /// Round 5, item 4: how often a submitted commit is looked for on chain between cycles
+    /// (one `GET /blockchain/transaction/byId/{id}` per poll while a commit is pending).
+    /// [`PENDING_COMMIT_POLL_INTERVAL`] by default; the cycles keep `update_interval_seconds`.
+    pub pending_poll_interval: Duration,
+    /// Round 5, item 3: how long one redemption submitted through `/redemption/submit` may hold
+    /// back a commit while it waits in the mempool ([`MAX_COMMIT_DEFERRAL`] by default).
+    pub max_commit_deferral: Duration,
 }
+
+/// Default [`TrackerBoxUpdateConfig::pending_poll_interval`]: a minute.
+pub const PENDING_COMMIT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default [`TrackerBoxUpdateConfig::max_commit_deferral`]: 20 minutes, about ten blocks.
+pub const MAX_COMMIT_DEFERRAL: Duration = Duration::from_secs(20 * 60);
+
+/// No commit is held back for a redemption once the tracker box is within this many blocks of
+/// the emergency window ([`crate::config::TRACKER_EMERGENCY_WINDOW_BLOCKS`]).
+pub const COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS: u64 = 200;
 
 impl std::fmt::Debug for TrackerBoxUpdateConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -218,6 +295,8 @@ impl std::fmt::Debug for TrackerBoxUpdateConfig {
             min_confirmation_depth,
             reserve_contract_addresses,
             heartbeat_blocks,
+            pending_poll_interval,
+            max_commit_deferral,
         } = self;
         f.debug_struct("TrackerBoxUpdateConfig")
             .field("wallet_node_url", &redact::Url(wallet_node_url))
@@ -231,6 +310,8 @@ impl std::fmt::Debug for TrackerBoxUpdateConfig {
             .field("min_confirmation_depth", min_confirmation_depth)
             .field("reserve_contract_addresses", reserve_contract_addresses)
             .field("heartbeat_blocks", heartbeat_blocks)
+            .field("pending_poll_interval", pending_poll_interval)
+            .field("max_commit_deferral", max_commit_deferral)
             .finish()
     }
 }
@@ -249,6 +330,8 @@ impl Default for TrackerBoxUpdateConfig {
             min_confirmation_depth: 2,
             reserve_contract_addresses: Vec::new(),
             heartbeat_blocks: 720,
+            pending_poll_interval: PENDING_COMMIT_POLL_INTERVAL,
+            max_commit_deferral: MAX_COMMIT_DEFERRAL,
         }
     }
 }
@@ -449,6 +532,14 @@ fn heartbeat_due(heartbeat_blocks: u64, current_height: u64, box_creation_height
     heartbeat_blocks > 0 && current_height.saturating_sub(box_creation_height) >= heartbeat_blocks
 }
 
+/// Round 5, item 3: whether a commit may still be held back for a redemption: the tracker box,
+/// created at `box_creation_height`, is more than [`COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS`]
+/// blocks short of the emergency window at `current_height`.
+fn commit_may_wait(current_height: u64, box_creation_height: u64) -> bool {
+    let age = current_height.saturating_sub(box_creation_height);
+    age + COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS < crate::config::TRACKER_EMERGENCY_WINDOW_BLOCKS
+}
+
 /// Whether the tracker can spend `box_ergo_tree_hex`: it must be exactly `P2PK(tracker_pubkey)`.
 /// A tracker box under any other script would be committed to with a transaction the tracker
 /// key cannot sign, or by spending a box the operator does not control.
@@ -489,6 +580,13 @@ impl TrackerBoxUpdater {
         let started = tokio::time::Instant::now();
         let mut tracker_box_recorded = false;
         let mut retry_soon = false;
+        // Round 5, item 4: between cycles, a pending commit is looked for on chain every
+        // `pending_poll_interval` (one node request per poll), so a confirmed commit is noticed
+        // within a minute instead of at the next cycle. The cycles keep their interval.
+        let poll_period = config.pending_poll_interval.max(Duration::from_millis(10));
+        let mut pending_poll =
+            tokio::time::interval_at(tokio::time::Instant::now() + poll_period, poll_period);
+        pending_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         info!(
             "Tracker box updater started with {}s interval",
@@ -498,7 +596,7 @@ impl TrackerBoxUpdater {
         loop {
             // `biased`: a shutdown that arrived during a cycle wins over a missed tick, so the
             // updater never starts another cycle once it was asked to stop.
-            tokio::select! {
+            let poll_only = tokio::select! {
                 biased;
                 _ = shutdown_rx.recv() => {
                     info!("Tracker box updater received shutdown signal, stopping");
@@ -507,8 +605,35 @@ impl TrackerBoxUpdater {
                 _ = tokio::time::sleep(STARTUP_RETRY_DELAY), if retry_soon => {
                     // The regular schedule restarts from this cycle: no burst of missed ticks.
                     ticker.reset();
+                    false
                 }
-                _ = ticker.tick(), if !retry_soon => {}
+                _ = ticker.tick(), if !retry_soon => false,
+                _ = pending_poll.tick(), if pending_tx.is_some() && !retry_soon => true,
+            };
+
+            if poll_only {
+                let Some((tx_id, expected_digest)) = pending_tx.clone() else {
+                    continue;
+                };
+                match Self::poll_pending_commit(&config, &tx_id).await {
+                    Ok(Some(confirming)) => {
+                        Self::commit_confirmed(
+                            &config,
+                            &shared_state,
+                            &cmd_tx,
+                            &tx_id,
+                            expected_digest,
+                            confirming,
+                        )
+                        .await;
+                        last_submitted_digest = Some(expected_digest);
+                        pending_missing_cycles = 0;
+                        pending_tx = None;
+                    }
+                    Ok(None) => {}
+                    Err(e) => warn!("Pending commit {} could not be looked up: {}", tx_id, e),
+                }
+                continue;
             }
             retry_soon = false;
 
@@ -517,11 +642,9 @@ impl TrackerBoxUpdater {
                     Ok(TxStatus::OnChain) => {
                         // Look up the confirming box to record its height/id, and the block
                         // height the transaction was included at.
-                        let ConfirmingTx {
-                            box_id,
-                            height,
-                            inclusion_height,
-                        } = match Self::fetch_tracker_box_summary(&config, &tx_id).await {
+                        let confirming = match Self::fetch_tracker_box_summary(&config, &tx_id)
+                            .await
+                        {
                             Ok(summary) => summary,
                             Err(e) => {
                                 error!(
@@ -531,61 +654,29 @@ impl TrackerBoxUpdater {
                                 continue;
                             }
                         };
-
-                        // Require a minimum on-chain depth (presence in a block
-                        // alone is not confirmation) before promoting pending
-                        // notes to Confirmed. The depth counts from the block that
-                        // included the transaction: its outputs' creation height is
-                        // when it was built, which can be many blocks earlier for a
-                        // transaction that waited in the mempool.
-                        if config.min_confirmation_depth > 1 {
-                            match Self::get_node_height(&config).await {
-                                Ok(current) => {
-                                    let depth =
-                                        confirmation_depth(current as u64, inclusion_height);
-                                    if depth < config.min_confirmation_depth {
-                                        info!(
-                                            "Transaction {} included at height {} (depth {}/{}), waiting for more confirmations...",
-                                            tx_id, inclusion_height, depth, config.min_confirmation_depth
-                                        );
-                                        continue;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to fetch node height for depth check of {}: {}. Will retry.",
-                                        tx_id, e
-                                    );
-                                    continue;
-                                }
+                        match Self::deep_enough(&config, &tx_id, &confirming).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                error!(
+                                    "Failed to fetch node height for depth check of {}: {}. Will retry.",
+                                    tx_id, e
+                                );
+                                continue;
                             }
                         }
-
-                        info!("Transaction {} confirmed on chain. Update complete.", tx_id);
+                        Self::commit_confirmed(
+                            &config,
+                            &shared_state,
+                            &cmd_tx,
+                            &tx_id,
+                            expected_digest,
+                            confirming,
+                        )
+                        .await;
                         last_submitted_digest = Some(expected_digest);
                         pending_missing_cycles = 0;
-
-                        shared_state.set_confirmed(expected_digest, box_id.clone(), height);
-                        shared_state.clear_pending();
                         pending_tx = None;
-
-                        if let Some(ref tx) = cmd_tx {
-                            let (rtx, rrx) = tokio::sync::oneshot::channel();
-                            let _ = tx
-                                .send(crate::TrackerCommand::ConfirmPendingNotes {
-                                    digest: expected_digest,
-                                    box_id,
-                                    height,
-                                    response_tx: rtx,
-                                })
-                                .await;
-                            let _ = rrx.await;
-                        }
-
-                        // Issue #17 phase 2: with the from-edge decrease now
-                        // confirmed, evaluate staged exchanges (apply the
-                        // to-edge increase or cancel if the reserve changed).
-                        Self::process_pending_exchanges(&config, &cmd_tx).await;
                     }
                     Ok(TxStatus::InMempool) => {
                         // Waiting for a block: still pending, never rebuilt or resubmitted.
@@ -794,6 +885,21 @@ impl TrackerBoxUpdater {
                 continue;
             }
 
+            // Round 5, item 3: a commit spends the tracker box that a redemption waiting in the
+            // mempool reads as its data input, which would invalidate the redemption.
+            if let Some(waiting) =
+                Self::redemption_holding_commit(&config, &shared_state, &tracker_box).await
+            {
+                info!(
+                    "Commit deferred: redemption {} reads tracker box {} and is still in the mempool (submitted {}s ago, held back for at most {}s)",
+                    waiting.tx_id,
+                    tracker_box.box_id,
+                    waiting.submitted_at.elapsed().as_secs(),
+                    config.max_commit_deferral.as_secs()
+                );
+                continue;
+            }
+
             match Self::submit_tracker_update(
                 &tracker_nft_id,
                 &config,
@@ -854,6 +960,204 @@ impl TrackerBoxUpdater {
             warn!("The tracker thread did not answer RefreshDigest; using the shared digest");
         }
         shared_state.get_avl_root_digest()
+    }
+
+    /// Round 5, item 4: one look at the chain for the pending commit `tx_id`
+    /// (`GET /blockchain/transaction/byId/{tx_id}` on the scanner node): `Some` once it is in a
+    /// block and at least `min_confirmation_depth` deep (the depth costs one `/info` read, only
+    /// once the commit is in a block), `None` while it is not.
+    async fn poll_pending_commit(
+        config: &TrackerBoxUpdateConfig,
+        tx_id: &str,
+    ) -> Result<Option<ConfirmingTx>, TrackerBoxUpdaterError> {
+        let client = basis_store::http::bounded_client();
+        let path = format!("/blockchain/transaction/byId/{tx_id}");
+        let mut request = client.get(format!(
+            "{}{path}",
+            config.scanner_node_url.trim_end_matches('/')
+        ));
+        if let Some(ref api_key) = config.scanner_api_key {
+            request = request.header("api_key", api_key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| TrackerBoxUpdaterError::HttpError(e.to_string()))?;
+        match response.status().as_u16() {
+            200 => {}
+            404 => return Ok(None),
+            status => {
+                let body = basis_store::http::read_body_capped(response)
+                    .await
+                    .unwrap_or_default();
+                return Err(TrackerBoxUpdaterError::HttpError(format!(
+                    "HTTP {status} from {path}: {body}"
+                )));
+            }
+        }
+        let body = basis_store::http::read_json_capped(response)
+            .await
+            .map_err(|e| TrackerBoxUpdaterError::HttpError(format!("JSON parse error: {}", e)))?;
+        let confirming = ConfirmingTx::from_indexed_tx(&body, tx_id);
+        if Self::deep_enough(config, tx_id, &confirming).await? {
+            Ok(Some(confirming))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Whether the commit `tx_id`, in a block at `confirming.inclusion_height`, is at least
+    /// `min_confirmation_depth` deep. Presence in a block alone is not confirmation, and the
+    /// depth counts from the block that included the transaction: its outputs' creation height
+    /// is when it was built, which can be many blocks earlier for a transaction that waited in
+    /// the mempool.
+    async fn deep_enough(
+        config: &TrackerBoxUpdateConfig,
+        tx_id: &str,
+        confirming: &ConfirmingTx,
+    ) -> Result<bool, TrackerBoxUpdaterError> {
+        if config.min_confirmation_depth <= 1 {
+            return Ok(true);
+        }
+        let current = Self::get_node_height(config).await?;
+        let depth = confirmation_depth(current as u64, confirming.inclusion_height);
+        if depth < config.min_confirmation_depth {
+            info!(
+                "Transaction {} included at height {} (depth {}/{}), waiting for more confirmations...",
+                tx_id, confirming.inclusion_height, depth, config.min_confirmation_depth
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The pending commit `tx_id` is confirmed: record the new tracker box and the committed
+    /// digest, promote the pending notes, and evaluate staged exchanges (issue #17 phase 2).
+    /// The caller clears its own pending state.
+    async fn commit_confirmed(
+        config: &TrackerBoxUpdateConfig,
+        shared_state: &SharedTrackerState,
+        cmd_tx: &Option<tokio::sync::mpsc::Sender<crate::TrackerCommand>>,
+        tx_id: &str,
+        expected_digest: [u8; 33],
+        confirming: ConfirmingTx,
+    ) {
+        info!("Transaction {} confirmed on chain. Update complete.", tx_id);
+        let ConfirmingTx { box_id, height, .. } = confirming;
+        shared_state.set_confirmed(expected_digest, box_id.clone(), height);
+        // The commit's first output is the new tracker box, which builds read as their data
+        // input from now on (round 5, item 4: a poll between cycles finds it first). Without
+        // outputs in the answer the id is the transaction's, which is no box: left to the
+        // cycle's own lookup.
+        if box_id != tx_id {
+            shared_state.set_tracker_box_id(box_id.clone());
+        }
+        shared_state.clear_pending();
+
+        if let Some(ref tx) = cmd_tx {
+            let (rtx, rrx) = tokio::sync::oneshot::channel();
+            let _ = tx
+                .send(crate::TrackerCommand::ConfirmPendingNotes {
+                    digest: expected_digest,
+                    box_id,
+                    height,
+                    response_tx: rtx,
+                })
+                .await;
+            let _ = rrx.await;
+        }
+
+        // Issue #17 phase 2: with the from-edge decrease now confirmed, evaluate staged
+        // exchanges (apply the to-edge increase or cancel if the reserve changed).
+        Self::process_pending_exchanges(config, cmd_tx).await;
+    }
+
+    /// Round 5, item 3: the redemption submitted through `/redemption/submit` that holds back a
+    /// commit of `tracker_box`, if one does: it reads `tracker_box` as a data input, was
+    /// submitted less than `max_commit_deferral` ago, and is still in a mempool (or its status
+    /// cannot be read). Redemptions in a block or gone from the mempools, and those that read
+    /// another box, are forgotten; one held back for `max_commit_deferral` is committed over
+    /// with a warning. Nothing is held back once the tracker box is within
+    /// [`COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS`] of the emergency window, or when the node
+    /// height cannot be read.
+    async fn redemption_holding_commit(
+        config: &TrackerBoxUpdateConfig,
+        shared_state: &SharedTrackerState,
+        tracker_box: &ErgoBoxApi,
+    ) -> Option<SubmittedRedemption> {
+        let submitted = shared_state.get_submitted_redemptions();
+        if submitted.is_empty() {
+            return None;
+        }
+        let mut forget = Vec::new();
+        let mut waiting = Vec::new();
+        for redemption in submitted {
+            if !redemption.data_input_ids.contains(&tracker_box.box_id) {
+                // It read an older tracker box, already spent: in a block already, or invalid.
+                forget.push(redemption.tx_id);
+            } else if redemption.submitted_at.elapsed() >= config.max_commit_deferral {
+                warn!(
+                    "Committing although redemption {} (submitted {}s ago) may still be in the mempool: a redemption holds back a commit for at most {}s. If it is not in a block yet, it fails and must be built again.",
+                    redemption.tx_id,
+                    redemption.submitted_at.elapsed().as_secs(),
+                    config.max_commit_deferral.as_secs()
+                );
+                forget.push(redemption.tx_id);
+            } else {
+                waiting.push(redemption);
+            }
+        }
+        shared_state.forget_submitted_redemptions(&forget);
+        if waiting.is_empty() {
+            return None;
+        }
+
+        match Self::get_node_height(config).await {
+            Ok(height) => {
+                let creation_height = tracker_box.creation_height as u64;
+                if !commit_may_wait(height as u64, creation_height) {
+                    warn!(
+                        "Committing although {} submitted redemption(s) may still be in the mempool: tracker box {} is {} blocks old, within {} blocks of the {}-block emergency window",
+                        waiting.len(),
+                        tracker_box.box_id,
+                        (height as u64).saturating_sub(creation_height),
+                        COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS,
+                        crate::config::TRACKER_EMERGENCY_WINDOW_BLOCKS
+                    );
+                    return None;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Committing without waiting for {} submitted redemption(s): the node height (tracker box age) cannot be read: {}",
+                    waiting.len(),
+                    e
+                );
+                return None;
+            }
+        }
+
+        let mut done = Vec::new();
+        let mut holding = None;
+        for redemption in waiting {
+            match Self::check_transaction_confirmation(config, &redemption.tx_id).await {
+                Ok(TxStatus::InMempool) => {
+                    holding = Some(redemption);
+                    break;
+                }
+                Ok(TxStatus::OnChain) | Ok(TxStatus::Missing) => done.push(redemption.tx_id),
+                Err(e) => {
+                    warn!(
+                        "Status of redemption {} cannot be read ({}); holding the commit back",
+                        redemption.tx_id, e
+                    );
+                    holding = Some(redemption);
+                    break;
+                }
+            }
+        }
+        shared_state.forget_submitted_redemptions(&done);
+        holding
     }
 
     /// Whether this cycle should recommit an unchanged digest (heartbeat): enabled, and the
@@ -2609,8 +2913,20 @@ mod tests {
     async fn run_updater(
         lookup: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
         height: Arc<std::sync::atomic::AtomicU64>,
-        mut done: impl FnMut(&[crate::local_wallet::tests::Seen]) -> bool,
+        done: impl FnMut(&[crate::local_wallet::tests::Seen]) -> bool,
     ) -> Vec<crate::local_wallet::tests::Seen> {
+        run_updater_with(lookup, height, |_, _, _| {}, done).await.0
+    }
+
+    /// [`run_updater`] with the config and the shared state adjusted by `setup` before the
+    /// updater starts (the fixture gives the tracker box). Returns the requests and the shared
+    /// state after the updater stopped.
+    async fn run_updater_with(
+        lookup: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+        height: Arc<std::sync::atomic::AtomicU64>,
+        setup: impl FnOnce(&mut TrackerBoxUpdateConfig, &SharedTrackerState, &CommitFixture),
+        mut done: impl FnMut(&[crate::local_wallet::tests::Seen]) -> bool,
+    ) -> (Vec<crate::local_wallet::tests::Seen>, SharedTrackerState) {
         use crate::local_wallet::tests::{mock_node, tree_of, utxo_box, LAST_HEADERS_JSON};
         use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
 
@@ -2678,7 +2994,7 @@ mod tests {
         })
         .await;
 
-        let config = TrackerBoxUpdateConfig {
+        let mut config = TrackerBoxUpdateConfig {
             wallet_node_url: url.clone(),
             scanner_node_url: url,
             tracker_secret_key: Some(fx.secret),
@@ -2689,8 +3005,14 @@ mod tests {
         shared.set_tracker_nft_id(hex::encode(fx.nft));
         // Not the digest in the tracker box's R5 (the empty tree), so there is a commit to make.
         shared.set_avl_root_digest([0x42; 33]);
+        setup(&mut config, &shared, &fx);
         let (stop_tx, stop_rx) = tokio::sync::broadcast::channel(1);
-        let updater = tokio::spawn(TrackerBoxUpdater::start(config, shared, stop_rx, None));
+        let updater = tokio::spawn(TrackerBoxUpdater::start(
+            config,
+            shared.clone(),
+            stop_rx,
+            None,
+        ));
 
         let started = std::time::Instant::now();
         loop {
@@ -2712,7 +3034,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let requests = seen.lock().unwrap().clone();
-        requests
+        (requests, shared)
     }
 
     fn count(seen: &[crate::local_wallet::tests::Seen], prefix: &str) -> usize {
@@ -2848,6 +3170,225 @@ mod tests {
             "confirmed at depth 2"
         );
         assert_eq!(broadcasts(&seen), 1);
+    }
+
+    /// Round 5, item 4: with cycles 600 s apart, the pending commit is looked for between them,
+    /// with one chain lookup per poll and nothing else, and once it is deep enough the new
+    /// tracker box and the committed digest are recorded without waiting for the next cycle.
+    #[tokio::test]
+    async fn a_pending_commit_is_polled_between_cycles() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        let included_at = 123_500u64;
+        let new_box = "ee".repeat(32);
+        let tx_json = serde_json::json!({
+            "inclusionHeight": included_at,
+            "outputs": [{ "boxId": new_box, "creationHeight": included_at - 1 }]
+        })
+        .to_string();
+        let chain_lookups = Arc::new(AtomicUsize::new(0));
+        let lookups = chain_lookups.clone();
+        // Three polls find nothing, the fourth finds the commit in a block.
+        let lookup = move |path: &str| {
+            if path.starts_with(CHAIN_LOOKUP) && lookups.fetch_add(1, Ordering::SeqCst) >= 3 {
+                (200, tx_json.clone())
+            } else {
+                (404, "{}".to_string())
+            }
+        };
+        let height = Arc::new(AtomicU64::new(included_at + 1));
+        let (seen, shared) = run_updater_with(
+            lookup,
+            height,
+            |config, _, _| {
+                config.update_interval_seconds = 600;
+                config.pending_poll_interval = Duration::from_millis(100);
+            },
+            |seen| count(seen, CHAIN_LOOKUP) >= 4,
+        )
+        .await;
+
+        assert_eq!(broadcasts(&seen), 1);
+        let broadcast = seen.iter().position(is_broadcast).unwrap();
+        let after: Vec<String> = seen[broadcast + 1..]
+            .iter()
+            .map(|r| r.target.split('?').next().unwrap_or_default().to_string())
+            .collect();
+        // Four polls, one chain lookup each, and the height for the depth once it was found
+        // (the `/info` before them is the commit's submitted height).
+        assert_eq!(count(&seen[broadcast..], CHAIN_LOOKUP), 4, "{after:?}");
+        assert_eq!(count(&seen[broadcast..], MEMPOOL_LOOKUP), 0, "{after:?}");
+        assert_eq!(count(&seen[broadcast..], "/blockchain/box/unspent/byTokenId/"), 0);
+        let first_poll = broadcast
+            + seen[broadcast..]
+                .iter()
+                .position(|r| r.target.starts_with(CHAIN_LOOKUP))
+                .unwrap();
+        assert_eq!(count(&seen[first_poll..], "/info"), 1, "{after:?}");
+
+        assert_eq!(shared.get_pending().tx_id, None, "no longer pending");
+        assert_eq!(shared.get_confirmed().digest, Some([0x42; 33]));
+        assert_eq!(shared.get_confirmed().box_id, Some(new_box.clone()));
+        assert_eq!(shared.get_tracker_box_id(), Some(new_box), "builds read the new box");
+    }
+
+    /// The submitted redemption the deferral tests use, and the mock answers for it.
+    const REDEMPTION_TX: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// Round 5, item 3: while a redemption submitted through `/redemption/submit` waits in the
+    /// mempool and reads the current tracker box, no commit is made; once it is in a block, the
+    /// next cycle commits. A redemption that reads another box holds nothing back and is
+    /// forgotten without a lookup.
+    #[tokio::test]
+    async fn a_commit_waits_for_a_submitted_redemption_in_the_mempool() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        let pool_lookups = Arc::new(AtomicUsize::new(0));
+        let pool = pool_lookups.clone();
+        let lookup = move |path: &str| {
+            let id = path.rsplit('/').next().unwrap_or_default();
+            if id == REDEMPTION_TX {
+                if path.starts_with(MEMPOOL_LOOKUP) {
+                    // In the mempool for three cycles, then in a block.
+                    if pool.fetch_add(1, Ordering::SeqCst) < 3 {
+                        return (200, "{}".to_string());
+                    }
+                    return (404, "{}".to_string());
+                }
+                return (200, "{}".to_string());
+            }
+            // The commit, once made, waits in the mempool.
+            if path.starts_with(MEMPOOL_LOOKUP) {
+                (200, "{}".to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        };
+        let height = Arc::new(AtomicU64::new(123_500));
+        let (seen, shared) = run_updater_with(
+            lookup,
+            height,
+            |_, shared, fx| {
+                shared.record_submitted_redemption(
+                    REDEMPTION_TX.to_string(),
+                    vec![fx.tracker_api.box_id.clone()],
+                );
+                shared.record_submitted_redemption("cd".repeat(32), vec!["ff".repeat(32)]);
+            },
+            |seen| broadcasts(seen) >= 1,
+        )
+        .await;
+
+        let broadcast = seen.iter().position(is_broadcast).unwrap();
+        let before = &seen[..broadcast];
+        let redemption_mempool = format!("{MEMPOOL_LOOKUP}{REDEMPTION_TX}");
+        assert_eq!(count(before, &redemption_mempool), 4, "three cycles held back, then gone");
+        assert!(count(before, "/blockchain/box/unspent/byTokenId/") >= 4);
+        assert_eq!(count(&seen, &format!("{MEMPOOL_LOOKUP}{}", "cd".repeat(32))), 0);
+        assert!(shared.get_submitted_redemptions().is_empty(), "both forgotten");
+    }
+
+    /// Round 5, item 3: a redemption that stays in the mempool holds a commit back for at most
+    /// `max_commit_deferral`; then the commit is made anyway.
+    #[tokio::test]
+    async fn a_redemption_holds_a_commit_back_for_a_limited_time() {
+        use std::sync::atomic::AtomicU64;
+        let lookup = |path: &str| {
+            if path.starts_with(MEMPOOL_LOOKUP) {
+                (200, "{}".to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        };
+        let height = Arc::new(AtomicU64::new(123_500));
+        let started = std::time::Instant::now();
+        let (seen, shared) = run_updater_with(
+            lookup,
+            height,
+            |config, shared, fx| {
+                config.max_commit_deferral = Duration::from_millis(2_500);
+                shared.record_submitted_redemption(
+                    REDEMPTION_TX.to_string(),
+                    vec![fx.tracker_api.box_id.clone()],
+                );
+            },
+            |seen| broadcasts(seen) >= 1,
+        )
+        .await;
+        assert!(started.elapsed() >= Duration::from_millis(2_500));
+        let broadcast = seen.iter().position(is_broadcast).unwrap();
+        let redemption_mempool = format!("{MEMPOOL_LOOKUP}{REDEMPTION_TX}");
+        assert!(count(&seen[..broadcast], &redemption_mempool) >= 2);
+        assert_eq!(count(&seen[broadcast..], &redemption_mempool), 0);
+        assert!(shared.get_submitted_redemptions().is_empty());
+    }
+
+    /// Round 5, item 3: within 200 blocks of the emergency window no commit is held back, not
+    /// even for a redemption in the mempool: the first cycle commits.
+    #[tokio::test]
+    async fn no_commit_is_held_back_near_the_emergency_window() {
+        use std::sync::atomic::AtomicU64;
+        let lookup = |path: &str| {
+            if path.starts_with(MEMPOOL_LOOKUP) {
+                (200, "{}".to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        };
+        // The fixture's tracker box was created at 123_000.
+        let height = Arc::new(AtomicU64::new(
+            123_000 + crate::config::TRACKER_EMERGENCY_WINDOW_BLOCKS
+                - COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS,
+        ));
+        let (seen, _) = run_updater_with(
+            lookup,
+            height,
+            |_, shared, fx| {
+                shared.record_submitted_redemption(
+                    REDEMPTION_TX.to_string(),
+                    vec![fx.tracker_api.box_id.clone()],
+                );
+            },
+            |seen| broadcasts(seen) >= 1,
+        )
+        .await;
+        let broadcast = seen.iter().position(is_broadcast).unwrap();
+        assert_eq!(
+            count(&seen[..broadcast], &format!("{MEMPOOL_LOOKUP}{REDEMPTION_TX}")),
+            0,
+            "not even looked up"
+        );
+        assert_eq!(count(&seen[..broadcast], "/blockchain/box/unspent/byTokenId/"), 1);
+    }
+
+    #[test]
+    fn commits_may_wait_until_200_blocks_before_the_emergency_window() {
+        let window = crate::config::TRACKER_EMERGENCY_WINDOW_BLOCKS;
+        assert!(commit_may_wait(1_000, 1_000));
+        assert!(commit_may_wait(1_000 + window - 201, 1_000));
+        assert!(!commit_may_wait(1_000 + window - 200, 1_000));
+        assert!(!commit_may_wait(1_000 + window + 5, 1_000));
+        // A box "created" above the node height (a lagging node) is young, not old.
+        assert!(commit_may_wait(900, 1_000));
+    }
+
+    #[test]
+    fn submitted_redemptions_are_bounded_and_forgotten_by_id() {
+        let shared = SharedTrackerState::new();
+        for i in 0..MAX_SUBMITTED_REDEMPTIONS + 5 {
+            shared.record_submitted_redemption(format!("tx-{i}"), vec!["box".to_string()]);
+        }
+        let all = shared.get_submitted_redemptions();
+        assert_eq!(all.len(), MAX_SUBMITTED_REDEMPTIONS);
+        assert_eq!(all[0].tx_id, "tx-5", "the oldest made room");
+        // The same id again replaces its entry.
+        shared.record_submitted_redemption("tx-5".to_string(), vec!["other".to_string()]);
+        let all = shared.get_submitted_redemptions();
+        assert_eq!(all.len(), MAX_SUBMITTED_REDEMPTIONS);
+        assert_eq!(all.last().unwrap().data_input_ids, ["other"]);
+        shared.forget_submitted_redemptions(&["tx-5".to_string(), "tx-6".to_string()]);
+        assert_eq!(
+            shared.get_submitted_redemptions().len(),
+            MAX_SUBMITTED_REDEMPTIONS - 2
+        );
     }
 
     #[test]

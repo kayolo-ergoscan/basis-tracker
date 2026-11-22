@@ -204,12 +204,27 @@ The background task executes the following algorithm in a continuous loop:
    - **Outputs**: new tracker box with the same value and updated R4/R5/R6 (tracker NFT first, the old box's other tokens after it); fee output to the standard fee contract; a change output to the change address whenever value is left. Only a leftover below the minimum value of that change box (360 nanoERG per serialized byte) is added to the fee instead
    - The input boxes are read from the UTXO set as bytes (`/utxo/byIdBinary/{id}`)
    - Before signing, the transaction is refused unless every input token reaches the outputs with its full amount (nothing burned or minted) and the tracker NFT appears exactly once: first in output 0, amount 1
-9. **Sign and Submit Transaction**:
+9. **Hold the Commit Back for a Submitted Redemption** (round 5): a commit spends the tracker
+   box, which a redemption submitted through `/redemption/submit` reads as its data input; a
+   commit that lands first invalidates the redemption. `/redemption/submit` therefore records
+   every broadcast redemption (its tx id, its data input box ids and the time) in the shared
+   state, and before committing the updater looks at the ones that read the current tracker box:
+   - one still in a mempool (or whose status cannot be read) holds the commit back for this
+     cycle; one in a block or gone from the mempools is forgotten, and so is one that reads
+     another (older, already spent) box;
+   - one redemption holds commits back for at most 20 minutes from its submit
+     (`MAX_COMMIT_DEFERRAL`); after that the commit is made anyway and a warning is logged;
+   - nothing is held back once the tracker box is within 200 blocks of the 2160-block emergency
+     window (`/info` height minus the box creation height,
+     `COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS`), or when the node height cannot be read.
+   The list is in memory (at most 1024 entries, the oldest make room) and starts empty after a
+   restart. Heartbeat commits are held back the same way.
+10. **Sign and Submit Transaction**:
    - Build the signing context from `/blocks/lastHeaders/10` (newest header first) and prove every input locally with `ergo.tracker_secret_key` (every input is `P2PK(tracker pk)`)
    - Validate the signed transaction locally (ERG and token preservation, dust, heights, proofs)
    - POST the signed transaction to `/transactions` to broadcast it
    - Log the transaction ID on successful broadcast and mark it as pending confirmation
-10. **Error Handling**:
+11. **Error Handling**:
     - If any step fails, log an appropriate ERROR message
     - Continue with the scheduled interval regardless of failures, except right after a start:
       until the tracker box was first recorded, a cycle that stopped because the AVL digest was
@@ -252,6 +267,14 @@ To prevent submitting redundant updates during blockchain propagation:
    next cycle builds a fresh update
 6. If checking the transaction status fails (any answer but 200 or 404), keep it pending and retry
    next cycle; the failure does not count as a missing cycle
+7. Between cycles (round 5) the pending transaction is also looked up on chain every 60 s
+   (`PENDING_COMMIT_POLL_INTERVAL`): one `GET /blockchain/transaction/byId/{id}` per poll while
+   it is not in a block, plus one `/info` read for the depth once it is. When it is deep enough,
+   the poll records the confirmation as a cycle would: the committed digest and the new tracker
+   box (output 0 of the commit, which `/redemption/build` reads as its data input from then on),
+   the pending notes are promoted and staged exchanges evaluated. A confirmed commit is so
+   noticed within a minute instead of at the next cycle; the cycles, and with them the commits,
+   keep the 600 s interval, and only the cycles decide that a transaction was dropped
 
 ### State Update Process
 

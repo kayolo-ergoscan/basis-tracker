@@ -607,6 +607,13 @@ still returns the tx id; state must then be repaired manually (see below). A sub
 that skips this sync leaves the reserve tree stale, and the next `/redemption/build`
 will find no reserve whose on-chain R5 matches the local digest.
 
+**Commits wait for it (round 5).** The broadcast redemption reads the tracker box as its data
+input, and a tracker commit spends that box. The submit records the redemption's tx id and data
+input box ids for the tracker box updater, which holds back its next commit while the
+redemption is still in a mempool and reads the current tracker box: at most 20 minutes per
+redemption, and never once the tracker box is within 200 blocks of the emergency window
+(`specs/server/tracker_box_update_spec.md`, main loop step 9).
+
 ### POST /redeem/complete (manual completion / repair)
 
 Admin-only (see `specs/server/authentication_authorization.md`). A request with

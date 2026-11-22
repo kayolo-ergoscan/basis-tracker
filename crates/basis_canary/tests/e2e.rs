@@ -1360,6 +1360,27 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
     );
     assert_eq!(first.outputs.len(), 3);
     assert_eq!(w.tracker_fee_boxes(), vec![ERG]);
+    // Round 5, item 3: the submit told the updater which tracker box the redemption reads, so
+    // a commit does not spend it while the redemption waits in the mempool.
+    let submitted = w
+        .state
+        .shared_tracker_state
+        .lock()
+        .await
+        .get_submitted_redemptions();
+    let recorded = submitted
+        .iter()
+        .find(|r| r.tx_id == String::from(first.id()))
+        .expect("the submitted redemption is recorded for the updater");
+    assert_eq!(
+        recorded.data_input_ids,
+        first
+            .data_inputs
+            .as_ref()
+            .map(|inputs| inputs.iter().map(|d| String::from(d.box_id)).collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    assert_eq!(recorded.data_input_ids.len(), 1, "the tracker box");
     let note = fetch_note(&w.context(), &w.a.pk, &w.b.pk)
         .await
         .unwrap()

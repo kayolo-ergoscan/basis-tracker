@@ -694,6 +694,8 @@ async fn main() {
             config.ergo.basis_token_reserve_contract_p2s.clone(),
         ],
         heartbeat_blocks: config.transaction.heartbeat_blocks,
+        pending_poll_interval: basis_server::tracker_box_updater::PENDING_COMMIT_POLL_INTERVAL,
+        max_commit_deferral: basis_server::tracker_box_updater::MAX_COMMIT_DEFERRAL,
     };
     if config.transaction.heartbeat_blocks == 0 {
         tracing::warn!(
