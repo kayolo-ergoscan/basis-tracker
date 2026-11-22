@@ -574,10 +574,10 @@ async fn start_tracker(
             heartbeat_blocks: 720,
             commit_reserve_nano: 100_000_000,
         },
+        // As in production: an empty (reject-by-default) acceptance config, and the policy
+        // enforced at redemption time (`/tracker/signature`, `/redemption/build`).
         acceptance: basis_server::acceptance::config::AcceptanceConfig::empty(),
-        redemption: RedemptionConfig {
-            enforce_acceptance_policy: false,
-        },
+        redemption: RedemptionConfig::default(),
         confirmation: ConfirmationConfig::default(),
     };
 
