@@ -386,6 +386,37 @@ pub enum TxStatus {
     Missing,
 }
 
+/// Update interval of the tracker box updater when `BASIS_TRACKER_UPDATE_INTERVAL_SECONDS` is
+/// not set, in seconds.
+pub const DEFAULT_UPDATE_INTERVAL_SECONDS: u64 = 600;
+
+/// Intervals below this many seconds work, but the server warns: every cycle reads the node,
+/// and `MAX_PENDING_MISSING_CYCLES` cycles of it decide that a commit was dropped.
+pub const SHORT_UPDATE_INTERVAL_SECONDS: u64 = 30;
+
+/// The update interval from `BASIS_TRACKER_UPDATE_INTERVAL_SECONDS`, given as `raw` (`None`
+/// when unset). Unset or empty gives [`DEFAULT_UPDATE_INTERVAL_SECONDS`]. `0` is refused
+/// (an interval of zero is no interval: the timer cannot run), and so is anything that is not
+/// a whole number of seconds, which used to fall back to the default silently.
+pub fn update_interval_from_env(raw: Option<&str>) -> Result<u64, String> {
+    let raw = raw.map(str::trim).unwrap_or_default();
+    if raw.is_empty() {
+        return Ok(DEFAULT_UPDATE_INTERVAL_SECONDS);
+    }
+    match raw.parse::<u64>() {
+        Ok(0) => Err(
+            "BASIS_TRACKER_UPDATE_INTERVAL_SECONDS is 0; set a number of seconds, at least 1 \
+             (default 600)"
+                .to_string(),
+        ),
+        Ok(seconds) => Ok(seconds),
+        Err(_) => Err(format!(
+            "BASIS_TRACKER_UPDATE_INTERVAL_SECONDS must be a whole number of seconds (default \
+             600), got {raw:?}"
+        )),
+    }
+}
+
 /// Whether a pending update transaction that the node has not seen for
 /// `missing_cycles` consecutive cycles should be treated as dropped/rejected
 /// (and the pending notes reverted so a fresh update can be submitted).
@@ -425,7 +456,9 @@ impl TrackerBoxUpdater {
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         cmd_tx: Option<tokio::sync::mpsc::Sender<crate::TrackerCommand>>,
     ) -> Result<(), TrackerBoxUpdaterError> {
-        let mut ticker = interval(Duration::from_secs(config.update_interval_seconds));
+        // `interval` panics on a zero period; the server refuses 0 at startup, and a config built
+        // in code with 0 runs every second instead.
+        let mut ticker = interval(Duration::from_secs(config.update_interval_seconds.max(1)));
 
         let mut last_submitted_digest: Option<[u8; 33]> = None;
         let mut pending_tx: Option<(String, [u8; 33])> = None;
@@ -2641,5 +2674,45 @@ mod tests {
             "confirmed at depth 2"
         );
         assert_eq!(broadcasts(&seen), 1);
+    }
+
+    #[test]
+    fn the_update_interval_env_refuses_zero_and_garbage() {
+        assert_eq!(update_interval_from_env(None), Ok(600));
+        assert_eq!(update_interval_from_env(Some("")), Ok(600));
+        assert_eq!(update_interval_from_env(Some(" 120 ")), Ok(120));
+        assert_eq!(update_interval_from_env(Some("10")), Ok(10));
+        let zero = update_interval_from_env(Some("0")).unwrap_err();
+        assert!(zero.contains("is 0"), "{zero}");
+        for garbage in ["10m", "-5", "1.5", "six hundred"] {
+            let err = update_interval_from_env(Some(garbage)).unwrap_err();
+            assert!(err.contains("whole number of seconds"), "{garbage}: {err}");
+        }
+    }
+
+    /// A config built in code with interval 0 no longer panics the updater task.
+    #[tokio::test]
+    async fn an_updater_with_interval_zero_runs_instead_of_panicking() {
+        let config = TrackerBoxUpdateConfig {
+            wallet_node_url: "http://127.0.0.1:1".to_string(),
+            scanner_node_url: "http://127.0.0.1:1".to_string(),
+            update_interval_seconds: 0,
+            ..Default::default()
+        };
+        let (stop_tx, stop_rx) = tokio::sync::broadcast::channel(1);
+        let updater = tokio::spawn(TrackerBoxUpdater::start(
+            config,
+            SharedTrackerState::new(),
+            stop_rx,
+            None,
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!updater.is_finished(), "the updater stopped (panicked?)");
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), updater)
+            .await
+            .expect("stops")
+            .expect("no panic")
+            .unwrap();
     }
 }

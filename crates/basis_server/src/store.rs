@@ -1,10 +1,15 @@
 use crate::models::TrackerEvent;
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex;
 
-// Simple file-based event store with sequential IDs
+/// Most events the store keeps. Beyond it the oldest event is dropped for each new one, so the
+/// log cannot grow without bound; ids keep counting, so a client sees where the log starts.
+pub const MAX_EVENTS: usize = 10_000;
+
+/// In-memory event log with sequential ids: the last [`MAX_EVENTS`] events.
 pub struct EventStore {
-    events: Mutex<Vec<TrackerEvent>>,
+    events: Mutex<VecDeque<TrackerEvent>>,
     next_id: AtomicU64,
 }
 
@@ -12,10 +17,7 @@ impl EventStore {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         // In a real implementation, this would load from disk
         // For now, we'll use in-memory but structured for easy disk persistence
-        Ok(Self {
-            events: Mutex::new(Vec::new()),
-            next_id: AtomicU64::new(1),
-        })
+        Ok(Self::new_in_memory())
     }
 
     pub async fn add_event(
@@ -27,10 +29,11 @@ impl EventStore {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         event.id = id;
 
-        // In a real implementation, this would append to a disk file
-        // For now, we'll use a mutex-protected vector
         let mut events = self.events.lock().await;
-        events.push(event);
+        if events.len() >= MAX_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(event);
 
         Ok(id)
     }
@@ -45,19 +48,22 @@ impl EventStore {
         let events = self.events.lock().await;
         let start = page.saturating_mul(page_size).min(events.len());
         let end = start.saturating_add(page_size).min(events.len());
-        Ok(events[start..end].to_vec())
+        Ok(events.range(start..end).cloned().collect())
     }
 
     /// The `count` most recent events, oldest of them first.
     pub async fn get_recent_events(&self, count: usize) -> Vec<TrackerEvent> {
         let events = self.events.lock().await;
-        events[events.len().saturating_sub(count)..].to_vec()
+        events
+            .range(events.len().saturating_sub(count)..)
+            .cloned()
+            .collect()
     }
 
-    /// Create an in-memory event store for testing
+    /// Create an empty in-memory event store.
     pub fn new_in_memory() -> Self {
         Self {
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(VecDeque::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -106,6 +112,27 @@ mod tests {
         assert!(page(2, usize::MAX).await.unwrap().is_empty());
         assert_eq!(ids(&page(0, usize::MAX).await.unwrap()), [1, 2, 3, 4, 5]);
         assert!(page(0, 0).await.unwrap().is_empty());
+    }
+
+    /// The log keeps the last MAX_EVENTS events: the oldest go first, ids keep counting.
+    #[tokio::test]
+    async fn the_log_keeps_the_last_max_events() {
+        let store = store_with(MAX_EVENTS as u64 + 5).await;
+        let first_page = store.get_events_paginated(0, 3).await.unwrap();
+        assert_eq!(ids(&first_page), [6, 7, 8]);
+        let all = store.get_events_paginated(0, usize::MAX).await.unwrap();
+        assert_eq!(all.len(), MAX_EVENTS);
+        assert_eq!(all.last().unwrap().id, MAX_EVENTS as u64 + 5);
+        let last_page = store
+            .get_events_paginated(MAX_EVENTS / 2 - 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&last_page),
+            [MAX_EVENTS as u64 + 4, MAX_EVENTS as u64 + 5]
+        );
+        let recent = store.get_recent_events(2).await;
+        assert_eq!(ids(&recent), [MAX_EVENTS as u64 + 4, MAX_EVENTS as u64 + 5]);
     }
 
     #[tokio::test]

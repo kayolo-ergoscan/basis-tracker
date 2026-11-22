@@ -265,6 +265,14 @@ export BASIS_ERGO_TRACKER_NFT_ID="your_tracker_nft_id"
 export BASIS_ERGO_NODE_URL="http://your-node:9053"
 ```
 
+`BASIS_TRACKER_UPDATE_INTERVAL_SECONDS` (not a config file key) sets how often the tracker
+box updater runs: default 600. `0` or a value that is not a whole number of seconds is
+refused at startup; below 30 the server warns, since every cycle reads the node and 3
+cycles without the pending commit in a mempool or a block count it as dropped.
+
+The in-memory event log behind `GET /events` keeps the last 10 000 events; older ones are
+dropped, and event ids keep counting.
+
 ## Tracker Public Key Configuration
 
 ### What is the Tracker Public Key?

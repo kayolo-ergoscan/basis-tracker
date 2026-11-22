@@ -162,6 +162,10 @@ struct Server {
 
 /// Run the binary in `dir` (which holds `config/basis.toml`), stdout and stderr to `server.log`.
 fn spawn_server(dir: &Path) -> (Child, std::path::PathBuf) {
+    spawn_server_with_env(dir, &[])
+}
+
+fn spawn_server_with_env(dir: &Path, env: &[(&str, &str)]) -> (Child, std::path::PathBuf) {
     let log = dir.join("server.log");
     let out = std::fs::File::create(&log).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_basis_server"))
@@ -169,6 +173,7 @@ fn spawn_server(dir: &Path) -> (Child, std::path::PathBuf) {
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("RUST_LOG", "info")
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::from(out.try_clone().unwrap()))
         .stderr(Stdio::from(out))
@@ -321,16 +326,8 @@ fn sigterm_with_a_stuck_client_still_exits_0_by_the_deadline() {
     server.print_shutdown_log();
 }
 
-/// An all-zero tracker NFT id is a placeholder, never a minted token: the binary exits 1 before
-/// it serves anything, and says why on stderr (before tracing is set up).
-#[test]
-fn an_all_zero_tracker_nft_is_refused_at_startup() {
-    let dir = tempfile::tempdir().unwrap();
-    let node = MockNode::start();
-    let port = free_port();
-    write_config_with_nft(dir.path(), port, &node.url, &"00".repeat(32));
-    let (mut child, log) = spawn_server(dir.path());
-
+/// Wait for a process that must exit during startup; its status and log.
+fn wait_for_startup_exit(mut child: Child, log: &Path) -> (ExitStatus, String) {
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -340,17 +337,50 @@ fn an_all_zero_tracker_nft_is_refused_at_startup() {
             let _ = child.kill();
             panic!(
                 "still running\n{}",
-                std::fs::read_to_string(&log).unwrap_or_default()
+                std::fs::read_to_string(log).unwrap_or_default()
             );
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let log = std::fs::read_to_string(&log).unwrap_or_default();
+    (status, std::fs::read_to_string(log).unwrap_or_default())
+}
+
+/// An all-zero tracker NFT id is a placeholder, never a minted token: the binary exits 1 before
+/// it serves anything, and says why on stderr (before tracing is set up).
+#[test]
+fn an_all_zero_tracker_nft_is_refused_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = MockNode::start();
+    let port = free_port();
+    write_config_with_nft(dir.path(), port, &node.url, &"00".repeat(32));
+    let (child, log) = spawn_server(dir.path());
+    let (status, log) = wait_for_startup_exit(child, &log);
     assert_eq!(status.code(), Some(1), "{log}");
     assert!(
         log.contains("basis_server: Tracker NFT ID is not properly configured"),
         "{log}"
     );
     assert!(log.contains("all zeros"), "{log}");
+    assert!(!get_root(port), "nothing may listen");
+}
+
+/// An update interval of 0 used to panic the updater's timer after startup; the binary now
+/// refuses it before it serves anything.
+#[test]
+fn an_update_interval_of_zero_is_refused_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = MockNode::start();
+    let port = free_port();
+    write_config(dir.path(), port, &node.url);
+    let (child, log) = spawn_server_with_env(
+        dir.path(),
+        &[("BASIS_TRACKER_UPDATE_INTERVAL_SECONDS", "0")],
+    );
+    let (status, log) = wait_for_startup_exit(child, &log);
+    assert_eq!(status.code(), Some(1), "{log}");
+    assert!(
+        log.contains("basis_server: BASIS_TRACKER_UPDATE_INTERVAL_SECONDS is 0"),
+        "{log}"
+    );
     assert!(!get_root(port), "nothing may listen");
 }

@@ -80,6 +80,16 @@ async fn main() {
         ));
     }
 
+    // The tracker box updater's interval: refuse 0 (its timer would panic) or a garbled value.
+    let tracker_update_interval = match basis_server::tracker_box_updater::update_interval_from_env(
+        std::env::var("BASIS_TRACKER_UPDATE_INTERVAL_SECONDS")
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(seconds) => seconds,
+        Err(msg) => exit_on_startup_error(&format!("{msg}. Refusing to start.")),
+    };
+
     tracing::info!("Configuration loaded successfully");
 
     // Resolve the configured data directory once.
@@ -654,10 +664,15 @@ async fn main() {
     // Use mainnet network prefix for address encoding
     let _network_prefix = ergo_lib::ergotree_ir::chain::address::NetworkPrefix::Mainnet;
 
-    let tracker_update_interval = std::env::var("BASIS_TRACKER_UPDATE_INTERVAL_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(600);
+    if tracker_update_interval < basis_server::tracker_box_updater::SHORT_UPDATE_INTERVAL_SECONDS {
+        tracing::warn!(
+            "BASIS_TRACKER_UPDATE_INTERVAL_SECONDS is {}s: every updater cycle reads the node, \
+             and 3 cycles without the pending commit in a mempool or a block count it as \
+             dropped. Use at least {}s outside demos and tests.",
+            tracker_update_interval,
+            basis_server::tracker_box_updater::SHORT_UPDATE_INTERVAL_SECONDS
+        );
+    }
 
     let (wallet_node_url, wallet_api_key) = config.ergo_wallet_node();
     let tracker_box_config = TrackerBoxUpdateConfig {
