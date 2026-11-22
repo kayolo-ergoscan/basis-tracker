@@ -469,6 +469,14 @@ pub type ExchangeAcceptanceCheckFn =
 /// the update, then marks the notes pending; two leave room for one more refresh in between.
 pub const RECENT_DIGEST_VALUES: usize = 2;
 
+/// A tree that reproduces a confirmed on-chain digest (see
+/// `TrackerStateManager::generate_committed_tracker_lookup_proof`).
+struct CommittedTree {
+    /// The confirmed digest the tree was built for; its root digest equals it.
+    digest: [u8; 33],
+    tree: basis_trees::BasisAvlTree,
+}
+
 pub struct TrackerStateManager {
     avl_state: basis_trees::BasisAvlTree,
     current_state: TrackerState,
@@ -513,6 +521,14 @@ pub struct TrackerStateManager {
     /// newest last. `mark_notes_pending` records exactly the values of the digest the
     /// updater submitted, not the values at the time it is called (follow-up review N2).
     recent_values: Vec<([u8; 33], Vec<(NoteKeyBytes, u64)>)>,
+    /// The committed tree behind `confirmed_digest`, built from the confirmed values (round 5,
+    /// item 1). Every redemption build needs a proof against it; rebuilding it from all notes
+    /// for each build let anyone with a signed request make the tracker walk every note. It is
+    /// built once per confirmed digest and dropped where the confirmed digest or a confirmed
+    /// value changes ([`Self::forget_committed_tree`]).
+    committed_tree: Option<CommittedTree>,
+    /// Number of committed-tree rebuilds (see [`Self::committed_tree_rebuild_count`]).
+    committed_tree_rebuilds: u64,
     /// Test-only fault-injection hook: while set, `rebuild_tree_canonically`
     /// returns an error without touching the live tree (issue #20 tests).
     #[cfg(test)]
@@ -576,6 +592,8 @@ impl TrackerStateManager {
             tree_dirty: false,
             tree_rebuilds: 0,
             recent_values: Vec::new(),
+            committed_tree: None,
+            committed_tree_rebuilds: 0,
             #[cfg(test)]
             fail_tree_rebuild: false,
         };
@@ -778,6 +796,8 @@ impl TrackerStateManager {
             tree_dirty: false,
             tree_rebuilds: 0,
             recent_values: Vec::new(),
+            committed_tree: None,
+            committed_tree_rebuilds: 0,
             #[cfg(test)]
             fail_tree_rebuild: false,
         };
@@ -958,6 +978,7 @@ impl TrackerStateManager {
     /// transactions do not survive a restart).
     pub fn rebuild_confirmations(&mut self) {
         self.confirmations.clear();
+        self.forget_committed_tree();
 
         let notes = match self.storage.get_all_notes_with_issuer() {
             Ok(n) => n,
@@ -1078,6 +1099,7 @@ impl TrackerStateManager {
         box_id: &str,
         height: u64,
     ) -> Result<usize, NoteError> {
+        let mut committed_state_changed = self.confirmed_digest != Some(digest);
         self.confirmed_digest = Some(digest);
         let keys: Vec<NoteKeyBytes> = self.confirmations.keys().copied().collect();
         let mut count = 0usize;
@@ -1091,6 +1113,7 @@ impl TrackerStateManager {
                     continue;
                 }
                 let local_is_pending = entry.status == NoteConfirmationStatus::Pending;
+                committed_state_changed |= entry.confirmed_total_debt != entry.pending_total_debt;
                 entry.confirmed_total_debt = entry.pending_total_debt;
                 entry.pending_total_debt = None;
                 entry.pending_tx_id = None;
@@ -1106,6 +1129,9 @@ impl TrackerStateManager {
                 };
                 let _ = self.storage.store_confirmation(&key, entry);
             }
+        }
+        if committed_state_changed {
+            self.forget_committed_tree();
         }
 
         tracing::info!(
@@ -1166,6 +1192,9 @@ impl TrackerStateManager {
         box_id: &str,
         height: u64,
     ) -> Result<usize, NoteError> {
+        if self.confirmed_digest != Some(*confirmed_digest) {
+            self.forget_committed_tree();
+        }
         self.confirmed_digest = Some(*confirmed_digest);
 
         self.refresh_live_tree();
@@ -1188,6 +1217,10 @@ impl TrackerStateManager {
             if entry.status != NoteConfirmationStatus::Confirmed
                 || entry.confirmed_total_debt != Some(local_value)
             {
+                if entry.confirmed_total_debt != Some(local_value) {
+                    // A confirmed value changes: the cached committed tree is stale.
+                    self.committed_tree = None;
+                }
                 entry.confirmed_total_debt = Some(local_value);
                 entry.pending_total_debt = None;
                 entry.pending_tx_id = None;
@@ -2014,9 +2047,11 @@ impl TrackerStateManager {
     /// against the tracker box's committed digest, so any note posted after the
     /// last commitment must not alter the proof's starting digest (issue #15 S6).
     ///
-    /// The committed tree is rebuilt from the per-note `confirmed_total_debt`
-    /// values in chronological order (same ordering as `rebuild_avl_tree`), and
-    /// the rebuilt digest is asserted to equal the recorded confirmed digest.
+    /// The committed tree is built from the per-note `confirmed_total_debt`
+    /// values in debt-key order (the order of `rebuild_avl_tree`), and the built
+    /// digest is checked to equal the recorded confirmed digest. It is built once
+    /// per confirmed digest and reused for every proof until the confirmed digest
+    /// or a confirmed value changes (round 5, item 1).
     ///
     /// Returns `NoteError::NoteNotConfirmed` when the note has no confirmed value
     /// (i.e. it is not committed on-chain yet) and `NoteError::StorageError` when
@@ -2094,11 +2129,48 @@ impl TrackerStateManager {
             )
         })?;
 
-        // Rebuild the committed tree from every note's confirmed value, in
-        // debt-key order (the order every tree uses; see
-        // `populate_tree_from_storage`), so it reproduces the committed digest
-        // whatever was raised locally since. Notes without a confirmed value
-        // are not part of the committed state.
+        // The committed tree is built once per confirmed digest (round 5, item 1) and kept
+        // until the confirmed digest or a confirmed value changes. A cached tree is used only
+        // for its own digest, and only when it holds this note's confirmed value; otherwise it
+        // is built again (and checked against the digest) exactly as before.
+        let value_bytes = confirmed_total_debt.to_be_bytes().to_vec();
+        let cached = self.committed_tree.as_ref().is_some_and(|committed| {
+            committed.digest == confirmed_digest
+                && committed.tree.get(&key_bytes).as_deref() == Some(value_bytes.as_slice())
+        });
+        if !cached {
+            self.committed_tree = None;
+            let tree = self.build_committed_tree(confirmed_digest)?;
+            self.committed_tree = Some(CommittedTree {
+                digest: confirmed_digest,
+                tree,
+            });
+        }
+        let committed = self
+            .committed_tree
+            .as_mut()
+            .expect("the committed tree was just checked or built");
+        let (avl_proof, _returned_value) = committed.tree.generate_lookup_proof(key_bytes.to_vec());
+
+        Ok(TrackerLookupProof {
+            key: key_bytes,
+            value: value_bytes,
+            proof: avl_proof,
+        })
+    }
+
+    /// Build the committed tree from every note's confirmed value and check that it
+    /// reproduces `confirmed_digest`.
+    ///
+    /// The keys are inserted in debt-key order (the order every tree uses; see
+    /// `populate_tree_from_storage`), so the tree reproduces the committed digest whatever was
+    /// raised locally since. Notes without a confirmed value are not part of the committed
+    /// state.
+    fn build_committed_tree(
+        &mut self,
+        confirmed_digest: [u8; 33],
+    ) -> Result<basis_trees::BasisAvlTree, NoteError> {
+        self.committed_tree_rebuilds += 1;
         let mut notes_with_issuer = self
             .storage
             .get_all_notes_with_issuer()
@@ -2132,6 +2204,7 @@ impl TrackerStateManager {
         // The rebuilt committed tree must reproduce the confirmed on-chain digest;
         // otherwise local confirmation metadata is inconsistent with the chain and
         // generating a proof would produce something that fails on-chain anyway.
+        // A mismatch is not cached: the next proof builds the tree again.
         let rebuilt_digest = committed_tree.root_digest();
         if rebuilt_digest != confirmed_digest {
             return Err(NoteError::StorageError(format!(
@@ -2140,14 +2213,25 @@ impl TrackerStateManager {
                 hex::encode(confirmed_digest)
             )));
         }
+        tracing::debug!(
+            "Committed tree built for confirmed digest {} ({} notes)",
+            hex::encode(confirmed_digest),
+            notes_with_issuer.len()
+        );
+        Ok(committed_tree)
+    }
 
-        let (avl_proof, _returned_value) = committed_tree.generate_lookup_proof(key_bytes.to_vec());
+    /// Drop the cached committed tree (round 5, item 1): called where the confirmed digest or
+    /// a confirmed value changes, so the next committed proof builds the tree again.
+    fn forget_committed_tree(&mut self) {
+        self.committed_tree = None;
+    }
 
-        Ok(TrackerLookupProof {
-            key: key_bytes,
-            value: confirmed_total_debt.to_be_bytes().to_vec(),
-            proof: avl_proof,
-        })
+    /// How many times the committed tree was built (see
+    /// [`Self::generate_committed_tracker_lookup_proof`]): once per confirmed digest, however
+    /// many proofs are made against it.
+    pub fn committed_tree_rebuild_count(&self) -> u64 {
+        self.committed_tree_rebuilds
     }
 
     /// Get or create the mutable reserve AVL tree for an (issuer, denomination) pair.

@@ -1011,24 +1011,32 @@ mod confirmation_state_tests {
         // note keeps its confirmed value but the recorded confirmed digest moves,
         // so the rebuilt committed tree no longer reproduces it.
         let other_digest = [9u8; 33];
+        // A proof against the first digest caches its tree; the new digest must not use it.
+        manager
+            .generate_committed_tracker_lookup_proof(&issuer, &recipient, &crate::DenomKey::Erg)
+            .unwrap();
         manager
             .reconcile_with_confirmed_digest(&other_digest, "box2", 300)
             .unwrap();
 
-        let result = manager.generate_committed_tracker_lookup_proof(
-            &issuer,
-            &recipient,
-            &crate::DenomKey::Erg,
-        );
-        match result {
-            Err(crate::NoteError::StorageError(msg)) => {
-                assert!(
-                    msg.contains("digest mismatch"),
-                    "expected digest mismatch error, got: {}",
-                    msg
-                );
+        for attempt in 0..2 {
+            let result = manager.generate_committed_tracker_lookup_proof(
+                &issuer,
+                &recipient,
+                &crate::DenomKey::Erg,
+            );
+            match result {
+                Err(crate::NoteError::StorageError(msg)) => {
+                    assert!(
+                        msg.contains("digest mismatch"),
+                        "expected digest mismatch error, got: {}",
+                        msg
+                    );
+                }
+                other => panic!("expected digest mismatch StorageError, got {:?}", other),
             }
-            other => panic!("expected digest mismatch StorageError, got {:?}", other),
+            // A mismatch is never cached: every attempt builds the tree again.
+            assert_eq!(manager.committed_tree_rebuild_count(), 2 + attempt);
         }
     }
 
@@ -1083,6 +1091,96 @@ mod confirmation_state_tests {
             .generate_committed_tracker_lookup_proof(&issuer, &b, &crate::DenomKey::Erg)
             .unwrap();
         assert_eq!(proof.value, 2u64.to_be_bytes().to_vec());
+    }
+
+    /// Round 5, item 1: the committed tree is built once per confirmed digest, however many
+    /// committed proofs (one per redemption build) are made against it, also while notes
+    /// arrive and the updater reconciles the same digest every cycle. A newly confirmed digest
+    /// builds it once more; a heartbeat that confirms the same digest again does not.
+    #[test]
+    fn committed_proofs_build_the_committed_tree_once_per_confirmed_digest() {
+        let mut manager = make_manager();
+        let issuer_secret = [1u8; 32];
+        let issuer = issuer_pubkey(&issuer_secret);
+        let recipients: Vec<[u8; 33]> = (0..8u8).map(|i| [i + 2; 33]).collect();
+        for (i, recipient) in recipients.iter().enumerate() {
+            let note = create_note(&issuer_secret, recipient, 1_000 + i as u64, 1 + i as u64);
+            manager.add_note(&issuer, &note).unwrap();
+        }
+        let digest1 = manager.get_state().avl_root_digest;
+        manager.mark_notes_pending(digest1, "tx1", 100).unwrap();
+        manager.confirm_pending_notes(digest1, "box1", 200).unwrap();
+        assert_eq!(manager.committed_tree_rebuild_count(), 0, "built on the first proof only");
+
+        for round in 0..5u8 {
+            for (i, recipient) in recipients.iter().enumerate() {
+                let proof = manager
+                    .generate_committed_tracker_lookup_proof(&issuer, recipient, &crate::DenomKey::Erg)
+                    .unwrap();
+                assert_eq!(proof.value, (1_000 + i as u64).to_be_bytes().to_vec());
+                assert!(basis_trees::BasisAvlTree::verify_proof(
+                    &digest1,
+                    &proof.proof,
+                    &proof.key,
+                    &proof.value
+                ));
+            }
+            // A new local note and the updater's reconcile of the same digest change nothing
+            // that is committed.
+            let late = create_note(&issuer_secret, &[0x70 + round; 33], 5, 100 + round as u64);
+            manager.add_note(&issuer, &late).unwrap();
+            manager
+                .reconcile_with_confirmed_digest(&digest1, "box1", 200)
+                .unwrap();
+        }
+        assert_eq!(manager.committed_tree_rebuild_count(), 1, "40 proofs, one build");
+
+        // The next commit confirms a new digest: one more build, and the proofs verify against it.
+        let digest2 = manager.get_state().avl_root_digest;
+        assert_ne!(digest2, digest1);
+        manager.mark_notes_pending(digest2, "tx2", 300).unwrap();
+        manager.confirm_pending_notes(digest2, "box2", 400).unwrap();
+        for _ in 0..10 {
+            let proof = manager
+                .generate_committed_tracker_lookup_proof(&issuer, &[0x70; 33], &crate::DenomKey::Erg)
+                .unwrap();
+            assert_eq!(proof.value, 5u64.to_be_bytes().to_vec());
+            assert!(basis_trees::BasisAvlTree::verify_proof(
+                &digest2,
+                &proof.proof,
+                &proof.key,
+                &proof.value
+            ));
+        }
+        assert_eq!(manager.committed_tree_rebuild_count(), 2);
+
+        // A heartbeat commits and confirms the same digest again: nothing to build.
+        manager.confirm_pending_notes(digest2, "box3", 500).unwrap();
+        manager
+            .reconcile_with_confirmed_digest(&digest2, "box3", 500)
+            .unwrap();
+        let proof = manager
+            .generate_committed_tracker_lookup_proof(&issuer, &recipients[0], &crate::DenomKey::Erg)
+            .unwrap();
+        assert!(basis_trees::BasisAvlTree::verify_proof(
+            &digest2,
+            &proof.proof,
+            &proof.key,
+            &proof.value
+        ));
+        assert_eq!(manager.committed_tree_rebuild_count(), 2);
+
+        // After a restart the tree is built again, once, for the digest the updater observes.
+        manager.rebuild_confirmations();
+        manager
+            .reconcile_with_confirmed_digest(&digest2, "box3", 500)
+            .unwrap();
+        for recipient in &recipients {
+            manager
+                .generate_committed_tracker_lookup_proof(&issuer, recipient, &crate::DenomKey::Erg)
+                .unwrap();
+        }
+        assert_eq!(manager.committed_tree_rebuild_count(), 3);
     }
 }
 
