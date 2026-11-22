@@ -10,6 +10,14 @@ use crate::{
 use fjall::{Config, PartitionCreateOptions};
 use std::path::Path;
 
+/// Journal fsync interval of every keyspace, in milliseconds.
+///
+/// Each write already reaches the OS buffers (`manual_journal_persist` is off), which survives
+/// a process crash. A background thread also syncs the journal to disk this often, so a power
+/// loss loses at most about one second of writes. The thread lives as long as the keyspace,
+/// which is why every storage below keeps its `Keyspace`.
+pub const JOURNAL_FSYNC_MS: u16 = 1000;
+
 /// Fixed-width note record length: issuer(33) ‖ collected(8) ‖ redeemed(8) ‖
 /// timestamp(8) ‖ signature(65) ‖ recipient(33) ‖ tracker_nft_id(32) ‖
 /// denomination(33) = 220 bytes.
@@ -46,6 +54,9 @@ pub struct NoteStorage {
 /// Database storage for scanner metadata
 #[derive(Clone)]
 pub struct ScannerMetadataStorage {
+    /// Keeps the keyspace and its background threads (journal fsync, flushes, compaction)
+    /// alive with this handle; dropping the last `Keyspace` stops them.
+    _keyspace: fjall::Keyspace,
     partition: fjall::Partition,
 }
 
@@ -69,6 +80,8 @@ pub struct QuarantinedReserve {
 /// Database storage for reserve information
 #[derive(Clone)]
 pub struct ReserveStorage {
+    /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]).
+    _keyspace: fjall::Keyspace,
     partition: fjall::Partition,
     quarantine_partition: fjall::Partition,
 }
@@ -76,6 +89,8 @@ pub struct ReserveStorage {
 /// Database storage for tracker information
 #[derive(Clone)]
 pub struct TrackerStorage {
+    /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]).
+    _keyspace: fjall::Keyspace,
     partition: fjall::Partition,
 }
 
@@ -85,6 +100,8 @@ pub struct TrackerStorage {
 /// Key: recipient_pubkey (33 bytes), Value: (timestamp, policy_json, signature)
 #[derive(Clone)]
 pub struct AcceptancePolicyStorage {
+    /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]).
+    _keyspace: fjall::Keyspace,
     partition: fjall::Partition,
 }
 
@@ -103,6 +120,7 @@ impl ScannerMetadataStorage {
     /// Open or create a new scanner metadata storage database
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, NoteError> {
         let keyspace = Config::new(path)
+            .fsync_ms(Some(JOURNAL_FSYNC_MS))
             .open()
             .map_err(|e| NoteError::StorageError(format!("Failed to open database: {}", e)))?;
 
@@ -110,7 +128,10 @@ impl ScannerMetadataStorage {
             .open_partition("scanner_metadata", PartitionCreateOptions::default())
             .map_err(|e| NoteError::StorageError(format!("Failed to open partition: {}", e)))?;
 
-        Ok(Self { partition })
+        Ok(Self {
+            _keyspace: keyspace,
+            partition,
+        })
     }
 
     /// Store scan ID for a specific scan name
@@ -193,6 +214,7 @@ impl NoteStorage {
     /// Open or create a new note storage database with extra indices
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, NoteError> {
         let keyspace = Config::new(path)
+            .fsync_ms(Some(JOURNAL_FSYNC_MS))
             .open()
             .map_err(|e| NoteError::StorageError(format!("Failed to open database: {}", e)))?;
 
@@ -1212,6 +1234,7 @@ impl ReserveStorage {
     /// Open or create a new reserve storage database
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, NoteError> {
         let keyspace = Config::new(path)
+            .fsync_ms(Some(JOURNAL_FSYNC_MS))
             .open()
             .map_err(|e| NoteError::StorageError(format!("Failed to open database: {}", e)))?;
 
@@ -1226,6 +1249,7 @@ impl ReserveStorage {
             })?;
 
         Ok(Self {
+            _keyspace: keyspace,
             partition,
             quarantine_partition,
         })
@@ -1351,6 +1375,7 @@ impl TrackerStorage {
     /// Open or create a new tracker storage database
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, NoteError> {
         let keyspace = Config::new(path)
+            .fsync_ms(Some(JOURNAL_FSYNC_MS))
             .open()
             .map_err(|e| NoteError::StorageError(format!("Failed to open database: {}", e)))?;
 
@@ -1358,7 +1383,10 @@ impl TrackerStorage {
             .open_partition("tracker_metadata", PartitionCreateOptions::default())
             .map_err(|e| NoteError::StorageError(format!("Failed to open partition: {}", e)))?;
 
-        Ok(Self { partition })
+        Ok(Self {
+            _keyspace: keyspace,
+            partition,
+        })
     }
 
     /// Store tracker box information in the database
@@ -1442,9 +1470,12 @@ impl TrackerStorage {
 impl AcceptancePolicyStorage {
     /// Open or create a new acceptance policy storage database
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, NoteError> {
-        let keyspace = Config::new(path).open().map_err(|e| {
-            NoteError::StorageError(format!("Failed to open policy database: {}", e))
-        })?;
+        let keyspace = Config::new(path)
+            .fsync_ms(Some(JOURNAL_FSYNC_MS))
+            .open()
+            .map_err(|e| {
+                NoteError::StorageError(format!("Failed to open policy database: {}", e))
+            })?;
 
         let partition = keyspace
             .open_partition("acceptance_policies", PartitionCreateOptions::default())
@@ -1452,7 +1483,10 @@ impl AcceptancePolicyStorage {
                 NoteError::StorageError(format!("Failed to open policy partition: {}", e))
             })?;
 
-        Ok(Self { partition })
+        Ok(Self {
+            _keyspace: keyspace,
+            partition,
+        })
     }
 
     /// Store a signed acceptance policy for a recipient
