@@ -185,7 +185,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
         '409':
-          description: The issuer has no tracked reserve or multiple tracked reserves in the from denomination
+          description: >-
+            The issuer has no tracked reserve or multiple tracked reserves in
+            the from denomination, or a redemption of the issuer's reserve in
+            either denomination is journaled ("the reserve of issuer <key> in
+            <denomination>: redemption <tx id> is waiting for the chain ...",
+            round 5b): try again once it is applied or dropped
           content:
             application/json:
               schema:
@@ -1163,9 +1168,11 @@ paths:
             `request_timestamp` not greater than the recipient's previous build
             request (replay), the issuer has more than one tracked reserve, a
             redemption of this reserve submitted through `/redemption/submit` is
-            still waiting for the chain ("... has redemption <tx id> waiting for
-            the chain ..."), or the committed state is ahead of a consented
-            decrease
+            journaled ("the reserve of issuer <key> in <denomination>: redemption
+            <tx id> is waiting for the chain; try again once it is confirmed, or
+            once it can no longer be mined ..."; or, once applied with a reserve
+            tree out of step with the chain, "... an operator has to look at it
+            ..."), or the committed state is ahead of a consented decrease
           content:
             application/json:
               schema:
@@ -1213,12 +1220,17 @@ paths:
         build that is never submitted blocks nothing.
 
         The redemption state follows the chain (round 5): the redemption is
-        journaled before the broadcast and applied to the note
+        journaled (synced to disk) before the broadcast and applied to the note
         (`amount_redeemed`) and the reserve tree only once it is in a block,
-        `[confirmation] min_depth` deep (checked every 60 s). Until then the
-        note shows the previous `amount_redeemed`, and `/redemption/build` of
-        the same reserve answers 409. A redemption in no mempool and not on
-        chain for 10 checks (about 10 minutes) is dropped unapplied.
+        `[confirmation] min_depth` deep (checked every 60 s), with the reserve
+        tree value the build proved (round 5b). Until then the note shows the
+        previous `amount_redeemed`, and `/redemption/build` of the same reserve
+        and `/notes/exchange` of its issuer answer 409. The answer's `tx_id` is
+        the signed transaction's id, also when the node reports another one.
+        A redemption in no mempool and not on chain for 10 checks is looked at
+        every 10 minutes and dropped unapplied only once it can no longer be
+        mined: its reserve box is spent by another transaction, or the tracker
+        box it reads is spent by a confirmed commit (round 5b).
       operationId: submitRedemption
       tags:
         - Redemption
@@ -1243,12 +1255,17 @@ paths:
                 $ref: '#/components/schemas/ApiResponseError'
         '500':
           description: >-
-            Internal server error, or the node did not accept the transaction
-            ("the node did not accept redemption <id>; build it again with POST
-            /redemption/build"; nothing is journaled), or the node's answer was
-            lost ("the node did not answer for redemption <id>; the tracker
-            watches the chain for it ..."; it stays journaled and is applied if
-            mined); the node's URL and answer are logged, never returned
+            Internal server error, or the journal cannot be written ("cannot
+            record ..."; nothing is broadcast), or the node refused the
+            transaction with a 4xx answer while it is in no mempool and its
+            reserve box is unspent ("the node did not accept redemption <id>;
+            build it again with POST /redemption/build"; nothing is journaled),
+            or the node's answer is a 5xx, missing or unclear ("the node did not
+            answer for redemption <id>; the tracker watches the chain for it
+            ..."; it stays journaled and is applied if mined). A refusal saying
+            the transaction is already in the pool, or one for a transaction the
+            node's mempool has, is a 200. The node's URL and answer are logged,
+            never returned
           content:
             application/json:
               schema:
@@ -2181,7 +2198,11 @@ components:
             on the notes this tracker holds: the sum of `amount_collected -
             amount_redeemed` over those notes (saturating at 2^64-1). It is per
             (owner, denomination), not per box: two reserves of one owner in one
-            denomination show the same debt.
+            denomination show the same debt. A redemption submitted through
+            `/redemption/submit` counts once it is applied (in a block,
+            `[confirmation] min_depth` deep): while it is journaled the debt
+            still includes it, while `collateral_amount` may already be the
+            reserve's smaller successor box (round 5b).
           example: 1200000000
         tracker_nft_id:
           type: string
@@ -2402,7 +2423,19 @@ components:
           nullable: true
           description: Optional explicit cumulative reserve-tree value
           example: 500000000
-
+        reserve_tree_timestamp:
+          type: integer
+          format: uint64
+          nullable: true
+          description: >-
+            Optional timestamp of the note's reserve tree value (round 5b): the
+            note timestamp the redemption's build proved, as journaled
+            (`GET /redemption/journal`). The reserve tree value is
+            `reserve_tree_timestamp || new_already_redeemed`, which must match
+            the reserve's R5. When omitted, the note's current timestamp is used
+            and the server logs a warning (a note re-signed after the build
+            then puts the reserve tree out of step with the chain)
+          example: 1700000000000
 
         denomination:
           type: string

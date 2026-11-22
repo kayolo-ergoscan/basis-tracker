@@ -601,9 +601,11 @@ otherwise `400 Bad Request`. The caller-supplied `issuer_pubkey` / `recipient_pu
 1. Increment the note's `amount_redeemed` by the build entry's redeemed amount (note accounting;
    cumulative redeemed against total debt). The note timestamp is part of the issuer's signed
    message and stays as signed.
-2. Sync the reserve AVL tree entry to the build entry's `new_already_redeemed` keyed with the note's
-   payment timestamp (the on-chain reserve tree value is `payment_timestamp || already_redeemed`).
-   This value comes from the build entry, not from the note record.
+2. Sync the reserve AVL tree entry to the build entry's `new_already_redeemed` with the timestamp
+   the build wrote (the on-chain reserve tree value is `timestamp || already_redeemed`). Both come
+   from the build entry, not from the note record: the timestamp is the note's timestamp at build
+   time (round 5b, F1), so a note re-signed between the build and the apply leaves the reserve
+   tree equal to the R5 the transaction put on chain.
 
 **State follows the chain (round 5, C8).** Until round 4 the submit applied both steps right
 after the broadcast, so a redemption that never reached a block (dropped from the mempool, or
@@ -613,45 +615,103 @@ Now:
 
 1. **Journal.** Before the broadcast the submit writes the redemption (tx id, reserve box,
    issuer, recipient, denomination, redeemed amount, `new_already_redeemed`, data inputs, submit
-   time) into the journal: partition `redemption_journal` of the `tracker_boxes` store, JSON per
-   tx id. A broadcast the node refuses (an error answer, or no connection) removes it again and
-   answers `500` "the node did not accept redemption ...". A broadcast whose answer is lost
-   keeps it (the node may have the transaction) and answers `500` "the node did not answer for
-   redemption ...; the tracker watches the chain for it". A successful broadcast answers `200`
-   with the tx id, as before; nothing is applied yet.
+   time and, round 5b, the reserve tree timestamp and R5 digest the build proved) into the
+   journal: partition `redemption_journal` of the `tracker_boxes` store, JSON per tx id (lower
+   case), synced to disk (`SyncAll`) before the node can have the transaction (round 5b, F9).
+   Fields added in round 5b have serde defaults, so entries written before read as before. The
+   entry keeps the signed transaction's id; a node that reports another id is logged, not
+   followed (round 5b, F2). What the broadcast answer does (round 5b, F7):
+   - `2xx`: `200` with the tx id; nothing is applied yet;
+   - `4xx` saying the transaction is already in the pool, or a `4xx` for a transaction the node's
+     mempool has: `200`, as accepted;
+   - any other `4xx` while the reserve box is unspent (`/utxo/byId`): refused. The entry is
+     removed and the answer is `500` "the node did not accept redemption ...; build it again";
+   - a `5xx`, no connection, a timeout, or a `4xx` while the reserve box is spent already or its
+     state cannot be read: kept (the node may have the transaction), `500` "the node did not
+     answer for redemption ...; the tracker watches the chain for it".
 2. **Confirmer.** Every 60 s the redemption confirmer looks each journaled redemption up, in the
    mempools first and then on chain (the tracker box updater's lookup order):
    - in a block, at least `[confirmation] min_depth` deep: applied (the two steps above, as one
-     `CompleteRedemption` with the cumulative value) and removed from the journal;
+     `CompleteRedemption` with the cumulative value and the build's timestamp). Then the
+     tracker's reserve tree digest is compared with R5 of output 0 (the reserve output) of the
+     mined transaction, from the blockchain index, or with the digest journaled at submit when
+     the index gives none (round 5b, F1). Equal: the entry is removed. Different: an error is
+     logged and the entry stays, marked (`digest_mismatch`, both digests); the confirmer leaves
+     it alone and the reserve builds nothing until an operator has looked at it;
    - in a mempool, or in a block not deep enough yet: kept;
-   - in neither for 10 consecutive checks (about 10 minutes): dropped, never applied. The note
-     and the reserve tree are as before the build, and the recipient can build it again;
+   - in neither for 10 consecutive checks: kept while it can still be mined, and from then on
+     looked at every 10 minutes (`next_check_at_ms`; round 5b, F4). It is dropped, never applied,
+     only once it can no longer be mined: its reserve box is spent by another transaction (the
+     spender the blockchain index names), or the tracker box it reads as a data input is out of
+     the UTXO set while its reserve box is unspent and the tracker's confirmed box is another one
+     (a confirmed commit replaced it). A reserve box out of the UTXO set whose spender the index
+     does not name yet (an index that lags behind the chain) keeps it: the redemption may be in a
+     block the index has not reached;
    - a node error: kept, not counted;
    - applying fails (the tracker's state no longer matches the build): kept with the error,
      logged once and tried again at every check. An operator repair (`/redeem/complete` below,
-     with the same `new_already_redeemed`) records it, and the next attempt finds it applied.
-3. **Idempotent apply.** `CompleteRedemption` with an explicit `new_already_redeemed` that the
-   note's `amount_redeemed` and the reserve tree value both already equal changes nothing and
-   succeeds: the confirmer and an operator repair may both send the same redemption. Any other
-   value must still be the note's `amount_redeemed + redeemed_amount`.
-4. **Builds wait.** While a reserve (issuer and denomination) has a journaled redemption,
-   `/redemption/build` answers `409 Conflict` naming it: a second build would spend the same
-   reserve box, and the reserve tree is one redemption behind the chain until it is applied.
+     with the same `new_already_redeemed` and `reserve_tree_timestamp`) records it, and the next
+     attempt finds it applied.
+
+   Every write-back of an entry is a compare-and-set: an entry removed meanwhile (refused at
+   submit, applied or dropped by an operator) is not brought back (round 5b, F8).
+3. **Idempotent, atomic apply.** `CompleteRedemption` with an explicit `new_already_redeemed`
+   that the note's `amount_redeemed` and the reserve tree value (timestamp and amount, all 16
+   bytes) already equal changes nothing and succeeds: the confirmer and an operator repair may
+   both send the same redemption. The same amount with another timestamp is refused. Any other
+   value must still be the note's `amount_redeemed + redeemed_amount`. The note, its index
+   entries and the reserve tree's journal record are written in one batch, and the in-memory
+   reserve tree changes only once the batch is written (round 5b, F6): a failed write leaves
+   nothing half-applied, and the retry applies both.
+4. **Builds and exchanges wait.** While a reserve (issuer and denomination) has a journaled
+   redemption, `/redemption/build` answers `409 Conflict` naming it: a second build would spend
+   the same reserve box, and the reserve tree is one redemption behind the chain until it is
+   applied. `/notes/exchange` answers `409` the same way while either of the issuer's two
+   reserves has one (round 5b, F5). A marked entry keeps answering `409` until it is dropped.
 5. **Restart.** The journal is on disk. At startup its redemptions are again among those that
    hold back a commit (with their submit time, so the 20-minute limit is not restarted), and
-   the confirmer follows them.
+   the confirmer follows them. Marked entries are applied already and hold nothing back.
+6. **Operator routes (round 5b, F6, Admin only).** `GET /redemption/journal` lists the entries;
+   `POST /redemption/journal/drop` `{"tx_id"}` removes one unapplied (its reserve builds again;
+   if it is mined after all, the reserve tree is out of step with the chain);
+   `POST /redemption/journal/apply` `{"tx_id"}` applies one now, without the chain, and compares
+   the reserve tree with the journaled digest (`409` when it cannot be applied or the digests
+   differ). The front proxy's route allowlist does not pass them: they are reached on the
+   tracker's own port.
 
-Not done in round 5: **scanner reconciliation** of a redemption that did not go through this
-tracker's submit (submitted through another node after the tracker's broadcast was refused, as
-the canary does, or one the journal dropped and that was mined later). The tracker's reserve
-tree is then behind the chain, and the build answers that no reserve matches the tracker's
-reserve tree until an operator records it with `/redeem/complete`, as before.
+**Reserve debt while a redemption is journaled (round 5b, F11).** `total_debt` of `/reserves`,
+`/reserves/issuer/{pubkey}` and `/reserves/{box_id}` is the owner's outstanding debt on the notes
+(`amount_collected - amount_redeemed`), read through the issuer index for the reserves' owners
+only. A journaled redemption changes `amount_redeemed` only when it is applied: until then the
+debt still includes it, while `collateral_amount` (the scanner's reserve box) is the smaller
+successor box as soon as the scanner has seen the block. For that window (at least `min_depth`
+blocks plus up to a minute) the debt is high by the redeemed amount, so the collateral ratio
+reads low.
 
-**Commits wait for it (round 5).** The broadcast redemption reads the tracker box as its data
+**The window of 6113b8d (round 5b, F1).** In 6113b8d the submit applied the redemption right after
+the broadcast with the note's timestamp at that moment, so a note re-signed between the build and
+the submit put the reserve tree out of step with the R5 the transaction wrote. The submit no longer
+applies anything, every apply carries the build's timestamp (the confirmer, `/redemption/journal/apply`),
+and `/redeem/complete` takes it as `reserve_tree_timestamp` (without it, the note's current
+timestamp, with a warning). Builds recorded by 6113b8d live only in memory and do not survive the
+upgrade, so no 6113b8d build is applied by the new code.
+
+Not done in round 5 or 5b: **scanner reconciliation** of a redemption that did not go through this
+tracker's submit (broadcast by the recipient through another node, or through the front's
+`/node/transactions`, or one dropped from the journal by an operator and mined later). The tracker's
+reserve tree is then behind the chain, and the build answers that no reserve matches the tracker's
+reserve tree until an operator records it with `/redeem/complete`, as before. A redemption dropped
+from every mempool that can still be mined keeps its reserve blocked until it can no longer be mined
+(at the latest when a confirmed commit replaces the tracker box it reads, which the heartbeat does
+within `heartbeat_blocks`) or until an operator drops it.
+
+**Commits wait for it (round 5, 5b).** The broadcast redemption reads the tracker box as its data
 input, and a tracker commit spends that box. The submit records the redemption's tx id and data
 input box ids for the tracker box updater, which holds back its next commit while the
 redemption is still in a mempool and reads the current tracker box: at most 20 minutes per
-redemption, and never once the tracker box is within 200 blocks of the emergency window
+redemption and at most 20 minutes in total from the first deferral since the last commit, whichever
+redemptions hold it back (round 5b, F3); never a commit due as a heartbeat (the tracker box is
+`heartbeat_blocks` old), and never once the tracker box is within 200 blocks of the emergency window
 (`specs/server/tracker_box_update_spec.md`, main loop step 9).
 
 ### POST /redeem/complete (manual completion / repair)
@@ -661,7 +721,10 @@ Admin-only (see `specs/server/authentication_authorization.md`). A request with
 
 The legacy completion endpoint accepts an optional `new_already_redeemed` field; when
 provided it is used as the reserve-tree value instead of the note's cumulative amount.
-This is the supported way to repair local state after an out-of-band redemption:
+Round 5b (F1): it also accepts an optional `reserve_tree_timestamp`, the timestamp of the reserve
+tree value the redemption's build proved (the journal entry's `reserve_tree_timestamp`, or the
+reserve output's R5 entry). Without it the note's current timestamp is used and a warning is
+logged. This is the supported way to repair local state after an out-of-band redemption:
 
 ```json
 {
@@ -669,7 +732,8 @@ This is the supported way to repair local state after an out-of-band redemption:
   "issuer_pubkey": "...",
   "recipient_pubkey": "...",
   "redeemed_amount": 100000000,
-  "new_already_redeemed": 100000000
+  "new_already_redeemed": 100000000,
+  "reserve_tree_timestamp": 1700000000000
 }
 ```
 

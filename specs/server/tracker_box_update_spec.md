@@ -214,11 +214,20 @@ The background task executes the following algorithm in a continuous loop:
      another (older, already spent) box;
    - one redemption holds commits back for at most 20 minutes from its submit
      (`MAX_COMMIT_DEFERRAL`); after that the commit is made anyway and a warning is logged;
+   - round 5b (F3): commits are held back for at most 20 minutes in total from the first
+     deferral since the last commit, whichever redemptions hold them back and however the digest
+     changes meanwhile, so redemptions submitted one after another cannot hold commits back for
+     longer. The clock restarts when a commit is submitted or a cycle has nothing to commit;
+   - round 5b (F3): a due heartbeat is never held back: neither a heartbeat commit (nothing new
+     to commit, the box `heartbeat_blocks` old) nor a commit of a new digest once the tracker box
+     is that old. A redemption in the mempool that reads the box then fails and must be built
+     again; a warning names how many were waiting;
    - nothing is held back once the tracker box is within 200 blocks of the 2160-block emergency
      window (`/info` height minus the box creation height,
      `COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS`), or when the node height cannot be read.
-   The list is in memory (at most 1024 entries, the oldest make room) and starts empty after a
-   restart. Heartbeat commits are held back the same way.
+   The list is in memory (at most 1024 entries, the oldest make room); at startup it is filled
+   again from the redemption journal (`specs/server/redemption_state_spec.md`), each entry with
+   its submit time.
 10. **Sign and Submit Transaction**:
    - Build the signing context from `/blocks/lastHeaders/10` (newest header first) and prove every input locally with `ergo.tracker_secret_key` (every input is `P2PK(tracker pk)`)
    - Validate the signed transaction locally (ERG and token preservation, dust, heights, proofs)

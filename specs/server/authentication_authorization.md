@@ -48,7 +48,8 @@ tls_key_path = "server.key"
 mode = "signature"          # RECOMMENDED. The built-in default is "none".
 # Shared secret used only when mode = "api_key".
 # api_key = "change-me"
-# Separate key for the Admin-only routes (/redeem/complete, GET /notes, GET /events*). Required when
+# Separate key for the Admin-only routes (/redeem/complete, /redemption/journal*, GET /notes,
+# GET /events*). Required when
 # mode = "api_key": api_key above then grants only Write. The server refuses to
 # start without it, with the "change-me-admin" placeholder, or equal to api_key.
 # admin_api_key = "..."
@@ -146,6 +147,8 @@ Every authenticated request receives an effective role. Routes require the follo
 | `/redemption/prepare` | `POST` | `Write` (removed: always `410 Gone`) |
 | `/redemption/build` | `POST` | `Write` |
 | `/redemption/submit` | `POST` | `Write` |
+| `/redemption/journal` | `GET` | `Admin` (every journaled redemption with its keys and amounts; round 5b) |
+| `/redemption/journal/drop`, `/redemption/journal/apply` | `POST` | `Admin` (round 5b) |
 | `/tracker/signature` | `POST` | `Write` |
 | `/notes/state` | `POST` | `Read` |
 | `/acceptance/check` | `POST` | `Read` |

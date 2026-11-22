@@ -97,8 +97,9 @@ signature_timestamp_tolerance_ms = 30000
 ```
 
 With `admin_api_key` set, the shared `api_key` grants only Write access; Admin routes
-(`/redeem/complete`, `GET /notes`, `GET /events`, `GET /events/paginated`) require the admin
-key.
+(`/redeem/complete`, `GET /redemption/journal`, `POST /redemption/journal/drop`,
+`POST /redemption/journal/apply`, `GET /notes`, `GET /events`, `GET /events/paginated`) require
+the admin key.
 Without it, `api_key` keeps its full Admin meaning (a startup warning is printed).
 
 When auth is enabled, configure TLS (`tls_cert_path` / `tls_key_path`) so
@@ -194,7 +195,10 @@ confirmations do not change.
 - Keep the tracker address funded: heartbeats are paid from the same token-free boxes
   as every other commit.
 - A heartbeat spends the tracker box. A redemption transaction built before it, which
-  carries the old tracker box as a data input, has to be rebuilt.
+  carries the old tracker box as a data input, has to be rebuilt. Commits wait for a
+  redemption submitted through `/redemption/submit` that is still in a mempool, for at most
+  20 minutes in total, but a due heartbeat never waits (round 5b): the box being
+  `heartbeat_blocks` old is the moment a heartbeat or any other commit goes out.
 
 `change_address`, when set, receives the change of the fee boxes. Leave it unset to keep
 the change at the tracker address, where the next commit can spend it.

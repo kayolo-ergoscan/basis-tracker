@@ -82,7 +82,13 @@ fjall keyspace waits up to one fsync interval to close.
 - `POST /redemption/submit` - Tracker-assisted redemption step 2: journal and broadcast a signed
   redemption transaction. The note and the reserve tree follow once it is in a block,
   `[confirmation] min_depth` deep (the redemption confirmer, every 60 s); meanwhile builds of
-  that reserve answer 409 (round 5, see `specs/server/redemption_state_spec.md`)
+  that reserve and exchanges of its issuer answer 409 (round 5 and 5b, see
+  `specs/server/redemption_state_spec.md`)
+- `GET /redemption/journal` - Admin: the journaled redemptions (round 5b)
+- `POST /redemption/journal/drop` - Admin: remove a journaled redemption without applying it
+  (round 5b)
+- `POST /redemption/journal/apply` - Admin: apply a journaled redemption without waiting for the
+  chain (round 5b)
 - `GET /proof/redemption` - Get redemption-specific proof with tracker state digest
 
 ### Tracker State and Proof Endpoints
@@ -95,7 +101,8 @@ fjall keyspace waits up to one fsync interval to close.
 
 ### Reserve Endpoints
 
-- `GET /reserves` - Get all reserve information
+- `GET /reserves` - Get all reserve information; each reserve's `total_debt` is read through the
+  issuer index for the reserves' owners, never by scanning every note (round 5b)
 - `GET /reserves/issuer/{pubkey}` - Get reserves for a specific issuer
 - `GET /reserves/{box_id}` - Get a single reserve by its box id
 
