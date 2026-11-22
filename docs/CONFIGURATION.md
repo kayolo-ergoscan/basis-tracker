@@ -203,7 +203,10 @@ min_depth = 2
 Presence of the tracker update transaction in a block alone is not treated as
 confirmation; the tracker box updater waits until the transaction has
 `min_depth` blocks before promoting pending notes to `Confirmed` (making them
-redeemable). Box/height fetch failures are retried on the next update cycle.
+redeemable). The depth counts from the block that included the transaction
+(`inclusionHeight` from `/blockchain/transaction/byId`), not from its outputs'
+creation height, which is older when the transaction waited in the mempool.
+Box/height fetch failures are retried on the next update cycle.
 Note this is only a depth gate — reorg handling beyond it is out of scope
 (see `specs/pr12_triage.md`).
 

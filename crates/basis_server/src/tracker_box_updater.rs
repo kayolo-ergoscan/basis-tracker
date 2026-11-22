@@ -326,6 +326,44 @@ pub fn confirmation_depth(current_height: u64, inclusion_height: u64) -> u64 {
     }
 }
 
+/// A commit transaction as the blockchain index reports it
+/// (`GET /blockchain/transaction/byId/{id}`, an `IndexedErgoTransaction`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfirmingTx {
+    /// The new tracker box: the first output (the tx id when the response has no outputs).
+    box_id: String,
+    /// Creation height of that box (0 when unknown), recorded as the confirmation height.
+    height: u64,
+    /// Height of the block that included the transaction (`inclusionHeight`, 0 when unknown).
+    /// Confirmation depth counts from here, never from the creation height: a transaction
+    /// that waited in the mempool was built many blocks before it was included.
+    inclusion_height: u64,
+}
+
+impl ConfirmingTx {
+    fn from_indexed_tx(body: &serde_json::Value, tx_id: &str) -> Self {
+        let first = body
+            .get("outputs")
+            .and_then(|o| o.as_array())
+            .and_then(|outputs| outputs.first());
+        Self {
+            box_id: first
+                .and_then(|b| b.get("boxId"))
+                .and_then(|b| b.as_str())
+                .unwrap_or(tx_id)
+                .to_string(),
+            height: first
+                .and_then(|b| b.get("creationHeight"))
+                .and_then(|h| h.as_u64())
+                .unwrap_or(0),
+            inclusion_height: body
+                .get("inclusionHeight")
+                .and_then(|h| h.as_u64())
+                .unwrap_or(0),
+        }
+    }
+}
+
 /// Tracker box updater service
 pub struct TrackerBoxUpdater;
 
@@ -417,30 +455,38 @@ impl TrackerBoxUpdater {
             if let Some((tx_id, expected_digest)) = pending_tx.clone() {
                 match Self::check_transaction_confirmation(&config, &tx_id).await {
                     Ok(TxStatus::OnChain) => {
-                        // Look up the confirming box to record its height/id.
-                        let (box_id, height) =
-                            match Self::fetch_tracker_box_summary(&config, &tx_id).await {
-                                Ok(summary) => summary,
-                                Err(e) => {
-                                    error!(
-                                        "Failed to fetch confirming box for {}: {}. Will retry.",
-                                        tx_id, e
-                                    );
-                                    continue;
-                                }
-                            };
+                        // Look up the confirming box to record its height/id, and the block
+                        // height the transaction was included at.
+                        let ConfirmingTx {
+                            box_id,
+                            height,
+                            inclusion_height,
+                        } = match Self::fetch_tracker_box_summary(&config, &tx_id).await {
+                            Ok(summary) => summary,
+                            Err(e) => {
+                                error!(
+                                    "Failed to fetch confirming box for {}: {}. Will retry.",
+                                    tx_id, e
+                                );
+                                continue;
+                            }
+                        };
 
                         // Require a minimum on-chain depth (presence in a block
                         // alone is not confirmation) before promoting pending
-                        // notes to Confirmed.
+                        // notes to Confirmed. The depth counts from the block that
+                        // included the transaction: its outputs' creation height is
+                        // when it was built, which can be many blocks earlier for a
+                        // transaction that waited in the mempool.
                         if config.min_confirmation_depth > 1 {
                             match Self::get_node_height(&config).await {
                                 Ok(current) => {
-                                    let depth = confirmation_depth(current as u64, height);
+                                    let depth =
+                                        confirmation_depth(current as u64, inclusion_height);
                                     if depth < config.min_confirmation_depth {
                                         info!(
                                             "Transaction {} included at height {} (depth {}/{}), waiting for more confirmations...",
-                                            tx_id, height, depth, config.min_confirmation_depth
+                                            tx_id, inclusion_height, depth, config.min_confirmation_depth
                                         );
                                         continue;
                                     }
@@ -738,12 +784,12 @@ impl TrackerBoxUpdater {
         true
     }
 
-    /// Fetch a minimal summary (box_id, creation_height) for a tracker box by
-    /// spending transaction id. Falls back to the supplied tx id on error.
+    /// What the loop records about a commit found on chain
+    /// (`GET /blockchain/transaction/byId/{tx_id}`): see [`ConfirmingTx`].
     async fn fetch_tracker_box_summary(
         config: &TrackerBoxUpdateConfig,
         tx_id: &str,
-    ) -> Result<(String, u64), TrackerBoxUpdaterError> {
+    ) -> Result<ConfirmingTx, TrackerBoxUpdaterError> {
         let client = basis_store::http::bounded_client();
         let url = format!(
             "{}/blockchain/transaction/byId/{}",
@@ -776,24 +822,7 @@ impl TrackerBoxUpdater {
                     TrackerBoxUpdaterError::HttpError(format!("JSON parse error: {}", e))
                 })
             })?;
-
-        // The new tracker box is the first output of the update transaction.
-        if let Some(outputs) = body.get("outputs").and_then(|o| o.as_array()) {
-            if let Some(first) = outputs.first() {
-                let box_id = first
-                    .get("boxId")
-                    .and_then(|b| b.as_str())
-                    .unwrap_or(tx_id)
-                    .to_string();
-                let height = first
-                    .get("creationHeight")
-                    .and_then(|h| h.as_u64())
-                    .unwrap_or(0);
-                return Ok((box_id, height));
-            }
-        }
-
-        Ok((tx_id.to_string(), 0))
+        Ok(ConfirmingTx::from_indexed_tx(&body, tx_id))
     }
 
     /// Fetch a reserve box's on-chain R5 digest from the node's UTXO set.
@@ -2355,7 +2384,25 @@ mod tests {
     /// requests seen so far, then stops the loop and returns them.
     async fn run_updater_until(
         in_mempool: bool,
-        done: impl Fn(&[crate::local_wallet::tests::Seen]) -> bool,
+        done: impl FnMut(&[crate::local_wallet::tests::Seen]) -> bool,
+    ) -> Vec<crate::local_wallet::tests::Seen> {
+        let lookup = move |path: &str| {
+            if in_mempool && path.starts_with(MEMPOOL_LOOKUP) {
+                (200, "{}".to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        };
+        let height = Arc::new(std::sync::atomic::AtomicU64::new(123_500));
+        run_updater(lookup, height, done).await
+    }
+
+    /// [`run_updater_until`] with the mempool and chain lookups of the commit answered by
+    /// `lookup(path)` and the node height (`/info`) read from `height`.
+    async fn run_updater(
+        lookup: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+        height: Arc<std::sync::atomic::AtomicU64>,
+        mut done: impl FnMut(&[crate::local_wallet::tests::Seen]) -> bool,
     ) -> Vec<crate::local_wallet::tests::Seen> {
         use crate::local_wallet::tests::{mock_node, tree_of, utxo_box, LAST_HEADERS_JSON};
         use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
@@ -2391,10 +2438,13 @@ mod tests {
         let (url, seen) = mock_node(move |method, target, body| {
             let path = target.split('?').next().unwrap_or_default();
             match (method, path) {
-                ("GET", "/info") => (
-                    200,
-                    serde_json::json!({ "fullHeight": 123_500 }).to_string(),
-                ),
+                ("GET", "/info") => {
+                    let full_height = height.load(std::sync::atomic::Ordering::SeqCst);
+                    (
+                        200,
+                        serde_json::json!({ "fullHeight": full_height }).to_string(),
+                    )
+                }
                 ("GET", p) if p == by_token => (200, tracker_boxes.clone()),
                 ("GET", "/blocks/lastHeaders/10") => (200, LAST_HEADERS_JSON.to_string()),
                 ("POST", "/blockchain/box/unspent/byAddress") if target.contains("offset=0&") => {
@@ -2413,11 +2463,8 @@ mod tests {
                     let tx: serde_json::Value = serde_json::from_str(body).unwrap();
                     (200, tx["id"].to_string())
                 }
-                ("GET", p) if p.starts_with(MEMPOOL_LOOKUP) && in_mempool => {
-                    (200, "{}".to_string())
-                }
                 ("GET", p) if p.starts_with(MEMPOOL_LOOKUP) || p.starts_with(CHAIN_LOOKUP) => {
-                    (404, "{}".to_string())
+                    lookup(p)
                 }
                 _ => (500, format!("unexpected {method} {target}")),
             }
@@ -2512,5 +2559,87 @@ mod tests {
             })
             .collect();
         assert_eq!(lookups, ["mempool", "chain"].repeat(missing));
+    }
+
+    #[test]
+    fn the_confirming_tx_reads_the_inclusion_height() {
+        let body = serde_json::json!({
+            "id": "aa".repeat(32),
+            "inclusionHeight": 123_500,
+            "numConfirmations": 1,
+            "outputs": [{ "boxId": "ee".repeat(32), "creationHeight": 123_470 }]
+        });
+        assert_eq!(
+            ConfirmingTx::from_indexed_tx(&body, "tx"),
+            ConfirmingTx {
+                box_id: "ee".repeat(32),
+                height: 123_470,
+                inclusion_height: 123_500,
+            }
+        );
+        // Unknown heights are 0 (depth 0: not deep enough), the box falls back to the tx id.
+        assert_eq!(
+            ConfirmingTx::from_indexed_tx(&serde_json::json!({}), "tx"),
+            ConfirmingTx {
+                box_id: "tx".to_string(),
+                height: 0,
+                inclusion_height: 0,
+            }
+        );
+    }
+
+    /// A commit built at 123_470 that waited in the mempool and was included at the tip,
+    /// 123_500, is at depth 1, not 31. With min_confirmation_depth 2 the updater keeps it
+    /// pending (it does not even look the tracker box up again) until the next block, and only
+    /// then treats it as confirmed and moves on.
+    #[tokio::test]
+    async fn confirmation_depth_counts_from_the_inclusion_height() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        const BY_TOKEN: &str = "/blockchain/box/unspent/byTokenId/";
+        let included_at = 123_500u64;
+        let tx_json = serde_json::json!({
+            "inclusionHeight": included_at,
+            "numConfirmations": 1,
+            "outputs": [{ "boxId": "ee".repeat(32), "creationHeight": included_at - 30 }]
+        })
+        .to_string();
+        let lookup = move |path: &str| {
+            if path.starts_with(CHAIN_LOOKUP) {
+                (200, tx_json.clone())
+            } else {
+                (404, "{}".to_string())
+            }
+        };
+        let height = Arc::new(AtomicU64::new(included_at));
+        let next_block_at = Arc::new(AtomicUsize::new(usize::MAX));
+        let (node_height, bump) = (height.clone(), next_block_at.clone());
+
+        let seen = run_updater(lookup, height, move |seen| {
+            let Some(broadcast) = seen.iter().position(is_broadcast) else {
+                return false;
+            };
+            let bumped_at = bump.load(Ordering::SeqCst);
+            if bumped_at == usize::MAX {
+                // Three cycles at depth 1 (a status and a summary lookup each), then a block.
+                if count(&seen[broadcast..], CHAIN_LOOKUP) >= 6 {
+                    bump.store(seen.len(), Ordering::SeqCst);
+                    node_height.store(included_at + 1, Ordering::SeqCst);
+                }
+                return false;
+            }
+            count(&seen[bumped_at..], BY_TOKEN) >= 1
+        })
+        .await;
+
+        let broadcast = seen.iter().position(is_broadcast).unwrap();
+        let bumped_at = next_block_at.load(Ordering::SeqCst);
+        let waiting = &seen[broadcast..bumped_at];
+        assert!(count(waiting, CHAIN_LOOKUP) >= 6);
+        assert_eq!(count(waiting, BY_TOKEN), 0, "confirmed at depth 1");
+        assert!(
+            count(&seen[bumped_at..], BY_TOKEN) >= 1,
+            "confirmed at depth 2"
+        );
+        assert_eq!(broadcasts(&seen), 1);
     }
 }

@@ -237,7 +237,9 @@ To prevent submitting redundant updates during blockchain propagation:
 2. On each subsequent cycle, look the transaction up in the mempool first
    (`/transactions/unconfirmed/byTransactionId`: the broadcast node, then the scanner node if it
    is another one), then on chain (`/blockchain/transaction/byId`)
-3. Only update `last_submitted_digest` after the transaction is confirmed on-chain
+3. Only update `last_submitted_digest` after the transaction is confirmed on-chain: included
+   in a block at least `[confirmation] min_depth` deep, counted from the block that included
+   it (`inclusionHeight`), never from its outputs' creation height
 4. A transaction in the mempool is pending, not dropped: keep waiting, and never rebuild or
    resubmit it
 5. Only a transaction found in neither the mempool nor the chain for 3 consecutive cycles
