@@ -21,93 +21,10 @@ use crate::{
 };
 use basis_store::{IouNote, NoteError, PubKey, Signature};
 use ergo_lib::ergotree_ir::chain::address::AddressEncoder;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-// Structs for the Schnorr signing API
-#[derive(Serialize, Deserialize)]
-struct SchnorrSignRequest {
-    address: String,
-    message: String,
-}
-
-#[derive(Deserialize)]
-struct SchnorrSignResponse {
-    #[serde(rename = "signedMessage")]
-    _signed_message: String,
-    signature: String,
-    #[serde(rename = "publicKey")]
-    _public_key: String,
-}
-
-#[derive(Deserialize)]
-struct ErrorResponse {
-    error: Option<ErrorMessage>,
-}
-
-#[derive(Deserialize)]
-struct ErrorMessage {
-    code: String,
-    message: String,
-}
-
-/// Call the Ergo node's schnorrSign API to generate a tracker signature
-async fn call_schnorr_sign_api(
-    node_url: &str,
-    api_key: Option<&str>,
-    address: &str,
-    message: &str,
-) -> Result<String, String> {
-    let client = basis_store::http::bounded_client();
-
-    let request_body = SchnorrSignRequest {
-        address: address.to_string(),
-        message: message.to_string(),
-    };
-
-    let url = format!("{}/utils/schnorrSign", node_url.trim_end_matches('/'));
-    let mut request_builder = client.post(&url);
-
-    // Add API key if provided
-    if let Some(key) = api_key {
-        request_builder = request_builder.header("api_key", key);
-    }
-
-    let response = request_builder
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send request: {}", e))?;
-
-    let status = response.status();
-    let response_text = basis_store::http::read_body_capped(response)
-        .await
-        .map_err(|e| format!("Failed to read response: {}", e))?;
-
-    if status.is_success() {
-        let sign_response: SchnorrSignResponse = serde_json::from_str(&response_text)
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        Ok(sign_response.signature)
-    } else {
-        // Try to parse error response
-        let error_response: Result<ErrorResponse, _> = serde_json::from_str(&response_text);
-        let error_msg = match error_response {
-            Ok(err_resp) => {
-                if let Some(err) = err_resp.error {
-                    format!("{}: {}", err.code, err.message)
-                } else {
-                    response_text
-                }
-            }
-            Err(_) => response_text,
-        };
-        Err(format!("API error {}: {}", status.as_u16(), error_msg))
-    }
-}
-
-/// Verify that a signature from the Ergo node is compatible with the Basis server's verification algorithm
-/// This is needed because the Ergo node's Schnorr implementation has been found to be incompatible
-/// with the Basis server's verification algorithm
+/// Self-check of a tracker signature produced in this process: verify it with the same
+/// algorithm clients and the reserve contract use. A failure is logged, never returned.
 async fn verify_ergo_node_signature_compatibility(
     signature_hex: &str,
     message_hex: &str,
@@ -3968,84 +3885,34 @@ pub async fn request_tracker_signature(
 
     let message_to_sign = hex::encode(&message_to_sign_bytes);
 
-    // Try local signing first if tracker secret key is configured
-    let tracker_signature = if let Some(tracker_secret) = state.config.tracker_secret_key_bytes() {
-        tracing::info!("Signing tracker signature locally using configured secret key");
-
-        match basis_store::schnorr::schnorr_sign(
-            &message_to_sign_bytes,
-            &tracker_secret,
-            &tracker_pubkey_bytes,
-        ) {
-            Ok(signature) => {
-                let sig_hex = hex::encode(signature);
-                tracing::info!("Local tracker signature generated successfully");
-                sig_hex
-            }
-            Err(e) => {
-                tracing::error!("Failed to sign locally: {:?}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(crate::models::error_response(format!(
-                        "Failed to sign locally: {:?}",
-                        e
-                    ))),
-                );
-            }
-        }
-    } else {
-        // Fall back to Ergo node API
-        tracing::info!("No tracker secret key configured, using Ergo node API");
-
-        // Convert tracker public key to P2PK address format for the Ergo node API
-        use ergo_lib::ergo_chain_types::EcPoint;
-        use ergo_lib::ergotree_ir::chain::address::{Address, NetworkPrefix};
-        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
-        use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
-
-        let tracker_ec_point = match EcPoint::sigma_parse_bytes(&tracker_pubkey_bytes) {
-            Ok(point) => point,
-            Err(e) => {
-                tracing::error!("Failed to parse tracker public key as EcPoint: {:?}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(crate::models::error_response(format!(
-                        "Failed to parse tracker public key: {}",
-                        e
-                    ))),
-                );
-            }
-        };
-
-        let prove_dlog = ProveDlog::from(tracker_ec_point);
-        let tracker_address = Address::P2Pk(prove_dlog);
-        let encoder = AddressEncoder::new(NetworkPrefix::Mainnet); // Use appropriate network prefix
-        let tracker_p2pk_address = encoder.address_to_str(&tracker_address);
-
-        // Schnorr signing uses the tracker wallet node ([ergo.wallet], falling back
-        // to the scanner node when unset).
-        let (wallet_node_url, wallet_api_key) = state.config.ergo_wallet_node();
-        let node_url = &wallet_node_url;
-        let api_key = wallet_api_key.as_deref();
-
-        // Call the Ergo node's schnorrSign API to generate the tracker signature
-        match call_schnorr_sign_api(node_url, api_key, &tracker_p2pk_address, &message_to_sign)
-            .await
-        {
-            Ok(signature) => signature,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to generate tracker signature via Ergo node API: {}",
+    // The tracker signs in this process only; there is no node fallback.
+    let Some(tracker_secret) = state.config.tracker_secret_key_bytes() else {
+        tracing::error!(
+            "Tracker signature requested but ergo.tracker_secret_key is not configured"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(crate::models::error_response(
+                "tracker secret key not configured (ergo.tracker_secret_key); the tracker signs locally only"
+                    .to_string(),
+            )),
+        );
+    };
+    let tracker_signature = match basis_store::schnorr::schnorr_sign(
+        &message_to_sign_bytes,
+        &tracker_secret,
+        &tracker_pubkey_bytes,
+    ) {
+        Ok(signature) => hex::encode(signature),
+        Err(e) => {
+            tracing::error!("Failed to sign locally: {:?}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::models::error_response(format!(
+                    "Failed to sign locally: {:?}",
                     e
-                );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(crate::models::error_response(format!(
-                        "Failed to generate tracker signature: {}",
-                        e
-                    ))),
-                );
-            }
+                ))),
+            );
         }
     };
 
@@ -4086,7 +3953,8 @@ pub async fn request_tracker_signature(
 /// Helper function to get tracker signature for redemption
 /// Used by the redemption flow to include tracker signature in the request
 ///
-/// If tracker_secret_key is configured, signs locally. Otherwise, falls back to Ergo node API.
+/// Signs locally with `ergo.tracker_secret_key`; fails (500) when it is not configured. The node's
+/// `/utils/schnorrSign` is never used.
 ///
 /// SECURITY (PR #16 H1): the signed message covers the STORED note's
 /// `(amount_collected, timestamp, tracker_nft_id)`. Caller-supplied amount/timestamp values are
@@ -4225,76 +4093,33 @@ async fn get_tracker_signature_for_redemption(
         &stored_note.tracker_nft_id,
     );
 
-    // Check if we have a tracker secret key for local signing
-    if let Some(tracker_secret) = state.config.tracker_secret_key_bytes() {
-        tracing::info!("Signing tracker signature locally using configured secret key");
-
-        // Sign locally using our schnorr implementation
-        let signature = basis_store::schnorr::schnorr_sign(
-            &message_to_sign_bytes,
-            &tracker_secret,
-            &tracker_pubkey_bytes,
+    // The tracker signs in this process only; there is no node fallback.
+    let tracker_secret = state.config.tracker_secret_key_bytes().ok_or_else(|| {
+        tracing::error!("Redemption signature requested but ergo.tracker_secret_key is not configured");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(crate::models::error_response(
+                "tracker secret key not configured (ergo.tracker_secret_key); the tracker signs locally only"
+                    .to_string(),
+            )),
         )
-        .map_err(|e| {
-            tracing::error!("Failed to sign locally: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(crate::models::error_response(format!(
-                    "Failed to sign locally: {:?}",
-                    e
-                ))),
-            )
-        })?;
-
-        let signature_hex = hex::encode(signature);
-        tracing::info!("Local tracker signature generated successfully");
-        return Ok(signature_hex);
-    }
-
-    // Fall back to Ergo node API if no local secret key is configured
-    tracing::info!("No tracker secret key configured, falling back to Ergo node API");
-
-    let message_to_sign = hex::encode(&message_to_sign_bytes);
-
-    // Convert tracker public key to P2PK address
-    use ergo_lib::ergo_chain_types::EcPoint;
-    use ergo_lib::ergotree_ir::chain::address::{Address, NetworkPrefix};
-    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
-    use ergo_lib::ergotree_ir::sigma_protocol::sigma_boolean::ProveDlog;
-
-    let tracker_ec_point = EcPoint::sigma_parse_bytes(&tracker_pubkey_bytes).map_err(|e| {
+    })?;
+    let signature = basis_store::schnorr::schnorr_sign(
+        &message_to_sign_bytes,
+        &tracker_secret,
+        &tracker_pubkey_bytes,
+    )
+    .map_err(|e| {
+        tracing::error!("Failed to sign locally: {:?}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(crate::models::error_response(format!(
-                "Failed to parse tracker public key: {}",
+                "Failed to sign locally: {:?}",
                 e
             ))),
         )
     })?;
-
-    let prove_dlog = ProveDlog::from(tracker_ec_point);
-    let tracker_address = Address::P2Pk(prove_dlog);
-    let encoder = AddressEncoder::new(NetworkPrefix::Mainnet);
-    let tracker_p2pk_address = encoder.address_to_str(&tracker_address);
-
-    // Schnorr signing uses the tracker wallet node ([ergo.wallet], falling back
-    // to the scanner node when unset).
-    let (wallet_node_url, wallet_api_key) = state.config.ergo_wallet_node();
-    let node_url = &wallet_node_url;
-    let api_key = wallet_api_key.as_deref();
-
-    // Call the Ergo node's schnorrSign API
-    call_schnorr_sign_api(node_url, api_key, &tracker_p2pk_address, &message_to_sign)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(crate::models::error_response(format!(
-                    "Failed to generate tracker signature: {}",
-                    e
-                ))),
-            )
-        })
+    Ok(hex::encode(signature))
 }
 
 /// `POST /redemption/prepare` is retired and always answers `410 Gone` with a JSON error.

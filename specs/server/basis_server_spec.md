@@ -197,16 +197,13 @@ The `/proof/redemption` endpoint returns responses with the following structure:
 
 ### Real Cryptographic Implementation
 
-The server now implements real cryptographic functionality using the Ergo node's Schnorr signing API instead of mock implementations:
+The server signs everything in its own process with `ergo.tracker_secret_key`; it never asks an Ergo node to sign:
 
 #### Schnorr Signature Generation
-- **Local Signing (Primary)**: If `tracker_secret_key` is configured in server config, signatures are generated locally using the tracker's secret key
-- **Remote Fallback**: If no secret key is configured, falls back to the `/utils/schnorrSign` API of the node configured under `[ergo.wallet]` (falling back to `[ergo.scanner]`)
+- **Local Signing (only)**: signatures are generated locally with `ergo.tracker_secret_key`, which is required at startup. There is no `/utils/schnorrSign` fallback; without the key a signature request fails with 500
 - **Format**: 65-byte signatures (33 bytes for 'a' component + 32 bytes for 'z' component)
 - **Structure**: Properly formatted with compressed public key prefix (0x02 or 0x03) followed by the signature components
-- **Security**: Supports both local signing (secret key in config) and remote signing (private keys secured within Ergo node)
-- **Authentication**: Remote requests to the signing API are authenticated using the tracker API key
-- **Implementation**: Tracker signature endpoints (`/tracker/signature` and `/redemption/prepare`) try local signing first, then fall back to Ergo node API
+- **Implementation**: `/tracker/signature` and `/redeem` sign locally (`/redemption/prepare` is removed: 410 Gone)
 - **Message Format**: 
   - Normal and emergency: `blake2b256(issuerKey||recipientKey) || longToByteArray(totalDebt) || longToByteArray(timestamp) || trackerNftId` (80 bytes)
   - Emergency redemption (after 3 days): same 80-byte message format, tracker signature becomes optional
@@ -305,18 +302,16 @@ Key configuration includes:
   tokens); larger requests are rejected with HTTP 400.
 - **`server.redemption_build_max_per_pair_per_hour`**: per-(issuer, recipient) rate limit on
   `POST /redemption/build` (default 60/hour, rolling window); excess requests get HTTP 429.
-- **Ergo node connection details**: `ergo.scanner.node_url` defaults to `http://127.0.0.1:9053`; point it at your Ergo node (with `extraIndex = true`) for real deployments. Wallet operations (`/wallet/*`, schnorr signing, broadcast) go to `ergo.wallet.node_url`, which falls back to the scanner node when unset.
+- **Ergo node connection details**: `ergo.scanner.node_url` defaults to `http://127.0.0.1:9053`; point it at your Ergo node (with `extraIndex = true`) for real deployments. Only the `POST /transactions` broadcast goes to `ergo.wallet.node_url`, which falls back to the scanner node when unset; no `/wallet/*` or `/utils/schnorrSign` endpoint is used and no node API key is needed.
 - Reserve contract P2S address
 - Tracker NFT ID (for tracker scanner registration and state commitment monitoring)
 - Tracker public key (for identifying the tracker server)
-- Tracker API key (for authenticating requests to the Ergo node's signing API)
 - Transaction fees
 
 **Critical Requirements**:
-1. `ergo.scanner.node_url` defaults to `http://127.0.0.1:9053` (local node); point it at your Ergo node (with `extraIndex = true`) for real deployments. `ergo.wallet.node_url` optionally points at a separate node hosting the tracker wallet; it falls back to the scanner node when unset.
-2. The server requires access to an Ergo node with the Schnorr signing API (`/utils/schnorrSign`) enabled for endpoints that require tracker signatures. The tracker private key must be available in the wallet of the node configured under `[ergo.wallet]` (falling back to `[ergo.scanner]`) for signature generation.
-3. The tracker public key must be provided in the configuration for signature verification purposes.
-4. The tracker API key must be provided to authenticate requests to the Ergo node's signing API.
+1. `ergo.scanner.node_url` defaults to `http://127.0.0.1:9053` (local node); point it at your Ergo node (with `extraIndex = true`) for real deployments. `ergo.wallet.node_url` optionally points at a separate node for the `POST /transactions` broadcast; it falls back to the scanner node when unset.
+2. `ergo.tracker_secret_key` must be configured: the tracker signs notes' redemption messages and its own transactions locally. No node wallet and no node API key are needed.
+3. The tracker public key must be provided in the configuration, and it must equal `tracker_secret_key·G` (checked at startup).
 5. When `server.auth.mode` is not `none`, configure TLS (`server.tls_cert_path` and `server.tls_key_path`) for production deployments so credentials and signatures are not sent in plaintext.
 
 ## Blockchain Integration

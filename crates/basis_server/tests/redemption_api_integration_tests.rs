@@ -1354,18 +1354,27 @@ mod redemption_api_tests {
         assert!(body.error.is_some());
     }
 
-    #[tokio::test]
-    async fn test_request_tracker_signature_valid_structure() {
-        // Test that valid request structure is accepted (will fail at signing stage due to no secret key)
-        let state = create_mock_app_state().await;
+    /// A state whose tracker public key is valid, with `tracker_secret_key` set or not.
+    async fn state_with_tracker_key(
+        tracker_pubkey: &[u8; 33],
+        tracker_secret: Option<&[u8; 32]>,
+    ) -> AppState {
+        let mut state = create_mock_app_state().await;
+        let mut config = (*state.config).clone();
+        config.ergo.tracker_public_key = Some(hex::encode(tracker_pubkey));
+        config.ergo.tracker_secret_key = tracker_secret.map(hex::encode);
+        state.config = Arc::new(config);
+        state
+    }
 
-        // A stored note is required: the tracker signs server-authoritative values (S4).
+    /// Store a note and its reserve, and return a signature request that matches it.
+    async fn signable_request(state: &AppState) -> TrackerSignatureRequest {
         let (issuer_secret, issuer_pubkey) = generate_keypair();
         let (_recipient_secret, recipient_pubkey) = generate_keypair();
         let issuer_hex = hex::encode(issuer_pubkey);
         let recipient_hex = hex::encode(recipient_pubkey);
         add_test_note(
-            &state,
+            state,
             &issuer_secret,
             &issuer_hex,
             &recipient_hex,
@@ -1373,41 +1382,66 @@ mod redemption_api_tests {
             1000,
         )
         .await;
-
         // The acceptance-policy collateral lookup needs a tracked reserve for the
         // note's denomination; without one the handler fails closed (409) before
         // reaching the signing step (finding #4).
-        add_tracker_reserve(&state, &issuer_hex, 10_000_000_000).await;
-
-        let request = TrackerSignatureRequest {
+        add_tracker_reserve(state, &issuer_hex, 10_000_000_000).await;
+        TrackerSignatureRequest {
             issuer_pubkey: issuer_hex,
             recipient_pubkey: recipient_hex,
             total_debt: 1000,
-            timestamp: 1234567890,
+            timestamp: 1000,
             emergency: false,
 
             denomination: String::new(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_tracker_signature_valid_structure() {
+        // A valid request reaches the signing step. Without tracker_secret_key it fails
+        // there: the tracker signs locally only and never falls back to the node's
+        // /utils/schnorrSign.
+        let (_tracker_secret, tracker_pubkey) = generate_keypair();
+        let state = state_with_tracker_key(&tracker_pubkey, None).await;
+        let request = signable_request(&state).await;
 
         let response =
             request_tracker_signature(axum::extract::State(state), axum::extract::Json(request))
                 .await;
 
-        // Without tracker_secret_key configured, it falls back to Ergo node API which will fail
-        // in test environment. The request structure itself should be validated.
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
         let body = &response.1;
-        if !body.success {
-            let default_msg = "unknown".to_string();
-            let error_msg = body.error.as_ref().unwrap_or(&default_msg);
-            assert!(
-                error_msg.contains("tracker")
-                    || error_msg.contains("Tracker")
-                    || error_msg.contains("sign")
-                    || error_msg.contains("node"),
-                "Expected tracker/signing-related error for valid request structure, got: {}",
-                error_msg
-            );
-        }
+        assert!(!body.success);
+        let error_msg = body.error.clone().unwrap_or_default();
+        assert!(
+            error_msg.contains("tracker secret key not configured"),
+            "expected the no-secret error, got: {}",
+            error_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_tracker_signature_signs_locally() {
+        // With the secret configured the signature is produced in-process (the mock state's
+        // node URL serves nothing) and verifies against the tracker public key.
+        let (tracker_secret, tracker_pubkey) = generate_keypair();
+        let state = state_with_tracker_key(&tracker_pubkey, Some(&tracker_secret)).await;
+        let request = signable_request(&state).await;
+
+        let response =
+            request_tracker_signature(axum::extract::State(state), axum::extract::Json(request))
+                .await;
+
+        assert_eq!(response.0, StatusCode::OK, "{:?}", response.1.error);
+        let data = response.1.data.as_ref().unwrap();
+        assert_eq!(data.tracker_pubkey, hex::encode(tracker_pubkey));
+        let signature: [u8; 65] = hex::decode(&data.tracker_signature)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let message = hex::decode(&data.message_signed).unwrap();
+        basis_store::schnorr::schnorr_verify(&signature, &message, &tracker_pubkey).unwrap();
     }
 
     #[tokio::test]
