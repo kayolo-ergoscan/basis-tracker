@@ -422,6 +422,22 @@ pub fn update_interval_from_env(raw: Option<&str>) -> Result<u64, String> {
 /// Whether a pending update transaction that the node has not seen for
 /// `missing_cycles` consecutive cycles should be treated as dropped/rejected
 /// (and the pending notes reverted so a fresh update can be submitted).
+/// Round 4: after a (re)start, a cycle that ends before it could record the tracker box (the
+/// AVL digest is not initialized yet, or the tracker box was not found) is retried after
+/// `STARTUP_RETRY_DELAY` instead of a full interval, for up to `STARTUP_RETRY_WINDOW` after
+/// the start. `/reserves/create` answers 503 until the tracker box is recorded, so a skipped
+/// first cycle kept it unavailable for a whole interval (600 s by default) after every restart.
+pub const STARTUP_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// See [`STARTUP_RETRY_DELAY`].
+pub const STARTUP_RETRY_WINDOW: Duration = Duration::from_secs(60);
+
+/// Whether a cycle that ended early `since_start` after the start is retried after
+/// [`STARTUP_RETRY_DELAY`]: only until the tracker box was first recorded, and only while
+/// the retry still falls within [`STARTUP_RETRY_WINDOW`].
+fn startup_retry_due(since_start: Duration, tracker_box_recorded: bool) -> bool {
+    !tracker_box_recorded && since_start + STARTUP_RETRY_DELAY <= STARTUP_RETRY_WINDOW
+}
+
 fn pending_tx_is_dropped(missing_cycles: u32) -> bool {
     missing_cycles >= MAX_PENDING_MISSING_CYCLES
 }
@@ -469,6 +485,10 @@ impl TrackerBoxUpdater {
         // otherwise stay `pending` forever and block all future updates
         // (issue #15 S6).
         let mut pending_missing_cycles: u32 = 0;
+        // Round 4: the startup retry (see `STARTUP_RETRY_DELAY`).
+        let started = tokio::time::Instant::now();
+        let mut tracker_box_recorded = false;
+        let mut retry_soon = false;
 
         info!(
             "Tracker box updater started with {}s interval",
@@ -484,8 +504,13 @@ impl TrackerBoxUpdater {
                     info!("Tracker box updater received shutdown signal, stopping");
                     return Ok(());
                 }
-                _ = ticker.tick() => {}
+                _ = tokio::time::sleep(STARTUP_RETRY_DELAY), if retry_soon => {
+                    // The regular schedule restarts from this cycle: no burst of missed ticks.
+                    ticker.reset();
+                }
+                _ = ticker.tick(), if !retry_soon => {}
             }
+            retry_soon = false;
 
             if let Some((tx_id, expected_digest)) = pending_tx.clone() {
                 match Self::check_transaction_confirmation(&config, &tx_id).await {
@@ -632,17 +657,35 @@ impl TrackerBoxUpdater {
             let tracker_pubkey = shared_state.get_tracker_pubkey();
 
             if current_digest == [0u8; 33] {
-                info!("AVL root digest not initialized yet, skipping update");
+                retry_soon = startup_retry_due(started.elapsed(), tracker_box_recorded);
+                if retry_soon {
+                    info!(
+                        "AVL root digest not initialized yet, retrying in {}s",
+                        STARTUP_RETRY_DELAY.as_secs()
+                    );
+                } else {
+                    info!("AVL root digest not initialized yet, skipping update");
+                }
                 continue;
             }
 
             let tracker_box = match Self::find_tracker_box(&config, &tracker_nft_id).await {
                 Ok(box_data) => box_data,
                 Err(e) => {
-                    error!("Failed to find tracker box: {}", e);
+                    retry_soon = startup_retry_due(started.elapsed(), tracker_box_recorded);
+                    if retry_soon {
+                        error!(
+                            "Failed to find tracker box: {}; retrying in {}s",
+                            e,
+                            STARTUP_RETRY_DELAY.as_secs()
+                        );
+                    } else {
+                        error!("Failed to find tracker box: {}", e);
+                    }
                     continue;
                 }
             };
+            tracker_box_recorded = true;
 
             // Refresh the confirmed box id in shared state from the live node.
             shared_state.set_tracker_box_id(tracker_box.box_id.clone());
@@ -1760,6 +1803,98 @@ mod tests {
                 && r.target.starts_with("/blockchain/box/unspent/byAddress?")));
         let expected_address = crate::local_wallet::p2pk_address(&PK).unwrap();
         assert_eq!(seen[0].body, format!("\"{expected_address}\""));
+    }
+
+    /// Round 4: the startup retry stops once the tracker box was recorded, and after the
+    /// window.
+    #[test]
+    fn startup_retries_stop_after_the_window_or_once_the_box_is_recorded() {
+        assert!(startup_retry_due(Duration::ZERO, false));
+        assert!(startup_retry_due(
+            STARTUP_RETRY_WINDOW - STARTUP_RETRY_DELAY,
+            false
+        ));
+        assert!(!startup_retry_due(
+            STARTUP_RETRY_WINDOW - STARTUP_RETRY_DELAY + Duration::from_millis(1),
+            false
+        ));
+        assert!(!startup_retry_due(Duration::ZERO, true));
+    }
+
+    /// Round 4: after a start, a cycle that ends because the AVL digest is not initialized yet
+    /// (the tracker thread still loading the tree) is retried after 5 s, not after the full
+    /// 600 s interval, so the tracker box that `/reserves/create` waits for is recorded within
+    /// seconds of a restart.
+    #[tokio::test]
+    async fn a_skipped_first_cycle_is_retried_within_seconds() {
+        use crate::local_wallet::tests::{mock_node, PK};
+        let nft = "5a".repeat(32);
+        let box_id = "ab".repeat(32);
+        let digest = [0x01u8; 33];
+        // R5: AvlTree type, digest, flags, key length.
+        let r5 = format!("64{}0720", hex::encode(digest));
+        let tree = crate::local_wallet::p2pk_tree_hex(&PK);
+        let (nft_node, box_node) = (nft.clone(), box_id.clone());
+        let (url, seen) = mock_node(move |_, target, _| {
+            if target.starts_with(&format!("/blockchain/box/unspent/byTokenId/{nft_node}")) {
+                let page = serde_json::json!([{
+                    "boxId": box_node,
+                    "value": 1_000_000u64,
+                    "ergoTree": tree,
+                    "assets": [{ "tokenId": nft_node, "amount": 1 }],
+                    "additionalRegisters": { "R5": r5 },
+                    "creationHeight": 10
+                }]);
+                (200, page.to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+        .await;
+        let config = TrackerBoxUpdateConfig {
+            wallet_node_url: "http://127.0.0.1:1".to_string(),
+            scanner_node_url: url,
+            update_interval_seconds: 600,
+            heartbeat_blocks: 0,
+            ..Default::default()
+        };
+        let shared = SharedTrackerState::new();
+        shared.set_tracker_nft_id(nft);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let updater = tokio::spawn(TrackerBoxUpdater::start(
+            config,
+            shared.clone(),
+            shutdown_rx,
+            None,
+        ));
+
+        // The first cycle runs at once and finds no digest.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(shared.get_confirmed().box_id.is_none());
+        shared.set_avl_root_digest(digest);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while shared.get_confirmed().box_id.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the skipped first cycle was not retried within 10 s"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(shared.get_confirmed().box_id.as_deref(), Some(box_id.as_str()));
+        assert_eq!(shared.get_confirmed().digest, Some(digest));
+
+        let _ = shutdown_tx.send(());
+        updater.await.unwrap().unwrap();
+        // One lookup: the first cycle stopped before it, the retry made it, and the next
+        // regular cycle is a full interval away.
+        let lookups = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.target.contains("byTokenId"))
+            .count();
+        assert_eq!(lookups, 1);
     }
 
     /// Fixture for the commit transaction: a tracker box at P2PK(fresh key) holding the NFT, as

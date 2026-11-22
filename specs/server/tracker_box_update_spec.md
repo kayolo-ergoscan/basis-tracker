@@ -189,7 +189,7 @@ The background task executes the following algorithm in a continuous loop:
 
 1. **Wait for Interval**: Use tokio::time::interval to wait for the configured update period (10 minutes)
 2. **Check Pending Transaction**: If a transaction was previously submitted but not yet confirmed, check where it is: first the mempool (`/transactions/unconfirmed/byTransactionId`), then the chain (`/blockchain/transaction/byId`). Only update `last_submitted_digest` after confirmation.
-3. **Access Shared State**: Read the current AVL tree root digest and tracker public key
+3. **Access Shared State**: Ask the tracker thread for the digest to commit (`RefreshDigest`: it rebuilds the live tree once if notes arrived since the last rebuild, and refreshes the shared digest), and read the tracker public key
 4. **Skip Unchanged State**: If the AVL root digest hasn't changed since the last confirmed submission, skip the update cycle, unless a heartbeat is due: with `[transaction] heartbeat_blocks` > 0 (default 720) and the tracker box at least that many blocks old (`/info` height minus the box creation height), the unchanged digest is recommitted through the normal path so the box never ages into the 2160-block emergency window
 5. **Find Tracker Box**: Query the blockchain for the tracker box using the tracker NFT ID via `/blockchain/box/unspent/byTokenId`
    - **NFT singleton check**: the tracker NFT must be a singleton (`amount == 1`) in the box. A non-singleton amount is a setup error (logged as an error): the reserve contract's singleton guarantees break if the tracker NFT is divisible.
@@ -211,7 +211,12 @@ The background task executes the following algorithm in a continuous loop:
    - Log the transaction ID on successful broadcast and mark it as pending confirmation
 10. **Error Handling**:
     - If any step fails, log an appropriate ERROR message
-    - Continue with the scheduled interval regardless of failures
+    - Continue with the scheduled interval regardless of failures, except right after a start:
+      until the tracker box was first recorded, a cycle that stopped because the AVL digest was
+      not initialized yet or the tracker box was not found is retried after 5 s, for up to 60 s
+      after the start (round 4). `/reserves/create` answers 503 until the tracker box is
+      recorded, so a skipped first cycle used to keep it unavailable for a whole interval. The
+      regular schedule then restarts from the last retry
 
 ### Asset Serialization in Payment Request
 
