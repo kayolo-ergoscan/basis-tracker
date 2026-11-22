@@ -285,7 +285,9 @@ pub struct TrackerBoxUpdateConfig {
     /// [`PENDING_COMMIT_POLL_INTERVAL`] by default; the cycles keep `update_interval_seconds`.
     pub pending_poll_interval: Duration,
     /// Round 5, item 3: how long one redemption submitted through `/redemption/submit` may hold
-    /// back a commit while it waits in the mempool ([`MAX_COMMIT_DEFERRAL`] by default).
+    /// back a commit while it waits in the mempool ([`MAX_COMMIT_DEFERRAL`] by default). Round
+    /// 5b (F3): also the most commits are held back in total from the first deferral since the
+    /// last commit, whichever redemptions hold them back. A due heartbeat is never held back.
     pub max_commit_deferral: Duration,
 }
 
@@ -606,6 +608,10 @@ impl TrackerBoxUpdater {
         let started = tokio::time::Instant::now();
         let mut tracker_box_recorded = false;
         let mut retry_soon = false;
+        // Round 5b (F3): when the first commit since the last one was held back for a
+        // redemption. Commits are held back for at most `max_commit_deferral` in total from
+        // here, whichever redemptions hold them back and however the digest changes meanwhile.
+        let mut deferring_since: Option<std::time::Instant> = None;
         // Round 5, item 4: between cycles, a pending commit is looked for on chain every
         // `pending_poll_interval` (one node request per poll), so a confirmed commit is noticed
         // within a minute instead of at the next cycle. The cycles keep their interval.
@@ -900,11 +906,15 @@ impl TrackerBoxUpdater {
 
             // With nothing to commit, a due heartbeat recommits the unchanged digest anyway
             // so the tracker box never ages into the emergency window.
+            let mut heartbeat = false;
             if let Some(reason) = nothing_to_commit {
                 if !Self::heartbeat_now(&config, &tracker_box).await {
                     info!("{}", reason);
+                    // Nothing waits to be committed: no deferral runs (round 5b, F3).
+                    deferring_since = None;
                     continue;
                 }
+                heartbeat = true;
             }
 
             if !tracker_box_spendable {
@@ -912,18 +922,40 @@ impl TrackerBoxUpdater {
             }
 
             // Round 5, item 3: a commit spends the tracker box that a redemption waiting in the
-            // mempool reads as its data input, which would invalidate the redemption.
-            if let Some(waiting) =
+            // mempool reads as its data input, which would invalidate the redemption. Round 5b
+            // (F3): a due heartbeat is never held back, and commits are held back for at most
+            // `max_commit_deferral` in total from the first deferral since the last commit, so
+            // redemptions submitted one after another cannot hold them back for longer.
+            if heartbeat {
+                let waiting = shared_state.get_submitted_redemptions().len();
+                if waiting > 0 {
+                    warn!(
+                        "Heartbeat commit not held back for {} submitted redemption(s): a due heartbeat never waits. A redemption that reads tracker box {} and is not in a block yet fails and must be built again.",
+                        waiting, tracker_box.box_id
+                    );
+                }
+            } else if let Some(waiting) =
                 Self::redemption_holding_commit(&config, &shared_state, &tracker_box).await
             {
-                info!(
-                    "Commit deferred: redemption {} reads tracker box {} and is still in the mempool (submitted {}s ago, held back for at most {}s)",
+                let since = *deferring_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() < config.max_commit_deferral {
+                    info!(
+                        "Commit deferred: redemption {} reads tracker box {} and is still in the mempool (submitted {}s ago; commits held back for {}s, at most {}s in total)",
+                        waiting.tx_id,
+                        tracker_box.box_id,
+                        waiting.submitted_at.elapsed().as_secs(),
+                        since.elapsed().as_secs(),
+                        config.max_commit_deferral.as_secs()
+                    );
+                    continue;
+                }
+                warn!(
+                    "Committing although redemption {} reads tracker box {} and may still be in the mempool: commits have been held back for {}s since the first deferral, at most {}s in total. If it is not in a block yet, it fails and must be built again.",
                     waiting.tx_id,
                     tracker_box.box_id,
-                    waiting.submitted_at.elapsed().as_secs(),
+                    since.elapsed().as_secs(),
                     config.max_commit_deferral.as_secs()
                 );
-                continue;
             }
 
             match Self::submit_tracker_update(
@@ -940,6 +972,7 @@ impl TrackerBoxUpdater {
                         "Tracker box update submitted. Transaction ID: {}, Box ID: {}. Waiting for confirmation...",
                         tx_id, tracker_box.box_id
                     );
+                    deferring_since = None;
 
                     let submitted_height = Self::get_node_height(&config).await.unwrap_or(0) as u64;
                     shared_state.set_pending(current_digest, tx_id.clone(), submitted_height);
@@ -1183,8 +1216,9 @@ impl TrackerBoxUpdater {
     /// cannot be read). Redemptions in a block or gone from the mempools, and those that read
     /// another box, are forgotten; one held back for `max_commit_deferral` is committed over
     /// with a warning. Nothing is held back once the tracker box is within
-    /// [`COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS`] of the emergency window, or when the node
-    /// height cannot be read.
+    /// [`COMMIT_DEFERRAL_EMERGENCY_MARGIN_BLOCKS`] of the emergency window, once it is due for
+    /// its heartbeat (round 5b, F3), or when the node height cannot be read. The loop caps the
+    /// deferral in total (round 5b, F3).
     async fn redemption_holding_commit(
         config: &TrackerBoxUpdateConfig,
         shared_state: &SharedTrackerState,
@@ -1224,6 +1258,17 @@ impl TrackerBoxUpdater {
         match Self::get_node_height(config).await {
             Ok(height) => {
                 let creation_height = tracker_box.creation_height as u64;
+                // Round 5b (F3): a commit that is due as a heartbeat is never held back.
+                if heartbeat_due(config.heartbeat_blocks, height as u64, creation_height) {
+                    warn!(
+                        "Committing although {} submitted redemption(s) may still be in the mempool: tracker box {} is {} blocks old, due for its heartbeat ({} blocks), and a due heartbeat never waits",
+                        waiting.len(),
+                        tracker_box.box_id,
+                        (height as u64).saturating_sub(creation_height),
+                        config.heartbeat_blocks
+                    );
+                    return None;
+                }
                 if !commit_may_wait(height as u64, creation_height) {
                     warn!(
                         "Committing although {} submitted redemption(s) may still be in the mempool: tracker box {} is {} blocks old, within {} blocks of the {}-block emergency window",
@@ -3482,6 +3527,112 @@ mod tests {
             "not even looked up"
         );
         assert_eq!(count(&seen[..broadcast], "/blockchain/box/unspent/byTokenId/"), 1);
+    }
+
+    /// Round 5b (F3): redemptions submitted one after another, each in the mempool and each
+    /// younger than `max_commit_deferral`, hold commits back for at most `max_commit_deferral`
+    /// in total from the first deferral; then the commit is made although one still waits.
+    #[tokio::test]
+    async fn back_to_back_redemptions_hold_a_commit_back_for_the_cap_in_total() {
+        use std::sync::atomic::AtomicU64;
+        let lookup = |path: &str| {
+            if path.starts_with(MEMPOOL_LOOKUP) {
+                (200, "{}".to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        };
+        let cap = Duration::from_millis(2_500);
+        let height = Arc::new(AtomicU64::new(123_500));
+        let held: Arc<std::sync::Mutex<Option<(SharedTrackerState, String)>>> = Arc::default();
+        let setup_held = held.clone();
+        let started = std::time::Instant::now();
+        let mut next = 0u32;
+        let mut last_submit = std::time::Instant::now();
+        let (seen, _) = run_updater_with(
+            lookup,
+            height,
+            move |config, shared, fx| {
+                config.max_commit_deferral = cap;
+                shared.record_submitted_redemption(
+                    format!("{:064x}", 0),
+                    vec![fx.tracker_api.box_id.clone()],
+                );
+                *setup_held.lock().unwrap() = Some((shared.clone(), fx.tracker_api.box_id.clone()));
+            },
+            |seen| {
+                // A new redemption every 600 ms: the newest is always younger than the cap.
+                if last_submit.elapsed() >= Duration::from_millis(600) && broadcasts(seen) == 0 {
+                    next += 1;
+                    last_submit = std::time::Instant::now();
+                    let held = held.lock().unwrap();
+                    let (shared, tracker_box) = held.as_ref().unwrap();
+                    shared.record_submitted_redemption(
+                        format!("{next:064x}"),
+                        vec![tracker_box.clone()],
+                    );
+                }
+                broadcasts(seen) >= 1
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(elapsed >= cap, "{elapsed:?}");
+        assert!(elapsed < cap + Duration::from_secs(4), "{elapsed:?}");
+        let broadcast = seen.iter().position(is_broadcast).unwrap();
+        let looked_up: std::collections::HashSet<&str> = seen[..broadcast]
+            .iter()
+            .filter_map(|r| r.target.strip_prefix(MEMPOOL_LOOKUP))
+            .collect();
+        assert!(looked_up.len() >= 2, "several redemptions held it back: {looked_up:?}");
+    }
+
+    /// Round 5b (F3): a due heartbeat (nothing new to commit, the tracker box `heartbeat_blocks`
+    /// old) is never held back for a redemption in the mempool, and neither is a commit of a new
+    /// digest once the box is that old: the first cycle commits without looking the redemption
+    /// up.
+    #[tokio::test]
+    async fn a_due_heartbeat_is_never_held_back() {
+        use std::sync::atomic::AtomicU64;
+        for new_digest in [false, true] {
+            let lookup = |path: &str| {
+                if path.starts_with(MEMPOOL_LOOKUP) {
+                    (200, "{}".to_string())
+                } else {
+                    (404, "{}".to_string())
+                }
+            };
+            // The fixture's tracker box was created at 123_000; 720 blocks is the default.
+            let height = Arc::new(AtomicU64::new(123_000 + 720));
+            let (seen, _) = run_updater_with(
+                lookup,
+                height,
+                |config, shared, fx| {
+                    assert_eq!(config.heartbeat_blocks, 720);
+                    if !new_digest {
+                        let r5 = hex::decode(&fx.tracker_api.additional_registers["R5"]).unwrap();
+                        shared.set_avl_root_digest(r5[1..34].try_into().unwrap());
+                    }
+                    shared.record_submitted_redemption(
+                        REDEMPTION_TX.to_string(),
+                        vec![fx.tracker_api.box_id.clone()],
+                    );
+                },
+                |seen| broadcasts(seen) >= 1,
+            )
+            .await;
+            let broadcast = seen.iter().position(is_broadcast).unwrap();
+            assert_eq!(
+                count(&seen[..broadcast], &format!("{MEMPOOL_LOOKUP}{REDEMPTION_TX}")),
+                0,
+                "new digest {new_digest}: not even looked up"
+            );
+            assert_eq!(
+                count(&seen[..broadcast], "/blockchain/box/unspent/byTokenId/"),
+                1,
+                "new digest {new_digest}: the first cycle commits"
+            );
+        }
     }
 
     #[test]
