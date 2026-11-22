@@ -328,6 +328,10 @@ values are ignored for signing.
 ```
 
 ### POST /redemption/prepare
+**Removed.** The endpoint now always answers `410 Gone` with a JSON error. Use
+`POST /tracker/signature` for the tracker signature and `POST /redemption/build` for the
+redemption transaction. The description below is kept for history.
+
 Prepare a complete redemption with real AVL proofs and tracker signatures from Ergo node.
 
 **Request Body:**

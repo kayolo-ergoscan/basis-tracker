@@ -4,7 +4,7 @@
 //! - POST /redeem: Initiate redemption
 //! - POST /redeem/complete: Complete redemption
 //! - GET /proof/redemption: Get redemption proof
-//! - POST /redemption/prepare: Prepare redemption data
+//! - POST /redemption/prepare: retired, answers 410 Gone
 //! - POST /tracker/signature: Request tracker signature
 //!
 //! Tests use the direct handler call pattern (Pattern A) with mock AppState,
@@ -1490,258 +1490,23 @@ mod redemption_api_tests {
     }
 
     // ============================================================================
-    // POST /redemption/prepare tests
+    // POST /redemption/prepare: retired, 410 Gone
     // ============================================================================
 
+    /// The endpoint is gone (it signed through the node's `/utils/schnorrSign`); it answers
+    /// 410 with a JSON error that names the replacements. It takes no input, so no request
+    /// can reach a signing or slicing path (the old short-hex panics cannot recur).
     #[tokio::test]
-    async fn test_prepare_redemption_invalid_hex() {
-        // Test that invalid hex pubkey returns 400
-        let state = create_mock_app_state().await;
-
-        let request = RedemptionPreparationRequest {
-            issuer_pubkey: "not-hex!!!".to_string(),
-            recipient_pubkey: "020202020202020202020202020202020202020202020202020202020202020202"
-                .to_string(),
-            amount: 1000,
-            timestamp: 1234567890,
-            emergency: false,
-
-            denomination: String::new(),
-        };
-
-        let response =
-            prepare_redemption(axum::extract::State(state), axum::extract::Json(request)).await;
-
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        let body = &response.1;
+    async fn test_prepare_redemption_returns_410_gone() {
+        let (status, body) = prepare_redemption().await;
+        assert_eq!(status, StatusCode::GONE);
         assert!(!body.success);
-        assert!(body.error.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_prepare_redemption_wrong_length_pubkey() {
-        // A decodable hex pubkey of the wrong length must be rejected with 400.
-        let state = create_mock_app_state().await;
-
-        // 32 bytes instead of 33
-        let wrong_length = "0101010101010101010101010101010101010101010101010101010101010101";
-
-        let request = RedemptionPreparationRequest {
-            issuer_pubkey: wrong_length.to_string(),
-            recipient_pubkey: "020202020202020202020202020202020202020202020202020202020202020202"
-                .to_string(),
-            amount: 1000,
-            timestamp: 1234567890,
-            emergency: false,
-
-            denomination: String::new(),
-        };
-
-        let response =
-            prepare_redemption(axum::extract::State(state), axum::extract::Json(request)).await;
-
-        // The handler decodes and length-checks both keys up front, so this is a
-        // deterministic 400 with a specific message. Asserting the exact status and
-        // message (rather than merely "not OK") means a regression that reintroduces a
-        // 500 or a different failure path will be caught here.
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        let body = &response.1;
-        assert!(!body.success);
-        let msg = body.error.clone().unwrap_or_default();
-        assert!(
-            msg.contains("issuer_pubkey must be 33 bytes"),
-            "expected issuer length error, got: {}",
-            msg
-        );
-    }
-
-    #[tokio::test]
-    async fn test_prepare_redemption_valid_structure() {
-        // Test that valid request structure is accepted (will fail at Ergo node API call)
-        let state = create_mock_app_state().await;
-
-        // A stored note is required: the tracker signs server-authoritative values (S4).
-        let (issuer_secret, issuer_pubkey) = generate_keypair();
-        let (_recipient_secret, recipient_pubkey) = generate_keypair();
-        let issuer_hex = hex::encode(issuer_pubkey);
-        let recipient_hex = hex::encode(recipient_pubkey);
-        add_test_note(
-            &state,
-            &issuer_secret,
-            &issuer_hex,
-            &recipient_hex,
-            1000,
-            1000,
-        )
-        .await;
-
-        // The acceptance-policy collateral lookup needs a tracked reserve for the
-        // note's denomination; without one the handler fails closed (409) before
-        // reaching the signing step (finding #4).
-        add_tracker_reserve(&state, &issuer_hex, 10_000_000_000).await;
-
-        let request = RedemptionPreparationRequest {
-            issuer_pubkey: issuer_hex,
-            recipient_pubkey: recipient_hex,
-            amount: 1000,
-            timestamp: 1234567890,
-            emergency: false,
-
-            denomination: String::new(),
-        };
-
-        let response =
-            prepare_redemption(axum::extract::State(state), axum::extract::Json(request)).await;
-
-        // Without Ergo node available, it will fail at the signing stage.
-        // The request structure should be validated correctly.
-        let body = &response.1;
-        if !body.success {
-            let default_msg = "unknown".to_string();
-            let error_msg = body.error.as_ref().unwrap_or(&default_msg);
-            assert!(
-                error_msg.contains("tracker")
-                    || error_msg.contains("Tracker")
-                    || error_msg.contains("sign")
-                    || error_msg.contains("node"),
-                "Expected tracker/signing-related error for valid request structure, got: {}",
-                error_msg
-            );
-        }
-    }
-
-    /// Issue #15 S4: /redemption/prepare must not fall back to caller-supplied
-    /// amount/timestamp when no note exists — the request is rejected instead.
-    #[tokio::test]
-    async fn test_prepare_redemption_no_note_returns_404() {
-        let state = create_mock_app_state().await;
-
-        let (_issuer_secret, issuer_pubkey) = generate_keypair();
-        let (_recipient_secret, recipient_pubkey) = generate_keypair();
-
-        let request = RedemptionPreparationRequest {
-            issuer_pubkey: hex::encode(issuer_pubkey),
-            recipient_pubkey: hex::encode(recipient_pubkey),
-            amount: 999_999_999, // caller-chosen value, must never be signed
-            timestamp: 1234567890,
-            emergency: false,
-
-            denomination: String::new(),
-        };
-
-        let response =
-            prepare_redemption(axum::extract::State(state), axum::extract::Json(request)).await;
-
-        assert_eq!(
-            response.0,
-            StatusCode::NOT_FOUND,
-            "unexpected error body: {:?}",
-            response.1.error
-        );
-        let body = &response.1;
-        assert!(!body.success);
-        let msg = body.error.clone().unwrap_or_default();
-        assert!(
-            msg.contains("No note is recorded"),
-            "expected note-not-found error, got: {}",
-            msg
-        );
-    }
-
-    // ============================================================================
-    // Regression tests: short-but-valid hex must not panic
-    // ============================================================================
-
-    /// Regression test for the `&payload.issuer_pubkey[..8]` slice panic.
-    ///
-    /// The handler used to validate only that the pubkeys were *decodable* hex and then
-    /// slice the first 8 characters to build a redemption ID. A well-formed hex string
-    /// shorter than 8 characters (e.g. "aa", which decodes to 1 byte) passed that check
-    /// and then panicked on the slice, aborting the request task.
-    #[tokio::test]
-    async fn test_prepare_redemption_short_hex_does_not_panic() {
-        let state = create_mock_app_state().await;
-
-        let request = RedemptionPreparationRequest {
-            issuer_pubkey: "aa".to_string(),
-            recipient_pubkey: "aa".to_string(),
-            amount: 1000,
-            timestamp: 0,
-            emergency: false,
-
-            denomination: String::new(),
-        };
-
-        // Must return a 400 rather than panicking.
-        let response =
-            prepare_redemption(axum::extract::State(state), axum::extract::Json(request)).await;
-
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        let body = &response.1;
-        assert!(!body.success);
-        assert!(body.error.is_some());
-    }
-
-    /// A short-but-valid-hex *recipient* key must not panic, even when the issuer key is
-    /// valid and long enough for the old fixed-offset issuer slice to succeed.
-    ///
-    /// Note the recipient value must be well-formed hex: an odd-length string such as "0"
-    /// would be rejected by the old decodability check *before* reaching the slice, so the
-    /// test would pass without ever exercising the panic. "aa" decodes to one byte and
-    /// therefore reaches the slice on the unfixed code.
-    #[tokio::test]
-    async fn test_prepare_redemption_short_recipient_does_not_panic() {
-        let state = create_mock_app_state().await;
-
-        let request = RedemptionPreparationRequest {
-            issuer_pubkey: "010101010101010101010101010101010101010101010101010101010101010101"
-                .to_string(),
-            recipient_pubkey: "aa".to_string(),
-            amount: 1000,
-            timestamp: 0,
-            emergency: false,
-
-            denomination: String::new(),
-        };
-
-        // The issuer key is valid, so only the recipient length is at fault: expect the
-        // recipient-specific message rather than the generic hex error.
-        let response =
-            prepare_redemption(axum::extract::State(state), axum::extract::Json(request)).await;
-
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        let body = &response.1;
-        assert!(!body.success);
-        let msg = body.error.clone().unwrap_or_default();
-        assert!(
-            msg.contains("recipient_pubkey must be 33 bytes"),
-            "expected recipient length error, got: {}",
-            msg
-        );
-    }
-
-    /// An empty string must not panic.
-    #[tokio::test]
-    async fn test_prepare_redemption_empty_pubkey_does_not_panic() {
-        let state = create_mock_app_state().await;
-
-        let request = RedemptionPreparationRequest {
-            issuer_pubkey: String::new(),
-            recipient_pubkey: String::new(),
-            amount: 1000,
-            timestamp: 0,
-            emergency: false,
-
-            denomination: String::new(),
-        };
-
-        let response =
-            prepare_redemption(axum::extract::State(state), axum::extract::Json(request)).await;
-
-        assert_eq!(response.0, StatusCode::BAD_REQUEST);
-        let body = &response.1;
-        assert!(!body.success);
-        assert!(body.error.is_some());
+        let json = serde_json::to_value(&body.0).unwrap();
+        assert_eq!(json["success"], false);
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("removed"), "{error}");
+        assert!(error.contains("POST /tracker/signature"), "{error}");
+        assert!(error.contains("POST /redemption/build"), "{error}");
     }
 
     // ============================================================================

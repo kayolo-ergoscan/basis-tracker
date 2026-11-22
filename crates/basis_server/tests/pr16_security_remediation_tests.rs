@@ -1,14 +1,14 @@
 //! Handler-level tests for the PR #16 security-review remediations that need an `AppState`:
 //!
-//! * H2 — fail-closed reserve selection: `/tracker/signature`, `/redemption/prepare` and
-//!   `/redemption/build` answer 409 when the issuer has more than one tracked reserve.
+//! * H2 — fail-closed reserve selection: `/tracker/signature` and `/redemption/build` answer
+//!   409 when the issuer has more than one tracked reserve (`/redemption/prepare` is gone: 410).
 //! * M1 — `/redemption/build` is rate limited per (issuer, recipient) pair (429).
 
 mod pr16_security_remediation {
     use axum::http::StatusCode;
     use basis_server::{
         api::{prepare_redemption, request_tracker_signature},
-        models::{RedemptionPreparationRequest, TrackerSignatureRequest},
+        models::TrackerSignatureRequest,
         redemption_build::{build_redemption, RedemptionBuildRequest},
         AppState, TrackerCommand,
     };
@@ -372,58 +372,18 @@ mod pr16_security_remediation {
         );
     }
 
+    /// `/redemption/prepare` is retired: it answers 410 Gone with a JSON error, whatever the
+    /// request (its fail-closed reserve checks live on in `/tracker/signature` and
+    /// `/redemption/build`).
     #[tokio::test]
-    async fn prepare_redemption_conflicts_when_issuer_has_two_reserves() {
-        let state = mock_state(60).await;
-        let (issuer, recipient) = add_note(&state).await;
-        let issuer_hex = hex::encode(issuer);
-        add_reserve(&state, &issuer_hex, "box_a").await;
-        add_reserve(&state, &issuer_hex, "box_b").await;
-
-        let (status, body) = prepare_redemption(
-            axum::extract::State(state),
-            axum::extract::Json(RedemptionPreparationRequest {
-                issuer_pubkey: issuer_hex,
-                recipient_pubkey: hex::encode(recipient),
-                amount: 1_000,
-                timestamp: NOTE_TIMESTAMP,
-                emergency: false,
-
-                denomination: String::new(),
-            }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT, "body: {:?}", body);
+    async fn prepare_redemption_is_gone() {
+        let (status, body) = prepare_redemption().await;
+        assert_eq!(status, StatusCode::GONE);
         assert!(!body.success);
-    }
-
-    #[tokio::test]
-    async fn prepare_redemption_single_reserve_passes_fail_closed_check() {
-        let state = mock_state(60).await;
-        let (issuer, recipient) = add_note(&state).await;
-        let issuer_hex = hex::encode(issuer);
-        add_reserve(&state, &issuer_hex, "box_a").await;
-
-        let (status, _body) = prepare_redemption(
-            axum::extract::State(state),
-            axum::extract::Json(RedemptionPreparationRequest {
-                issuer_pubkey: issuer_hex,
-                recipient_pubkey: hex::encode(recipient),
-                amount: 1_000,
-                timestamp: NOTE_TIMESTAMP,
-                emergency: false,
-
-                denomination: String::new(),
-            }),
-        )
-        .await;
-
-        assert_ne!(
-            status,
-            StatusCode::CONFLICT,
-            "a single reserve must not trip the fail-closed check"
-        );
+        assert!(body.data.is_none());
+        let error = body.error.clone().unwrap();
+        assert!(error.contains("/tracker/signature"), "{error}");
+        assert!(error.contains("/redemption/build"), "{error}");
     }
 
     // ------------------------------------------------------------------
@@ -451,36 +411,6 @@ mod pr16_security_remediation {
                 issuer_pubkey: issuer_hex,
                 recipient_pubkey: hex::encode(recipient),
                 total_debt: NOTE_TOTAL_DEBT,
-                timestamp: NOTE_TIMESTAMP,
-                emergency: false,
-
-                denomination: format!("token:{token_hex}"),
-            }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::CONFLICT, "body: {:?}", body);
-        assert!(body
-            .error
-            .clone()
-            .unwrap()
-            .contains(&format!("denomination token:{token_hex}")));
-    }
-
-    #[tokio::test]
-    async fn prepare_redemption_refuses_token_note_without_token_reserve() {
-        let token_hex = hex::encode(TEST_TOKEN_ID);
-        let state = mock_state_with_served_token(60, &token_hex).await;
-        let (issuer, recipient) = add_token_note(&state, &TEST_TOKEN_ID).await;
-        let issuer_hex = hex::encode(issuer);
-        add_reserve(&state, &issuer_hex, "box_erg").await;
-
-        let (status, body) = prepare_redemption(
-            axum::extract::State(state),
-            axum::extract::Json(RedemptionPreparationRequest {
-                issuer_pubkey: issuer_hex,
-                recipient_pubkey: hex::encode(recipient),
-                amount: 1_000,
                 timestamp: NOTE_TIMESTAMP,
                 emergency: false,
 

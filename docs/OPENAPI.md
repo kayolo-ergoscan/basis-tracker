@@ -160,7 +160,7 @@ configured Ergo node wallet.
 
 - `POST /redeem` - Initiate redemption of an IOU note
 - `POST /redeem/complete` - Mark a redemption as completed locally (amounts are validated against the stored note state; a mismatch returns 400)
-- `POST /redemption/prepare` - Prepare a redemption (legacy tracker-signature + proof endpoint; the note must exist and the stored note's cumulative debt and timestamp are signed — the request's `timestamp` field is ignored)
+- `POST /redemption/prepare` - Removed: always answers `410 Gone` with a JSON error (use `POST /tracker/signature` and `POST /redemption/build`)
 - `POST /redemption/build` - Build an unsigned redemption transaction and sign fee inputs (the tracker proof is generated against the last on-chain-confirmed tracker state; returns 400 if the note is not yet in the confirmed state)
 - `POST /redemption/submit` - Broadcast a fully-signed redemption transaction (note key and amounts are re-validated against stored state before broadcasting; a mismatch returns 400)
 

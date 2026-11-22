@@ -994,49 +994,19 @@ paths:
 
   /redemption/prepare:
     post:
-      summary: Prepare a redemption
+      summary: Removed (410 Gone)
+      deprecated: true
       description: |
-        Prepare a redemption by generating AVL proofs and tracker signature.
-        Returns the legacy preparation response containing a single combined AVL proof.
-
-        The note for the issuer/recipient pair must exist in the tracker state;
-        otherwise the request is rejected with 404. The tracker signature always
-        covers the stored note's cumulative debt and payment timestamp — the
-        `timestamp` request field must match the stored note — and `amount` is
-        used only for the acceptance-policy check (skipped for emergency
-        requests). That check is evaluated against the issuer's tracked reserve
-        for the note's denomination; 409 when that reserve is missing or not
-        unique — a reserve of another currency is never consulted in its place.
+        Removed. This endpoint signed through the Ergo node's `/utils/schnorrSign`; it now
+        always answers 410 Gone with a JSON error, whatever the request. Use
+        `POST /tracker/signature` for the tracker signature (signed in the tracker process)
+        and `POST /redemption/build` for the redemption transaction.
       operationId: prepareRedemption
       tags:
         - Redemption
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/RedemptionPreparationRequest'
       responses:
-        '200':
-          description: Redemption prepared successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ApiResponseRedemptionPreparation'
-        '400':
-          description: Bad request - invalid input parameters
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ApiResponseError'
-        '409':
-          description: The issuer's tracked reserve for the note's denomination is missing or not unique
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ApiResponseError'
-        '500':
-          description: Internal server error
+        '410':
+          description: The endpoint has been removed
           content:
             application/json:
               schema:
@@ -2348,78 +2318,6 @@ components:
           description: Updated reserve state digest after the insert operation (R5 register value)
           example: "64fedcba0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 
-    RedemptionPreparationRequest:
-      type: object
-      description: Request for redemption preparation
-      required:
-        - issuer_pubkey
-        - recipient_pubkey
-        - amount
-        - timestamp
-      properties:
-        issuer_pubkey:
-          type: string
-          description: Hex-encoded issuer public key (66 characters)
-          pattern: '^[0-9a-fA-F]{66}$'
-          example: "010101010101010101010101010101010101010101010101010101010101010101"
-        recipient_pubkey:
-          type: string
-          description: Hex-encoded recipient public key (66 characters)
-          pattern: '^[0-9a-fA-F]{66}$'
-          example: "020202020202020202020202020202020202020202020202020202020202020202"
-        amount:
-          type: integer
-          format: uint64
-          description: Intended redemption amount in nanoERG. Used only for the acceptance-policy check; the signed message always covers the stored note's cumulative debt
-          example: 500000000
-        timestamp:
-          type: integer
-          format: uint64
-          description: Must equal the stored note's payment timestamp; mismatches are rejected with 409
-          example: 1234567890000
-        emergency:
-          type: boolean
-          default: false
-          description: Whether this is an emergency redemption (exempt from the acceptance-policy check)
-          example: false
-
-
-        denomination:
-          type: string
-          description: >-
-            Denomination of the note: "erg" or "token:<64-hex>". When omitted, the server
-            resolves to the pair's existing note's denomination when unambiguous, else "erg".
-          example: "erg"
-    RedemptionPreparationResponse:
-      type: object
-      description: Legacy redemption preparation response
-      properties:
-        redemption_id:
-          type: string
-          description: Unique redemption identifier
-          example: "redeem_0101010101010101_0202020202020202"
-        avl_proof:
-          type: string
-          description: Hex-encoded combined AVL proof
-          example: "0102030405060708"
-        tracker_signature:
-          type: string
-          description: Hex-encoded tracker Schnorr signature
-          example: "0404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404"
-        tracker_pubkey:
-          type: string
-          description: Hex-encoded tracker public key
-          example: "030303030303030303030303030303030303030303030303030303030303030303"
-        tracker_state_digest:
-          type: string
-          description: Tracker state digest
-          example: "64abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-        block_height:
-          type: integer
-          format: uint64
-          description: Current blockchain height
-          example: 1500
-
     RedemptionBuildRequest:
       type: object
       description: Request to build a redemption transaction
@@ -3120,14 +3018,6 @@ components:
           properties:
             data:
               $ref: '#/components/schemas/TrackerSignatureResponse'
-
-    ApiResponseRedemptionPreparation:
-      allOf:
-        - $ref: '#/components/schemas/ApiResponse'
-        - type: object
-          properties:
-            data:
-              $ref: '#/components/schemas/RedemptionPreparationResponse'
 
     ApiResponseRedemptionBuild:
       allOf:
