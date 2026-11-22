@@ -5,6 +5,7 @@ pub mod api;
 pub mod auth_middleware;
 pub mod authorization;
 pub mod config;
+pub mod local_wallet;
 pub mod models;
 pub mod redemption_build;
 pub mod reserve_api;

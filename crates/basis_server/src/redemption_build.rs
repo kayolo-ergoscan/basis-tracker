@@ -203,9 +203,8 @@ impl NodeClient {
         }
     }
 
-    /// Node hosting the tracker wallet: `/wallet/*` (fee inputs), binaries of
-    /// wallet-selected fee boxes, and transaction broadcast. Falls back to the
-    /// scanner node when `[ergo.wallet]` is not configured.
+    /// Node that receives broadcasts (`POST /transactions`). Falls back to the
+    /// scanner node when `[ergo.wallet]` is not configured. No wallet endpoint is used.
     fn wallet(state: &AppState) -> Self {
         let (url, api_key) = state.config.ergo_wallet_node();
         NodeClient {
@@ -247,18 +246,35 @@ impl NodeClient {
         serde_json::from_value(v).map_err(|e| format!("parse box {box_id}: {e}"))
     }
 
-    async fn wallet_boxes(&self) -> Result<Vec<NodeBox>, String> {
-        let v = self
-            .get_json("/wallet/boxes/unspent?minConfirmations=0&maxConfirmations=-1")
-            .await?;
-        #[derive(Deserialize)]
-        struct Entry {
-            #[serde(rename = "box")]
-            details: NodeBox,
+    /// Token-free boxes locked by `P2PK(tracker_pubkey)`, from the public
+    /// `POST /blockchain/box/unspent/byAddress` (no node wallet, no API key). Boxes spent in the
+    /// mempool are skipped; token-bearing boxes (the tracker box among them) are never returned.
+    async fn tracker_fee_boxes(
+        &self,
+        tracker_pubkey: &[u8; 33],
+        enough: u64,
+    ) -> Result<Vec<NodeBox>, String> {
+        let address = crate::local_wallet::p2pk_address(tracker_pubkey)?;
+        let tree = crate::local_wallet::p2pk_tree_hex(tracker_pubkey);
+        let node = crate::local_wallet::NodeEndpoint::new(&self.url, self.api_key.clone());
+        let scan = crate::local_wallet::scan_fee_boxes(&node, &address, &tree, &[], enough).await?;
+        if scan.truncated {
+            tracing::warn!(
+                "fee box scan of the tracker address stopped after {} pages",
+                crate::local_wallet::BY_ADDRESS_MAX_PAGES
+            );
         }
-        let entries: Vec<Entry> =
-            serde_json::from_value(v).map_err(|e| format!("parse wallet boxes: {e}"))?;
-        Ok(entries.into_iter().map(|e| e.details).collect())
+        Ok(scan
+            .boxes
+            .into_iter()
+            .map(|b| NodeBox {
+                box_id: b.box_id,
+                value: b.value,
+                ergo_tree: b.ergo_tree,
+                assets: Vec::new(),
+                additional_registers: b.additional_registers,
+            })
+            .collect())
     }
 
     async fn last_headers(&self) -> Result<Vec<Header>, String> {
@@ -721,7 +737,6 @@ async fn build_redemption_inner(
     };
 
     let chain_node = NodeClient::chain(state);
-    let wallet_node = NodeClient::wallet(state);
 
     // Look up the note to confirm it exists. The stored note's payment
     // timestamp is authoritative for the tracker signature, context var #4, and
@@ -1245,15 +1260,6 @@ async fn build_redemption_inner(
     // Token-backed reserves preserve the reserve's ERG value and move reserve tokens.
     let is_token_reserve = !reserve_token_id.is_empty();
 
-    let wallet_boxes = match wallet_node.wallet_boxes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("wallet boxes: {e}"),
-            )
-        }
-    };
     let fee = state.config.transaction_fee();
     // For token reserves the fee inputs must also fund the recipient's min-value ERG box.
     let fee_input_required = if is_token_reserve {
@@ -1261,13 +1267,38 @@ async fn build_redemption_inner(
     } else {
         fee
     };
+    // Fee inputs are signed below with the tracker secret, so they come from the tracker's own
+    // P2PK address (public byAddress index, token-free boxes only).
+    let tracker_pubkey_for_fees = match state.config.tracker_public_key_bytes() {
+        Ok(Some(p)) => p,
+        _ => {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tracker public key not configured",
+            )
+        }
+    };
+    let wallet_boxes = match chain_node
+        .tracker_fee_boxes(&tracker_pubkey_for_fees, fee_input_required)
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("tracker fee boxes: {e}"),
+            )
+        }
+    };
     let (fee_boxes, fee_total) =
         match select_fee_inputs(&wallet_boxes, fee_input_required, &reserve_box_id) {
             Some(v) => v,
             None => {
                 return api_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("no wallet boxes covering {fee_input_required} nanoERG fee"),
+                    format!(
+                        "no token-free boxes at the tracker address covering {fee_input_required} nanoERG fee"
+                    ),
                 )
             }
         };
@@ -1275,7 +1306,7 @@ async fn build_redemption_inner(
     // Change address: the owner of the first selected fee box (which we sign), else config/recipient.
     // SECURITY: change always goes back to the tracker's own address.
     //
-    // The fee inputs come from the TRACKER's wallet (`select_fee_inputs` over `/wallet/boxes/unspent`)
+    // The fee inputs come from the TRACKER's address (`select_fee_inputs` over byAddress boxes)
     // and are signed with the tracker key, so a caller-chosen `change_address` meant a caller could
     // name any destination for the tracker's own ERG. Repeating a 1-nanoERG redemption against a
     // tiny self-owned reserve handed out one wallet box minus the fee each time.
@@ -1537,7 +1568,7 @@ async fn build_redemption_inner(
     };
     let mut fee_binaries = Vec::with_capacity(fee_boxes.len());
     for fb in &fee_boxes {
-        match wallet_node.box_binary(&fb.box_id).await {
+        match chain_node.box_binary(&fb.box_id).await {
             Ok(b) => fee_binaries.push(b),
             Err(e) => {
                 return api_err(

@@ -228,9 +228,9 @@ pub enum TrackerBoxUpdaterError {
     TransactionNotFound(String),
     #[error("Serialization error: {0}")]
     SerializationError(String),
-    #[error("No wallet boxes available to pay transaction fee")]
+    #[error("No token-free boxes at the tracker address to pay the transaction fee")]
     NoFeeInputs,
-    #[error("Insufficient wallet funds to pay transaction fee: {available} < {required}")]
+    #[error("Insufficient token-free funds at the tracker address to pay the fee: {available} < {required}")]
     InsufficientFeeInputs { available: u64, required: u64 },
     #[error("Failed to sign transaction: {0}")]
     SigningFailed(String),
@@ -259,13 +259,6 @@ pub struct ErgoBoxApi {
 pub struct AssetApi {
     pub token_id: String,
     pub amount: u64,
-}
-
-/// Wrapper returned by /wallet/boxes/unspent
-#[derive(Debug, serde::Deserialize)]
-struct WalletBoxEntry {
-    #[serde(rename = "box")]
-    pub box_details: ErgoBoxApi,
 }
 
 /// Wrapper for /utxo/byIdBinary response
@@ -928,105 +921,42 @@ impl TrackerBoxUpdater {
         Ok(candidates.into_iter().next().unwrap())
     }
 
-    /// Fetch wallet-owned unspent boxes from the Ergo node.
-    async fn get_wallet_boxes(
+    /// Token-free boxes at the tracker's own P2PK address, found through the public
+    /// `POST /blockchain/box/unspent/byAddress` on the scanner node (no node wallet, no API
+    /// key). Boxes already spent by a mempool transaction are skipped. Token-bearing boxes are
+    /// never returned: the tracker box (with the tracker NFT) lives at the same address and
+    /// must never be spent as a fee input.
+    async fn find_fee_boxes(
         config: &TrackerBoxUpdateConfig,
-    ) -> Result<Vec<ErgoBoxApi>, TrackerBoxUpdaterError> {
-        let client = basis_store::http::bounded_client();
-        let url = format!(
-            "{}/wallet/boxes/unspent?minConfirmations=0&maxConfirmations=-1",
-            config.wallet_node_url.trim_end_matches('/')
-        );
-
-        let mut request = client.get(&url);
-        if let Some(ref api_key) = config.wallet_api_key {
-            request = request.header("api_key", api_key);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| TrackerBoxUpdaterError::HttpError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(TrackerBoxUpdaterError::HttpError(format!(
-                "HTTP {} fetching wallet boxes: {}",
-                status, body
-            )));
-        }
-
-        let entries: Vec<WalletBoxEntry> = basis_store::http::read_json_capped(response)
-            .await
-            .map_err(|e| TrackerBoxUpdaterError::HttpError(format!("JSON parse error: {}", e)))
-            .and_then(|value| {
-                serde_json::from_value(value).map_err(|e| {
-                    TrackerBoxUpdaterError::HttpError(format!("JSON parse error: {}", e))
-                })
-            })?;
-
-        Ok(entries.into_iter().map(|e| e.box_details).collect())
-    }
-
-    /// Select wallet boxes covering the required fee, excluding the tracker box itself.
-    /// Prefers boxes without tokens; falls back to token-bearing boxes and preserves their tokens
-    /// in the change output.
-    fn select_fee_inputs(
-        wallet_boxes: &[ErgoBoxApi],
-        required: u64,
+        tracker_pubkey: &[u8; 33],
         tracker_box_id: &str,
-    ) -> (Vec<String>, u64) {
-        let candidates: Vec<&ErgoBoxApi> = wallet_boxes
-            .iter()
-            .filter(|b| b.box_id != tracker_box_id)
-            .collect();
+        enough: u64,
+    ) -> Result<Vec<crate::local_wallet::UnspentBox>, TrackerBoxUpdaterError> {
+        use crate::local_wallet;
 
-        // Try token-free boxes first.
-        let mut token_free: Vec<&ErgoBoxApi> = candidates
-            .iter()
-            .filter(|b| b.assets.is_empty())
-            .copied()
-            .collect();
-        token_free.sort_by_key(|b| b.value);
-
-        if let Some(box_) = token_free.iter().find(|b| b.value >= required) {
-            return (vec![box_.box_id.clone()], box_.value);
+        let address = local_wallet::p2pk_address(tracker_pubkey)
+            .map_err(TrackerBoxUpdaterError::SerializationError)?;
+        let tree = local_wallet::p2pk_tree_hex(tracker_pubkey);
+        let node = local_wallet::NodeEndpoint::new(
+            &config.scanner_node_url,
+            config.scanner_api_key.clone(),
+        );
+        let scan = local_wallet::scan_fee_boxes(&node, &address, &tree, &[tracker_box_id], enough)
+            .await
+            .map_err(TrackerBoxUpdaterError::HttpError)?;
+        if scan.skipped_with_tokens > 1 {
+            info!(
+                "Fee box scan skipped {} token-bearing boxes at the tracker address (the tracker box is one of them)",
+                scan.skipped_with_tokens
+            );
         }
-
-        let mut selected = Vec::new();
-        let mut total = 0u64;
-        for box_ in token_free {
-            total += box_.value;
-            selected.push(box_.box_id.clone());
-            if total >= required {
-                return (selected, total);
-            }
+        if scan.truncated {
+            warn!(
+                "Fee box scan of the tracker address stopped after {} pages",
+                local_wallet::BY_ADDRESS_MAX_PAGES
+            );
         }
-
-        // Fall back to token-bearing boxes if necessary.
-        let mut token_boxes: Vec<&ErgoBoxApi> = candidates
-            .iter()
-            .filter(|b| !b.assets.is_empty())
-            .copied()
-            .collect();
-        token_boxes.sort_by_key(|b| b.value);
-
-        if let Some(box_) = token_boxes.iter().find(|b| b.value >= required) {
-            return (vec![box_.box_id.clone()], box_.value);
-        }
-
-        let mut selected = Vec::new();
-        let mut total = 0u64;
-        for box_ in token_boxes {
-            total += box_.value;
-            selected.push(box_.box_id.clone());
-            if total >= required {
-                return (selected, total);
-            }
-        }
-
-        (selected, total)
+        Ok(scan.boxes)
     }
 
     /// Fetch the hex-encoded serialized bytes of a box from the Ergo node.
@@ -1245,21 +1175,23 @@ impl TrackerBoxUpdater {
         };
 
         let current_height = Self::get_node_height(config).await?;
-        let wallet_boxes = Self::get_wallet_boxes(config).await?;
+        let fee_boxes =
+            Self::find_fee_boxes(config, tracker_pubkey, &tracker_box.box_id, config.fee).await?;
 
-        let (fee_input_ids, fee_input_total) =
-            Self::select_fee_inputs(&wallet_boxes, config.fee, &tracker_box.box_id);
-
-        if fee_input_ids.is_empty() {
-            return Err(TrackerBoxUpdaterError::NoFeeInputs);
-        }
-
-        if fee_input_total < config.fee {
-            return Err(TrackerBoxUpdaterError::InsufficientFeeInputs {
-                available: fee_input_total,
-                required: config.fee,
-            });
-        }
+        let (fee_inputs, fee_input_total) =
+            match crate::local_wallet::select_fee_boxes(&fee_boxes, config.fee) {
+                Some(selected) => selected,
+                None if fee_boxes.is_empty() => return Err(TrackerBoxUpdaterError::NoFeeInputs),
+                None => {
+                    return Err(TrackerBoxUpdaterError::InsufficientFeeInputs {
+                        available: fee_boxes
+                            .iter()
+                            .fold(0u64, |a, b| a.saturating_add(b.value)),
+                        required: config.fee,
+                    })
+                }
+            };
+        let fee_input_ids: Vec<String> = fee_inputs.iter().map(|b| b.box_id.clone()).collect();
 
         let mut inputs = vec![serde_json::json!({
             "boxId": tracker_box.box_id,
@@ -1275,27 +1207,8 @@ impl TrackerBoxUpdater {
             inputs_raw.push(Self::get_box_binary(config, fee_box_id).await?);
         }
 
+        // Fee inputs never hold tokens, so the change output carries none.
         let change_amount = fee_input_total.saturating_sub(config.fee);
-
-        // Preserve any tokens from the fee inputs in the change output so they are not burned.
-        let change_assets: Vec<serde_json::Value> = fee_input_ids
-            .iter()
-            .flat_map(|id| {
-                wallet_boxes
-                    .iter()
-                    .find(|b| &b.box_id == id)
-                    .map(|b| {
-                        b.assets.iter().map(|a| {
-                            serde_json::json!({
-                                "tokenId": a.token_id,
-                                "amount": a.amount
-                            })
-                        })
-                    })
-                    .into_iter()
-                    .flatten()
-            })
-            .collect();
 
         // Ensure the tracker NFT is always the first token in the output tracker box,
         // followed by any other tokens preserved from the input tracker box.
@@ -1332,7 +1245,7 @@ impl TrackerBoxUpdater {
                 "value": change_amount,
                 "ergoTree": change_address_to_ergo_tree(&change_address)?,
                 "creationHeight": current_height,
-                "assets": change_assets,
+                "assets": [],
                 "additionalRegisters": {}
             }));
         }
@@ -1519,5 +1432,63 @@ mod tests {
         assert!(!confirmed_box_orphaned(None, "box_a"));
         assert!(!confirmed_box_orphaned(Some("box_a"), "box_a"));
         assert!(confirmed_box_orphaned(Some("box_a"), "box_b"));
+    }
+
+    /// Fee boxes come from the public byAddress index on the scanner node, never from the
+    /// wallet node, and the tracker box (token-bearing) is never offered as a fee input.
+    #[tokio::test]
+    async fn fee_boxes_come_from_by_address_and_skip_the_tracker_box() {
+        use crate::local_wallet::tests::{mock_node, PK};
+        let tree = crate::local_wallet::p2pk_tree_hex(&PK);
+        let tree_for_node = tree.clone();
+        let tracker_box_id = "ab".repeat(32);
+        let tracker_box_for_node = tracker_box_id.clone();
+        let (url, seen) = mock_node(move |_, target| {
+            if target.contains("offset=0") {
+                let page = serde_json::json!([
+                    {
+                        "boxId": tracker_box_for_node,
+                        "value": 1_000_000u64,
+                        "ergoTree": tree_for_node,
+                        "assets": [{ "tokenId": "11".repeat(32), "amount": 1 }],
+                        "additionalRegisters": {},
+                        "creationHeight": 10
+                    },
+                    {
+                        "boxId": "cd".repeat(32),
+                        "value": 3_000_000u64,
+                        "ergoTree": tree_for_node,
+                        "assets": [],
+                        "additionalRegisters": {},
+                        "creationHeight": 11
+                    }
+                ]);
+                (200, page.to_string())
+            } else {
+                (200, "[]".to_string())
+            }
+        })
+        .await;
+
+        let config = TrackerBoxUpdateConfig {
+            // Unreachable: any wallet-node call would fail the test.
+            wallet_node_url: "http://127.0.0.1:1".to_string(),
+            scanner_node_url: url,
+            ..Default::default()
+        };
+        let boxes = TrackerBoxUpdater::find_fee_boxes(&config, &PK, &tracker_box_id, 1_000_000)
+            .await
+            .unwrap();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].box_id, "cd".repeat(32));
+        assert!(boxes.iter().all(|b| b.assets.is_empty()));
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen
+            .iter()
+            .all(|r| r.method == "POST"
+                && r.target.starts_with("/blockchain/box/unspent/byAddress?")));
+        let expected_address = crate::local_wallet::p2pk_address(&PK).unwrap();
+        assert_eq!(seen[0].body, format!("\"{expected_address}\""));
     }
 }
