@@ -407,6 +407,29 @@ impl RedemptionManager {
             ));
         }
 
+        // Round 5 (C8): applying the same redemption again changes nothing. The redemption
+        // confirmer applies a redemption once the chain has it, and an operator repair
+        // (`/redeem/complete`) may send the same one. With the explicit cumulative value, the
+        // note AND the reserve tree both at that value mean it is applied: the tree only takes
+        // values from applied redemptions, and each redemption raises it.
+        if let Some(explicit) = new_already_redeemed {
+            if note.amount_redeemed == explicit
+                && self
+                    .tracker
+                    .get_already_redeemed(issuer_pubkey, recipient_pubkey, denomination)
+                    .map_err(RedemptionError::from)?
+                    == explicit
+            {
+                tracing::info!(
+                    "Redemption to cumulative {} of {} -> {} is applied already; nothing to do",
+                    explicit,
+                    hex::encode(issuer_pubkey),
+                    hex::encode(recipient_pubkey)
+                );
+                return Ok(());
+            }
+        }
+
         // SECURITY: do not let the caller drive the cumulative redeemed amount past the debt.
         // `redeemed_amount` arrives from the request body (`/redeem/complete`,
         // `/redemption/submit`), and a plain `+=` would accept more than was ever owed, permanently
@@ -1419,6 +1442,63 @@ mod tests {
             "expected InvalidAmount after full redemption, got {:?}",
             result
         );
+    }
+
+    /// Round 5 (C8): the same redemption applied twice (the confirmer and an operator repair)
+    /// changes the note and the reserve tree once; a different value is still refused.
+    #[test]
+    fn test_complete_redemption_is_idempotent_for_the_same_cumulative_value() {
+        let secp = secp256k1::Secp256k1::new();
+        let issuer_secret = secp256k1::SecretKey::from_slice(&[0x21u8; 32]).unwrap();
+        let issuer_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &issuer_secret).serialize();
+        let recipient_pubkey = [0x03u8; 33];
+        let mut redemption_manager =
+            RedemptionManager::new(crate::TrackerStateManager::new_with_temp_storage());
+        let note = IouNote::create_and_sign(
+            recipient_pubkey,
+            1_000,
+            1_700_000_000_000,
+            &issuer_secret.secret_bytes(),
+            &[0x42; 32],
+            crate::DenomKey::Erg,
+        )
+        .unwrap();
+        redemption_manager
+            .tracker
+            .add_note(&issuer_pubkey, &note)
+            .expect("add note");
+
+        let complete = |m: &mut RedemptionManager, amount: u64, cumulative: u64| {
+            m.complete_redemption(
+                &issuer_pubkey,
+                &recipient_pubkey,
+                &crate::DenomKey::Erg,
+                amount,
+                Some(cumulative),
+            )
+        };
+        let state = |m: &RedemptionManager| {
+            (
+                m.tracker
+                    .lookup_note(&issuer_pubkey, &recipient_pubkey, &crate::DenomKey::Erg)
+                    .unwrap()
+                    .amount_redeemed,
+                m.tracker
+                    .get_already_redeemed(&issuer_pubkey, &recipient_pubkey, &crate::DenomKey::Erg)
+                    .unwrap(),
+            )
+        };
+        complete(&mut redemption_manager, 300, 300).expect("first apply");
+        assert_eq!(state(&redemption_manager), (300, 300));
+        complete(&mut redemption_manager, 300, 300).expect("the same redemption again");
+        assert_eq!(state(&redemption_manager), (300, 300));
+        // Another redemption still has to match the state.
+        assert!(matches!(
+            complete(&mut redemption_manager, 100, 300 + 200),
+            Err(RedemptionError::InvalidAmount(_))
+        ));
+        complete(&mut redemption_manager, 200, 500).expect("the next redemption");
+        assert_eq!(state(&redemption_manager), (500, 500));
     }
 
     /// The reserve AVL journal must survive a TrackerStateManager restart so that

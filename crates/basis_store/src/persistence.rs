@@ -92,6 +92,47 @@ pub struct TrackerStorage {
     /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]).
     _keyspace: fjall::Keyspace,
     partition: fjall::Partition,
+    /// Redemptions submitted through `/redemption/submit` that the chain has not confirmed yet
+    /// (round 5, C8; see [`JournaledRedemption`]).
+    redemption_journal: fjall::Partition,
+}
+
+/// The partition of [`TrackerStorage`] that holds the submitted redemptions. It is created on
+/// first open; a data dir without it (written before round 5) opens unchanged, and an older
+/// binary leaves it alone.
+pub const REDEMPTION_JOURNAL_PARTITION: &str = "redemption_journal";
+
+/// A redemption `/redemption/submit` broadcast (or is about to) that the chain has not
+/// confirmed yet (round 5, C8). It is written before the broadcast and removed once the
+/// redemption is applied to the note and the reserve tree (it is in a block, deep enough) or
+/// dropped (gone from the mempools and the chain, or refused by the node). Stored as JSON under
+/// the transaction id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JournaledRedemption {
+    /// Id of the redemption transaction (a signed transaction has its unsigned one's id).
+    pub tx_id: String,
+    /// The reserve box it spends.
+    pub reserve_box_id: String,
+    /// Issuer (reserve owner) key, lower-case hex.
+    pub issuer_pubkey: String,
+    /// Recipient key, lower-case hex.
+    pub recipient_pubkey: String,
+    /// The note's denomination (`DenomKey::denomination_id`).
+    pub denomination: String,
+    /// Amount it redeems.
+    pub redeemed_amount: u64,
+    /// The reserve tree's cumulative value for the note once it is applied.
+    pub new_already_redeemed: u64,
+    /// The boxes it reads as data inputs (the tracker box).
+    pub data_input_ids: Vec<String>,
+    /// Unix milliseconds when `/redemption/submit` wrote it.
+    pub submitted_at_ms: u64,
+    /// Consecutive checks that found it in neither a mempool nor the chain.
+    #[serde(default)]
+    pub missing_checks: u32,
+    /// Why the last attempt to apply it failed, if one did.
+    #[serde(default)]
+    pub apply_error: Option<String>,
 }
 
 /// Database storage for per-recipient acceptance policies
@@ -1403,11 +1444,64 @@ impl TrackerStorage {
         let partition = keyspace
             .open_partition("tracker_metadata", PartitionCreateOptions::default())
             .map_err(|e| NoteError::StorageError(format!("Failed to open partition: {}", e)))?;
+        let redemption_journal = keyspace
+            .open_partition(REDEMPTION_JOURNAL_PARTITION, PartitionCreateOptions::default())
+            .map_err(|e| {
+                NoteError::StorageError(format!(
+                    "Failed to open the redemption journal partition: {}",
+                    e
+                ))
+            })?;
 
         Ok(Self {
             _keyspace: keyspace,
             partition,
+            redemption_journal,
         })
+    }
+
+    /// Write (or replace) the journal entry of `entry.tx_id`.
+    pub fn journal_redemption(&self, entry: &JournaledRedemption) -> Result<(), NoteError> {
+        let value = serde_json::to_vec(entry).map_err(|e| {
+            NoteError::StorageError(format!("Failed to serialize a journaled redemption: {}", e))
+        })?;
+        self.redemption_journal
+            .insert(entry.tx_id.to_ascii_lowercase().as_bytes(), value)
+            .map_err(|e| {
+                NoteError::StorageError(format!("Failed to journal a redemption: {}", e))
+            })
+    }
+
+    /// Every journaled redemption, in transaction id order. An entry that cannot be read is
+    /// skipped with a warning.
+    pub fn journaled_redemptions(&self) -> Result<Vec<JournaledRedemption>, NoteError> {
+        let mut entries = Vec::new();
+        for item in self.redemption_journal.iter() {
+            let (key, value) = item.map_err(|e| {
+                NoteError::StorageError(format!("Failed to read the redemption journal: {}", e))
+            })?;
+            match serde_json::from_slice::<JournaledRedemption>(&value) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => tracing::warn!(
+                    "Skipping an unreadable redemption journal entry {}: {}",
+                    String::from_utf8_lossy(&key),
+                    e
+                ),
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Remove the journal entry of `tx_id` (nothing when there is none).
+    pub fn remove_journaled_redemption(&self, tx_id: &str) -> Result<(), NoteError> {
+        self.redemption_journal
+            .remove(tx_id.to_ascii_lowercase().as_bytes())
+            .map_err(|e| {
+                NoteError::StorageError(format!(
+                    "Failed to remove a journaled redemption: {}",
+                    e
+                ))
+            })
     }
 
     /// Store tracker box information in the database
@@ -1729,6 +1823,77 @@ impl AcceptancePolicyStorage {
             }
         }
         Ok(policies)
+    }
+}
+
+#[cfg(test)]
+mod redemption_journal_tests {
+    use super::*;
+
+    fn entry(tx: &str) -> JournaledRedemption {
+        JournaledRedemption {
+            tx_id: tx.to_string(),
+            reserve_box_id: "ab".repeat(32),
+            issuer_pubkey: "02".repeat(33),
+            recipient_pubkey: "03".repeat(33),
+            denomination: "erg".to_string(),
+            redeemed_amount: 100,
+            new_already_redeemed: 100,
+            data_input_ids: vec!["cd".repeat(32)],
+            submitted_at_ms: 1_700_000_000_000,
+            missing_checks: 0,
+            apply_error: None,
+        }
+    }
+
+    /// Round 5 (C8): a tracker_boxes dir written by 6113b8d (only the `tracker_metadata`
+    /// partition) opens unchanged with an empty journal; entries are written, replaced, read
+    /// and removed by transaction id, and survive a reopen.
+    #[test]
+    fn a_6113b8d_tracker_dir_opens_with_an_empty_redemption_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let keyspace = Config::new(dir.path()).open().unwrap();
+            let partition = keyspace
+                .open_partition("tracker_metadata", PartitionCreateOptions::default())
+                .unwrap();
+            partition.insert(b"some-box", b"{}").unwrap();
+            keyspace.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+        let storage = TrackerStorage::open(dir.path()).unwrap();
+        assert!(storage.journaled_redemptions().unwrap().is_empty());
+
+        let (a, b) = ("aa".repeat(32), "BB".repeat(32));
+        storage.journal_redemption(&entry(&a)).unwrap();
+        storage.journal_redemption(&entry(&b)).unwrap();
+        let mut counted = entry(&a);
+        counted.missing_checks = 2;
+        storage.journal_redemption(&counted).unwrap();
+        let entries = storage.journaled_redemptions().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], counted);
+        storage.remove_journaled_redemption(&b.to_ascii_lowercase()).unwrap();
+        drop(storage);
+
+        let storage = TrackerStorage::open(dir.path()).unwrap();
+        assert_eq!(storage.journaled_redemptions().unwrap(), vec![counted]);
+        // An entry without the round-5 counters reads with their defaults.
+        storage
+            .redemption_journal
+            .insert(
+                "cc".repeat(32).as_bytes(),
+                serde_json::json!({
+                    "tx_id": "cc".repeat(32), "reserve_box_id": "r", "issuer_pubkey": "i",
+                    "recipient_pubkey": "p", "denomination": "erg", "redeemed_amount": 1,
+                    "new_already_redeemed": 1, "data_input_ids": [], "submitted_at_ms": 1
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let read = storage.journaled_redemptions().unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[1].missing_checks, 0);
+        assert_eq!(read[1].apply_error, None);
     }
 }
 
