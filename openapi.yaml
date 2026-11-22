@@ -2441,7 +2441,9 @@ components:
         change_amount:
           type: integer
           format: uint64
-          description: Change amount returned to the tracker
+          description: >-
+            Change amount returned to the tracker; 0 (no change output) when the leftover is
+            below the minimum value of a box and went to the miner fee
           example: 123900000
         change_address:
           type: string
@@ -2458,7 +2460,9 @@ components:
         fee:
           type: integer
           format: uint64
-          description: Transaction fee
+          description: >-
+            Miner fee of the built transaction: the configured fee plus any leftover too small
+            to form a change box
           example: 1100000
         new_already_redeemed:
           type: integer

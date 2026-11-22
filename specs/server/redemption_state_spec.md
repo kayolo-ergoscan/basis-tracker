@@ -475,6 +475,16 @@ transaction moves every input token to the outputs unchanged. Otherwise the buil
 500 and nothing is signed, so a stale index entry can never get the tracker to sign away its
 NFT.
 
+**Outputs and local checks:** every output is created at the height of the signing context
+(the newest of the last 10 headers), as the tracker's own commits are. Change below the
+minimum value of its box (360 nanoERG per serialized byte) cannot form a box and goes to the
+miner fee (`change_amount` 0, `fee` the configured fee plus that leftover). An ERG redemption
+whose amount is below the minimum value of the recipient's box is refused with 400. Before
+signing, the build also checks what it can without the reserve input's proof: inputs and
+outputs hold the same value, no output is below its minimum value, and every output is created
+at the signing height or below and no lower than any input. After signing, the fee input
+proofs are verified against the signing context.
+
 **`new_already_redeemed`:** computed from the **reserve-tree lookup** (previous
 cumulative value for this reserve, `0` for a first redemption) plus the requested
 amount — *not* from the note record. With multiple reserves per issuer (each reserve

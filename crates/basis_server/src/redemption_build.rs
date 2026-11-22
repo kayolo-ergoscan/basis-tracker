@@ -649,11 +649,18 @@ fn select_fee_inputs(
 /// - every fee input (every input after the reserve, input 0) is locked by `P2PK(tracker key)`
 ///   (`tracker_tree_hex`) and holds no token;
 /// - the transaction moves every input token to the outputs with the same total and creates
-///   none ([`crate::local_wallet::check_tokens_preserved`]).
+///   none ([`crate::local_wallet::check_tokens_preserved`]);
+///
+/// and that the node would take it, as far as that is known without the reserve input's proof:
+/// - the outputs hold exactly the value of the inputs;
+/// - no output is below its minimum value (360 nanoERG per serialized byte);
+/// - every output is created at `height` (the signing context's) or below, and no lower than
+///   any input.
 fn check_before_fee_signing(
     unsigned: &UnsignedTransaction,
     input_boxes: &[ErgoBox],
     tracker_tree_hex: &str,
+    height: u32,
 ) -> Result<(), String> {
     if input_boxes.len() != unsigned.inputs.len() {
         return Err(format!(
@@ -689,11 +696,123 @@ fn check_before_fee_signing(
             ));
         }
     }
-    crate::local_wallet::check_tokens_preserved(
-        input_boxes,
-        unsigned.output_candidates.as_vec(),
-        None,
+    let outputs = unsigned.output_candidates.as_vec();
+    crate::local_wallet::check_tokens_preserved(input_boxes, outputs, None)?;
+
+    let value_in = input_boxes
+        .iter()
+        .try_fold(0u64, |acc, b| acc.checked_add(*b.value.as_u64()))
+        .ok_or("input values overflow")?;
+    let value_out = outputs
+        .iter()
+        .try_fold(0u64, |acc, c| acc.checked_add(*c.value.as_u64()))
+        .ok_or("output values overflow")?;
+    if value_in != value_out {
+        return Err(format!(
+            "inputs hold {value_in} nanoERG but outputs {value_out}"
+        ));
+    }
+    let newest_input = input_boxes
+        .iter()
+        .map(|b| b.creation_height)
+        .max()
+        .unwrap_or(0);
+    for (i, output) in outputs.iter().enumerate() {
+        let value = *output.value.as_u64();
+        let min = crate::local_wallet::min_box_value(output)?;
+        if value < min {
+            return Err(format!(
+                "output {i} holds {value} nanoERG, below its minimum value {min}"
+            ));
+        }
+        if output.creation_height > height || output.creation_height < newest_input {
+            return Err(format!(
+                "output {i} is created at height {}, outside {newest_input}..={height}",
+                output.creation_height
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify the proofs of the fee inputs (every input after the reserve, input 0) of the
+/// partially signed `tx` against the signing context. The reserve input's proof is the
+/// client's to add, so it is not checked here.
+fn verify_fee_input_proofs(
+    tx: &Transaction,
+    input_boxes: &[ErgoBox],
+    data_boxes: &[ErgoBox],
+    state_context: &ErgoStateContext,
+) -> Result<(), String> {
+    let context = ergo_lib::wallet::signing::TransactionContext::new(
+        tx.clone(),
+        input_boxes.to_vec(),
+        data_boxes.to_vec(),
     )
+    .map_err(|e| format!("transaction context: {e}"))?;
+    let bytes_to_sign = tx
+        .bytes_to_sign()
+        .map_err(|e| format!("bytes to sign: {e}"))?;
+    for i in 1..tx.inputs.len() {
+        let mut input_context = ergo_lib::wallet::signing::make_context(state_context, &context, i)
+            .map_err(|e| format!("fee input {i} context: {e}"))?;
+        let verified = ergo_lib::chain::transaction::verify_tx_input_proof(
+            &context,
+            &mut input_context,
+            state_context,
+            i,
+            &bytes_to_sign,
+        )
+        .map_err(|e| format!("fee input {i}: {e}"))?;
+        if !verified.result {
+            return Err(format!("fee input {i}: the proof does not verify"));
+        }
+    }
+    Ok(())
+}
+
+/// Minimum value of a box at `ergo_tree_hex` holding `value` and nothing else, created at
+/// `height` (see [`crate::local_wallet::min_box_value`]).
+fn plain_box_min_value(ergo_tree_hex: &str, value: u64, height: u32) -> Result<u64, String> {
+    use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBoxCandidate, NonMandatoryRegisters};
+    let candidate = ErgoBoxCandidate {
+        value: BoxValue::try_from(value.max(BoxValue::MIN_RAW))
+            .map_err(|e| format!("box value: {e}"))?,
+        ergo_tree: parse_ergo_tree(ergo_tree_hex)?,
+        tokens: None,
+        additional_registers: NonMandatoryRegisters::empty(),
+        creation_height: height,
+    };
+    crate::local_wallet::min_box_value(&candidate)
+}
+
+fn parse_ergo_tree(
+    ergo_tree_hex: &str,
+) -> Result<ergo_lib::ergotree_ir::ergo_tree::ErgoTree, String> {
+    let bytes = hex::decode(ergo_tree_hex).map_err(|e| format!("ergo tree hex: {e}"))?;
+    ergo_lib::ergotree_ir::ergo_tree::ErgoTree::sigma_parse_bytes(&bytes)
+        .map_err(|e| format!("ergo tree: {e}"))
+}
+
+/// The miner fee and the change of a redemption whose fee inputs leave `leftover` nanoERG
+/// after `fee` (and, for a token reserve, the recipient's box). Change below the minimum value
+/// of its box at `change_tree_hex` cannot form a box: it is added to the fee, and there is no
+/// change output (change 0).
+fn fee_and_change(
+    fee: u64,
+    leftover: u64,
+    change_tree_hex: &str,
+    height: u32,
+) -> Result<(u64, u64), String> {
+    let change_tree = parse_ergo_tree(change_tree_hex)?;
+    match crate::local_wallet::change_output(leftover, &change_tree, height)? {
+        Some(_) => Ok((fee, leftover)),
+        None => fee
+            .checked_add(leftover)
+            .map(|fee| (fee, 0))
+            .ok_or_else(|| "fee overflows".to_string()),
+    }
 }
 
 type ApiResult<T> = Result<T, (StatusCode, Json<ApiResponse<RedemptionBuildResponse>>)>;
@@ -1297,19 +1416,15 @@ async fn build_redemption_inner(
         Vec::new()
     };
 
-    // Fetch node data (height) — node client created above.
-    let current_height = {
-        let scanner = state.ergo_scanner.lock().await;
-        match scanner.get_current_height().await {
-            Ok(h) => h,
-            Err(e) => {
-                return api_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("current height: {e}"),
-                )
-            }
-        }
+    // Signing context (contract does not read headers/params; height from PreHeader): the
+    // newest header first, and the pre-header from the newest. The outputs are created at its
+    // height, the chain tip, as the tracker's own commits are; the scanner's cached height can
+    // be minutes old, below the creation height of a fee box from the latest commit.
+    let state_context = match chain_node.state_context().await {
+        Ok(context) => context,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("headers: {e}")),
     };
+    let current_height = state_context.pre_header.height;
 
     let reserve_box = match chain_node.box_details(&reserve_box_id).await {
         Ok(b) => b,
@@ -1575,6 +1690,31 @@ async fn build_redemption_inner(
         )
     };
 
+    // The node rejects an output below its minimum value (360 nanoERG per serialized byte).
+    // The recipient of an ERG redemption gets `amount` itself, so a smaller amount is refused.
+    if !is_token_reserve {
+        match plain_box_min_value(&recipient_ergo_tree, recipient_output_value, current_height) {
+            Ok(min) if recipient_output_value < min => {
+                return api_err(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "amount {recipient_output_value} nanoERG is below the minimum value of \
+                         the recipient's box ({min} nanoERG)"
+                    ),
+                )
+            }
+            Ok(_) => {}
+            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        }
+    }
+    // Change that cannot form a box goes to the miner fee, as in the tracker's own commits: a
+    // fee box worth the fee plus 1 nanoERG no longer makes the build fail or the node reject it.
+    let (fee, change_amount) =
+        match fee_and_change(fee, change_amount, &change_ergo_tree, current_height) {
+            Ok(v) => v,
+            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        };
+
     // Inputs: reserve (index 0) then fee inputs.
     let mut inputs = vec![json!({ "boxId": reserve_box_id, "extension": context_extension })];
     for fb in &fee_boxes {
@@ -1697,7 +1837,9 @@ async fn build_redemption_inner(
     let data_boxes = vec![tracker_ebox];
 
     let tracker_tree_hex = crate::local_wallet::p2pk_tree_hex(&tracker_pubkey_for_fees);
-    if let Err(e) = check_before_fee_signing(&unsigned, &input_boxes, &tracker_tree_hex) {
+    if let Err(e) =
+        check_before_fee_signing(&unsigned, &input_boxes, &tracker_tree_hex, current_height)
+    {
         tracing::error!("Refusing to sign the fee inputs of redemption {built_tx_id}: {e}");
         return api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1705,12 +1847,6 @@ async fn build_redemption_inner(
         );
     }
 
-    // State context for proving (contract does not read headers/params; height from PreHeader):
-    // the newest header first, and the pre-header from the newest.
-    let state_context = match chain_node.state_context().await {
-        Ok(context) => context,
-        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("headers: {e}")),
-    };
     let pre_header = state_context.pre_header.clone();
     let headers_array = state_context.headers.clone();
 
@@ -1754,6 +1890,16 @@ async fn build_redemption_inner(
                     format!("fee input {fee_idx} signing: {e:?}"),
                 )
             }
+        }
+    }
+
+    if let Some(ref tx) = partial {
+        if let Err(e) = verify_fee_input_proofs(tx, &input_boxes, &data_boxes, &state_context) {
+            tracing::error!("Fee inputs of redemption {built_tx_id} do not verify: {e}");
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("fee input proofs do not verify: {e}"),
+            );
         }
     }
 
@@ -2399,7 +2545,7 @@ mod tests {
         json!({
             "value": value,
             "ergoTree": ergo_tree,
-            "creationHeight": 123_400,
+            "creationHeight": HEIGHT,
             "assets": assets,
             "additionalRegisters": {}
         })
@@ -2408,6 +2554,7 @@ mod tests {
     /// Boxes for a redemption: the tracker key, a reserve holding its NFT, a plain fee box of
     /// the tracker key and the tracker box (tracker key, tracker NFT).
     struct FeeSigningFixture {
+        tracker_secret: [u8; 32],
         tracker_tree_hex: String,
         reserve: ErgoBox,
         fee_box: ErgoBox,
@@ -2415,14 +2562,17 @@ mod tests {
     }
 
     const RESERVE_NFT: [u8; 32] = [0x77; 32];
+    /// Creation height of the fixture outputs: the signing context's height.
+    const HEIGHT: u32 = 123_400;
     const TRACKER_NFT: [u8; 32] = [0x11; 32];
 
     fn fee_signing_fixture(reserve_tokens: &[([u8; 32], u64)]) -> FeeSigningFixture {
         use crate::local_wallet::tests::{fresh_key, tree_of, utxo_box};
-        let (_, tracker) = fresh_key();
+        let (tracker_secret, tracker) = fresh_key();
         let (_, owner) = fresh_key();
         let tracker_tree = tree_of(&tracker.public_key());
         FeeSigningFixture {
+            tracker_secret,
             tracker_tree_hex: crate::local_wallet::p2pk_tree_hex(&tracker.public_key()),
             reserve: utxo_box(
                 &tree_of(&owner.public_key()),
@@ -2465,7 +2615,7 @@ mod tests {
         let fx = fee_signing_fixture(&[(RESERVE_NFT, 1)]);
         let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
         let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
-        check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap();
+        check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap();
     }
 
     /// A stale or wrong index entry offered the tracker box as a plain fee box. Its bytes hold the
@@ -2479,8 +2629,8 @@ mod tests {
                 &[&fx.reserve, &fx.tracker_box],
                 fx.outputs(&fx.tracker_box, nft_in_change),
             );
-            let err =
-                check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+            let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT)
+                .unwrap_err();
             assert!(err.contains("fee input 1"), "{err}");
             assert!(err.contains("holds tokens"), "{err}");
             assert!(err.contains(&hex::encode(TRACKER_NFT)), "{err}");
@@ -2493,14 +2643,16 @@ mod tests {
         let fx = fee_signing_fixture(&[(RESERVE_NFT, 1), ([0x55; 32], 7)]);
         let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
         let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
-        let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+        let err =
+            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap_err();
         assert!(err.contains("would be burned"), "{err}");
 
         // The reserve output carries an NFT the reserve does not hold.
         let fx = fee_signing_fixture(&[]);
         let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
         let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
-        let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+        let err =
+            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap_err();
         assert!(err.contains("in no input"), "{err}");
     }
 
@@ -2519,14 +2671,132 @@ mod tests {
         );
         let unsigned = unsigned_spending(&[&fx.reserve, &foreign], fx.outputs(&foreign, &[]));
         let inputs = vec![fx.reserve.clone(), foreign.clone()];
-        let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+        let err =
+            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap_err();
         assert!(err.contains("not locked by P2PK(tracker key)"), "{err}");
 
         // The node's bytes are another box than the one the transaction spends.
         let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
         let inputs = vec![fx.reserve.clone(), foreign];
-        let err = check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex).unwrap_err();
+        let err =
+            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, HEIGHT).unwrap_err();
         assert!(err.contains("input 1 spends box"), "{err}");
+    }
+
+    #[test]
+    fn a_redemption_the_node_would_reject_is_never_signed() {
+        use crate::local_wallet::tests::utxo_box;
+        let fx = fee_signing_fixture(&[(RESERVE_NFT, 1)]);
+        let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
+        let check = |outputs: Vec<Value>, height: u32| {
+            let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], outputs);
+            check_before_fee_signing(&unsigned, &inputs, &fx.tracker_tree_hex, height)
+        };
+
+        // Value created out of nothing.
+        let mut outputs = fx.outputs(&fx.fee_box, &[]);
+        outputs[3]["value"] = json!(4_000_001u64);
+        let err = check(outputs, HEIGHT).unwrap_err();
+        assert!(
+            err.contains("inputs hold 15000000 nanoERG but outputs 15000001"),
+            "{err}"
+        );
+
+        // Outputs created above the signing height.
+        let err = check(fx.outputs(&fx.fee_box, &[]), HEIGHT - 1).unwrap_err();
+        assert!(err.contains("created at height 123400"), "{err}");
+
+        // Outputs created below a fee input's creation height.
+        let tracker_tree = fx.fee_box.ergo_tree.clone();
+        let late_fee_box = utxo_box(&tracker_tree, 5_000_000, &[], &[], HEIGHT + 1, 4);
+        let unsigned = unsigned_spending(
+            &[&fx.reserve, &late_fee_box],
+            fx.outputs(&late_fee_box, &[]),
+        );
+        let late_inputs = vec![fx.reserve.clone(), late_fee_box];
+        let err =
+            check_before_fee_signing(&unsigned, &late_inputs, &fx.tracker_tree_hex, HEIGHT + 1)
+                .unwrap_err();
+        assert!(err.contains("outside 123401..=123401"), "{err}");
+
+        // Change of 1 nanoERG: balanced, but below the minimum value of a box.
+        let dust_fee_box = utxo_box(&tracker_tree, 1_000_001, &[], &[], 123_100, 5);
+        let unsigned = unsigned_spending(
+            &[&fx.reserve, &dust_fee_box],
+            fx.outputs(&dust_fee_box, &[]),
+        );
+        let dust_inputs = vec![fx.reserve.clone(), dust_fee_box];
+        let err = check_before_fee_signing(&unsigned, &dust_inputs, &fx.tracker_tree_hex, HEIGHT)
+            .unwrap_err();
+        assert!(
+            err.contains("output 3 holds 1 nanoERG, below its minimum value"),
+            "{err}"
+        );
+    }
+
+    /// Change that cannot form a box goes to the miner fee: a single fee box worth the fee plus
+    /// 1 nanoERG pays a fee of fee + 1 and leaves no change output.
+    #[test]
+    fn change_below_the_minimum_box_value_goes_to_the_fee() {
+        let fx = fee_signing_fixture(&[]);
+        let tree = &fx.tracker_tree_hex;
+        let fee = 1_000_000;
+        // Every value from 2^14 to 2^21 - 1 encodes in 3 bytes, so the minimum is the same.
+        let min = plain_box_min_value(tree, 30_000, HEIGHT).unwrap();
+        assert!((16_384..2_097_152).contains(&min), "{min}");
+        assert_eq!(plain_box_min_value(tree, min, HEIGHT).unwrap(), min);
+
+        assert_eq!(fee_and_change(fee, 0, tree, HEIGHT).unwrap(), (fee, 0));
+        assert_eq!(fee_and_change(fee, 1, tree, HEIGHT).unwrap(), (fee + 1, 0));
+        assert_eq!(
+            fee_and_change(fee, min - 1, tree, HEIGHT).unwrap(),
+            (fee + min - 1, 0)
+        );
+        assert_eq!(fee_and_change(fee, min, tree, HEIGHT).unwrap(), (fee, min));
+        assert_eq!(
+            fee_and_change(fee, 4_000_000, tree, HEIGHT).unwrap(),
+            (fee, 4_000_000)
+        );
+
+        // A recipient box of 1 nanoERG is below its minimum: the handler refuses such an amount.
+        assert!(plain_box_min_value(tree, 1, HEIGHT).unwrap() > 1);
+    }
+
+    /// The tracker's fee input proof verifies against the signing context; the same proof on
+    /// other outputs does not.
+    #[test]
+    fn fee_input_proofs_are_verified_after_signing() {
+        let fx = fee_signing_fixture(&[(RESERVE_NFT, 1)]);
+        let state = crate::local_wallet::tests::fixture_state();
+        let secret = SecretKey::dlog_from_bytes(&fx.tracker_secret).unwrap();
+        let inputs = vec![fx.reserve.clone(), fx.fee_box.clone()];
+        let unsigned = unsigned_spending(&[&fx.reserve, &fx.fee_box], fx.outputs(&fx.fee_box, &[]));
+        let signed = add_input_proof(
+            &unsigned,
+            None,
+            &inputs,
+            &[],
+            &state.pre_header,
+            &state.headers,
+            1,
+            &secret,
+        )
+        .unwrap();
+        verify_fee_input_proofs(&signed, &inputs, &[], &state).unwrap();
+
+        // The same proofs on outputs that pay 1 nanoERG more to the miner.
+        let mut outputs = fx.outputs(&fx.fee_box, &[]);
+        outputs[2]["value"] = json!(1_000_001u64);
+        outputs[3]["value"] = json!(3_999_999u64);
+        let other = unsigned_spending(&[&fx.reserve, &fx.fee_box], outputs);
+        let spliced = Transaction::new(
+            signed.inputs.clone(),
+            other.data_inputs.clone(),
+            other.output_candidates.clone(),
+        )
+        .unwrap();
+        let err = verify_fee_input_proofs(&spliced, &inputs, &[], &state).unwrap_err();
+        assert!(err.contains("fee input 1"), "{err}");
     }
 
     /// The address index lists the tracker box without its NFT. The fee scan of a redemption
