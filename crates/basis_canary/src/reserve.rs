@@ -50,13 +50,6 @@ pub struct PayloadAsset {
     pub amount: u64,
 }
 
-/// The reserve output built from a checked payload, and what about the payload is worth saying.
-#[derive(Debug)]
-pub struct ReserveOutput {
-    pub candidate: ErgoBoxCandidate,
-    pub warnings: Vec<String>,
-}
-
 /// Check the payload against the request (`owner`, `erg_nano`, reserve NFT `reserve_nft`) and
 /// `tracker_nft`, and build the reserve output it describes, created at `height`.
 ///
@@ -64,8 +57,7 @@ pub struct ReserveOutput {
 /// `erg_nano` nanoERG, the reserve NFT with amount 1 and nothing else, R4 = the owner key,
 /// R5 = the empty reserve tree, R6 = `tracker_nft` (a reserve bound to another tracker is
 /// refused), R7 absent or Long 0, no other register; its change address must be the owner's.
-/// A register whose hex holds bytes after its value is read as the node reads it (the value
-/// alone), the box gets the value's canonical encoding, and a warning says so.
+/// Every register must be a canonical constant: its value and nothing after it.
 pub fn reserve_output(
     payload: &ReservePayload,
     owner: &[u8; 33],
@@ -73,14 +65,13 @@ pub fn reserve_output(
     reserve_nft: &str,
     tracker_nft: &[u8; 32],
     height: u32,
-) -> Result<ReserveOutput, String> {
+) -> Result<ErgoBoxCandidate, String> {
     let [request] = payload.requests.as_slice() else {
         return Err(format!(
             "the payload asks for {} boxes; a reserve creation is exactly one",
             payload.requests.len()
         ));
     };
-    let mut warnings = Vec::new();
 
     let ergo_tree = tx::address_tree(&request.address)?;
     if ergo_tree != tx::reserve_tree()? {
@@ -112,7 +103,7 @@ pub fn reserve_output(
     {
         return Err(format!("unexpected register {other} in the payload"));
     }
-    let mut read = |id: &str| -> Result<Option<Constant>, String> {
+    let read = |id: &str| -> Result<Option<Constant>, String> {
         let Some(value) = registers.get(id) else {
             return Ok(None);
         };
@@ -120,9 +111,9 @@ pub fn reserve_output(
             tx::parse_register(value).map_err(|e| format!("payload {id} {value:?}: {e}"))?;
         if !canonical {
             let encoded = tx::constant_hex(&constant)?;
-            warnings.push(format!(
-                "payload {id} is {value}: the value {encoded} followed by {} extra byte(s). The \
-                 node reads only the value, so the reserve box gets {encoded}",
+            return Err(format!(
+                "payload {id} is {value}: the value {encoded} followed by {} extra byte(s), not \
+                 a canonical register; refusing",
                 (value.len() - encoded.len()) / 2
             ));
         }
@@ -194,10 +185,7 @@ pub fn reserve_output(
             "--erg-nano {erg_nano} is below the minimum value of the reserve box ({min} nanoERG)"
         ));
     }
-    Ok(ReserveOutput {
-        candidate,
-        warnings,
-    })
+    Ok(candidate)
 }
 
 /// A transaction ready to sign, with the boxes it spends in input order.
@@ -445,10 +433,7 @@ pub async fn reserve_create(
         &context.tracker_nft,
         height,
     )?;
-    for warning in &reserve.warnings {
-        report.line(format!("warning: {warning}"));
-    }
-    let built = build_reserve_tx(inputs, reserve.candidate, &owner_tree, height)?;
+    let built = build_reserve_tx(inputs, reserve, &owner_tree, height)?;
     check_reserve_tx(&built, &owner_pk, &reserve_nft, &context.tracker_nft)?;
     report.line(
         "checks before signing: OK (ERG in = ERG out; only the reserve NFT is minted, amount 1, \
@@ -544,7 +529,7 @@ mod tests {
                     "R4": format!("07{}", hex::encode(owner)),
                     "R5": basis_store::ergo_scanner::empty_reserve_tree_register(),
                     "R6": format!("0e20{}", hex::encode(NFT)),
-                    "R7": "05000000000000000000",
+                    "R7": "0500",
                 },
             }],
             "fee": FEE,
@@ -581,7 +566,7 @@ mod tests {
             reserve_output(&payload(&owner, &nft_box), &owner, ERG, &nft_box, &NFT, 100).unwrap();
         let registers: Vec<String> = tx::REGISTER_IDS
             .iter()
-            .filter_map(|r| tx::candidate_register(&out.candidate, *r))
+            .filter_map(|r| tx::candidate_register(&out, *r))
             .map(|c| tx::constant_hex(&c).unwrap())
             .collect();
         assert_eq!(
@@ -593,12 +578,9 @@ mod tests {
                 "0500".to_string(),
             ]
         );
-        assert_eq!(tx::candidate_tokens(&out.candidate), vec![(nft_box, 1)]);
-        assert_eq!(*out.candidate.value.as_u64(), ERG);
-        assert_eq!(out.candidate.ergo_tree, tx::reserve_tree().unwrap());
-        // The tracker's R7 holds 8 bytes after the Long: said, and encoded canonically.
-        assert_eq!(out.warnings.len(), 1);
-        assert!(out.warnings[0].starts_with("payload R7 is 05000000000000000000"));
+        assert_eq!(tx::candidate_tokens(&out), vec![(nft_box, 1)]);
+        assert_eq!(*out.value.as_u64(), ERG);
+        assert_eq!(out.ergo_tree, tx::reserve_tree().unwrap());
     }
 
     #[test]
@@ -643,6 +625,15 @@ mod tests {
                     p.requests[0].registers.insert("R7".into(), "0502".into());
                 }),
                 "is not Long 0",
+            ),
+            (
+                // The R7 of the tracker before round 4: Long 0 and 8 more zero bytes.
+                Box::new(|p: &mut ReservePayload| {
+                    p.requests[0]
+                        .registers
+                        .insert("R7".into(), "05000000000000000000".into());
+                }),
+                "followed by 8 extra byte(s), not a canonical register",
             ),
             (
                 Box::new(|p: &mut ReservePayload| {
@@ -702,9 +693,8 @@ mod tests {
             utxo(&owner_tree, 500_000_000, None, 1),
         ];
         let nft_box = String::from(inputs[0].box_id());
-        let reserve = reserve_output(&payload(&owner, &nft_box), &owner, ERG, &nft_box, &NFT, 100)
-            .unwrap()
-            .candidate;
+        let reserve =
+            reserve_output(&payload(&owner, &nft_box), &owner, ERG, &nft_box, &NFT, 100).unwrap();
         let built = build_reserve_tx(inputs.clone(), reserve.clone(), &owner_tree, 100).unwrap();
         check_reserve_tx(&built, &owner, &nft_box, &NFT).unwrap();
         assert_eq!((built.fee, built.change), (FEE, 99_000_000));
@@ -720,8 +710,7 @@ mod tests {
             &NFT,
             100,
         )
-        .unwrap()
-        .candidate;
+        .unwrap();
         let built = build_reserve_tx(exact, reserve_exact, &owner_tree, 100).unwrap();
         check_reserve_tx(&built, &owner, &nft_exact, &NFT).unwrap();
         assert_eq!((built.fee, built.change), (FEE + 1_000, 0));

@@ -5,14 +5,20 @@
 //!    against its committed tree), and its stored signature must cover that total: it is the
 //!    issuer signature the contract checks (context var #2).
 //! 2. `POST /tracker/signature` must return the tracker's signature over the same message.
-//! 3. `POST /redemption/build`: the tracker builds the transaction, pays the fee from its own
-//!    boxes and signs those inputs. The recipient's key needs no ERG.
+//! 3. `POST /redemption/build`, asked for by the recipient: a Basis Schnorr signature over the
+//!    build request message (`"basis-build-v1"`, tracker NFT, issuer, recipient, `erg`, amount,
+//!    request timestamp in ms). The tracker builds a transaction that spends only the reserve:
+//!    the miner fee comes out of the payout, so the recipient's key needs no ERG and the tracker
+//!    signs nothing.
 //! 4. Every input and data input is read again from the node, and the transaction is checked
-//!    before the recipient's key proves the reserve input (input 0).
+//!    before the recipient's key proves the reserve input, its only input.
 //! 5. The signed transaction is validated in full against the node's last 10 headers, then
-//!    submitted through `POST /redemption/submit`, or through the node if the tracker refuses.
+//!    submitted through `POST /redemption/submit`, or through the node when the tracker cannot
+//!    submit it. Never after a 409: the tracker then no longer holds this build (a newer build of
+//!    the note replaced it, or it expired).
 
 use basis_server::local_wallet::{self, NodeEndpoint};
+use basis_server::redemption_build::FEE_PAID_BY_RECIPIENT;
 use basis_store::DenomKey;
 use ergo_lib::chain::transaction::unsigned::UnsignedTransaction;
 use ergo_lib::chain::transaction::Transaction;
@@ -25,7 +31,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::keys::FileKey;
-use crate::note::{fetch_note, note_message};
+use crate::note::{fetch_note, note_message, now_ms};
 use crate::tx;
 use crate::{Context, Report};
 
@@ -60,6 +66,9 @@ pub struct BuildResponse {
     pub fee: u64,
     #[serde(default)]
     pub new_already_redeemed: u64,
+    /// Who pays the miner fee: `recipient` for an ERG reserve (it comes out of the payout).
+    #[serde(default)]
+    pub fee_paid_by: String,
 }
 
 /// What the redemption must be.
@@ -74,6 +83,79 @@ pub struct Expectation {
     pub issuer_signature: [u8; 65],
     pub tracker_nft: [u8; 32],
     pub tracker_pubkey: [u8; 33],
+    /// Largest miner fee the payout may pay (`--max-fee-nano`).
+    pub max_fee: u64,
+}
+
+/// The message the recipient signs to ask for a build of an ERG redemption: 131 bytes,
+/// `"basis-build-v1" ‖ tracker NFT (32) ‖ issuer (33) ‖ recipient (33) ‖ "erg" ‖ amount (8 BE) ‖
+/// request timestamp in ms (8 BE)`, made by the tracker's own function.
+pub fn build_request_message(
+    tracker_nft: &[u8; 32],
+    issuer: &[u8; 33],
+    recipient: &[u8; 33],
+    amount: u64,
+    request_timestamp: u64,
+) -> Vec<u8> {
+    basis_store::schnorr::build_request_message(
+        tracker_nft,
+        issuer,
+        recipient,
+        &DenomKey::Erg,
+        amount,
+        request_timestamp,
+    )
+}
+
+/// A `POST /redemption/build` body signed by the recipient.
+#[derive(Debug, Clone)]
+pub struct BuildRequest {
+    pub body: Value,
+    /// The signed message ([`build_request_message`]).
+    pub message: Vec<u8>,
+    /// The recipient's Basis Schnorr signature `a ‖ z` over `message`.
+    pub signature: [u8; 65],
+    pub request_timestamp: u64,
+}
+
+/// The build request for `amount` of the ERG note of `issuer` to the recipient, signed with the
+/// recipient's key at `request_timestamp` (ms). The tracker accepts it within 120 s of its clock,
+/// and only when `request_timestamp` is above the recipient's previous build request.
+pub fn signed_build_request(
+    recipient: &FileKey,
+    issuer: &[u8; 33],
+    amount: u64,
+    issuer_signature: &[u8; 65],
+    tracker_nft: &[u8; 32],
+    request_timestamp: u64,
+) -> Result<BuildRequest, String> {
+    let recipient_pk = recipient.public_key();
+    let message = build_request_message(
+        tracker_nft,
+        issuer,
+        &recipient_pk,
+        amount,
+        request_timestamp,
+    );
+    let signature = recipient.schnorr_sign(&message)?;
+    basis_store::schnorr::schnorr_verify(&signature, &message, &recipient_pk)
+        .map_err(|e| format!("the build request signature does not verify: {e:?}"))?;
+    let body = json!({
+        "issuer_pubkey": hex::encode(issuer),
+        "recipient_pubkey": hex::encode(recipient_pk),
+        "amount": amount,
+        "issuer_signature": hex::encode(issuer_signature),
+        "emergency": false,
+        "denomination": "erg",
+        "request_timestamp": request_timestamp,
+        "receiver_signature": hex::encode(signature),
+    });
+    Ok(BuildRequest {
+        body,
+        message,
+        signature,
+        request_timestamp,
+    })
 }
 
 fn signature_bytes(what: &str, hex_value: &str) -> Result<[u8; 65], String> {
@@ -147,21 +229,21 @@ pub async fn node_boxes(
 /// Checks run before the recipient's key proves the reserve input. Returns the index of the
 /// payout output.
 ///
+/// - The build is an ERG redemption whose fee the recipient pays (`fee_paid_by` `recipient`):
+///   the fee is at most `max_fee`, the payout is `amount - fee`, and there is no change.
 /// - The boxes are the ones the transaction names; data input 0 is the tracker box (token 0 is
 ///   the tracker NFT, R4 the tracker key that signed the redemption).
-/// - Input 0 is the issuer's reserve under the contract compiled into this build (R4 = issuer,
-///   R6 = tracker NFT, one token: its NFT). Every other input is a token-free `P2PK(tracker)`
-///   box, so the recipient's proof spends nothing but the reserve.
+/// - The only input is the issuer's reserve under the contract compiled into this build (R4 =
+///   issuer, R6 = tracker NFT, one token: its NFT), so the recipient's proof spends nothing else.
 /// - The reserve input's context extension is in Scala's serialization order (the node computes
 ///   the id from it) and holds: #0 = redeem into output 0, #1 = recipient, #2 = the issuer's note
 ///   signature, #3 = committed total, #4 = note timestamp, #5 and #8 proofs, #6 the tracker's
 ///   signature (verified), #7 exactly when the reserve tree already has this note.
-/// - Output 0 keeps the reserve (script, tokens, R4, R6, R7) minus exactly `amount`; one output
-///   pays exactly `amount` to `P2PK(recipient)` with no token; the others are the miner fee and
-///   token-free change to the tracker.
+/// - The outputs are exactly: 0 the reserve (script, tokens, R4, R6, R7) minus `amount`, 1 the
+///   token-free payout of `amount - fee` to `P2PK(recipient)`, 2 the token-free miner fee.
 /// - ERG in equals ERG out, no token is minted or burned, and the reserve NFT stays first in
 ///   output 0.
-/// - The fee-signed transaction is this one, with proofs for every input but the reserve's.
+/// - The build's transaction with empty proofs is this one: the tracker signed nothing.
 pub fn check_redemption(
     unsigned: &UnsignedTransaction,
     partial: &Transaction,
@@ -170,10 +252,45 @@ pub fn check_redemption(
     build: &BuildResponse,
     expect: &Expectation,
 ) -> Result<usize, String> {
+    // Who pays the fee, and how much.
+    if build.fee_paid_by != FEE_PAID_BY_RECIPIENT {
+        return Err(format!(
+            "the build says the miner fee is paid by {:?}; an ERG redemption takes it from the \
+             payout ({FEE_PAID_BY_RECIPIENT:?}), the only layout this tool signs",
+            build.fee_paid_by
+        ));
+    }
+    if build.fee > expect.max_fee {
+        return Err(format!(
+            "the miner fee {} nanoERG is above the limit {} nanoERG (--max-fee-nano); it comes \
+             out of the payout",
+            build.fee, expect.max_fee
+        ));
+    }
+    let payout_value = expect
+        .amount
+        .checked_sub(build.fee)
+        .filter(|v| *v > 0)
+        .ok_or("the miner fee is not below the amount")?;
+    if build.recipient_output_value != payout_value
+        || build.change_amount != 0
+        || !build.change_address.is_empty()
+    {
+        return Err(format!(
+            "the build reports a payout of {} nanoERG and change {} to {:?}; expected {} (the \
+             amount {} minus the fee {}) and no change",
+            build.recipient_output_value,
+            build.change_amount,
+            build.change_address,
+            payout_value,
+            expect.amount,
+            build.fee
+        ));
+    }
+
     tx::check_box_ids(unsigned, inputs, data_inputs)?;
     let reserve_tree = tx::reserve_tree()?;
     let recipient_tree = tx::p2pk_tree(&expect.recipient)?;
-    let tracker_tree = tx::p2pk_tree(&expect.tracker_pubkey)?;
     let nft = tx::coll_bytes(&expect.tracker_nft);
     if expect.tracker_pubkey == expect.recipient {
         return Err("the tracker key is the recipient key".to_string());
@@ -202,8 +319,13 @@ pub fn check_redemption(
         ));
     }
 
-    // Inputs.
-    let reserve = inputs.first().ok_or("the transaction has no inputs")?;
+    // The only input: the reserve.
+    let [reserve] = inputs else {
+        return Err(format!(
+            "the transaction spends {} inputs; an ERG redemption spends only the reserve",
+            inputs.len()
+        ));
+    };
     if String::from(reserve.box_id()) != build.reserve_box_id {
         return Err("input 0 is not the build's reserve box".to_string());
     }
@@ -229,22 +351,9 @@ pub fn check_redemption(
             ))
         }
     };
-    for (i, b) in inputs.iter().enumerate().skip(1) {
-        if b.ergo_tree != tracker_tree || !tx::box_tokens(b).is_empty() {
-            return Err(format!(
-                "input {i} is not a token-free P2PK(tracker) box; the recipient's proof could \
-                 spend it"
-            ));
-        }
-    }
 
-    // Context extensions.
+    // The reserve input's context extension.
     let unsigned_inputs = unsigned.inputs.as_vec();
-    for (i, input) in unsigned_inputs.iter().enumerate().skip(1) {
-        if !input.extension.values.is_empty() {
-            return Err(format!("fee input {i} has a context extension"));
-        }
-    }
     let extension = &unsigned_inputs[0].extension.values;
     let keys: Vec<u8> = extension.keys().copied().collect();
     let mut sorted = keys.clone();
@@ -326,9 +435,15 @@ pub fn check_redemption(
     basis_store::schnorr::schnorr_verify(&tracker_signature, &message, &expect.tracker_pubkey)
         .map_err(|_| "context var #6 is not the tracker's signature over the note message")?;
 
-    // Outputs.
+    // Outputs: the reserve, the payout, the miner fee.
     let outputs = unsigned.output_candidates.as_vec();
-    let reserve_out = outputs.first().ok_or("the transaction has no outputs")?;
+    let [reserve_out, payout, fee_out] = outputs.as_slice() else {
+        return Err(format!(
+            "{} outputs; an ERG redemption has exactly three: the reserve, the payout and the \
+             miner fee",
+            outputs.len()
+        ));
+    };
     let reserve_left = reserve
         .value
         .as_u64()
@@ -354,60 +469,54 @@ pub fn check_redemption(
     {
         return Err("output 0 changes the reserve's refund height (R7)".to_string());
     }
-    let fee_tree = tx::fee_tree()?;
-    let mut payout = None;
-    for (i, o) in outputs.iter().enumerate().skip(1) {
-        if o.ergo_tree == recipient_tree {
-            if payout.is_some() || *o.value.as_u64() != expect.amount || o.tokens.is_some() {
-                return Err(format!(
-                    "output {i} to the recipient is not the single token-free payout of {} \
-                     nanoERG",
-                    expect.amount
-                ));
-            }
-            payout = Some(i);
-        } else if o.ergo_tree == fee_tree || o.ergo_tree == tracker_tree {
-            if o.tokens.is_some() {
-                return Err(format!("output {i} carries tokens"));
-            }
-        } else {
-            return Err(format!("output {i} goes to an unexpected script"));
-        }
+    if payout.ergo_tree != recipient_tree {
+        return Err("output 1 goes to an unexpected script, not P2PK(recipient)".to_string());
     }
-    let payout = payout.ok_or("no output pays the recipient")?;
-    if !outputs.iter().any(|o| o.ergo_tree == fee_tree) {
-        return Err("no miner fee output".to_string());
+    if *payout.value.as_u64() != payout_value || payout.tokens.is_some() {
+        return Err(format!(
+            "output 1 pays {} nanoERG to the recipient; expected {payout_value} (the amount {} \
+             minus the miner fee {}) and no token",
+            payout.value.as_u64(),
+            expect.amount,
+            build.fee
+        ));
+    }
+    if fee_out.ergo_tree != tx::fee_tree()?
+        || *fee_out.value.as_u64() != build.fee
+        || fee_out.tokens.is_some()
+    {
+        return Err(format!(
+            "output 2 is not the token-free miner fee of {} nanoERG",
+            build.fee
+        ));
     }
 
     tx::check_erg_preserved(inputs, outputs)?;
     local_wallet::check_tokens_preserved(inputs, outputs, None)?;
     local_wallet::check_nft_only_in_output0(outputs, &reserve_nft)?;
 
-    // The fee-signed transaction.
+    // The build's transaction with empty proofs: the tracker signed nothing.
     if partial.id() != unsigned.id() {
-        return Err(
-            "the build's fee-signed transaction is not its unsigned transaction".to_string(),
-        );
+        return Err("the build's partial transaction is not its unsigned transaction".to_string());
     }
-    let partial_inputs = partial.inputs.as_vec();
-    if partial_inputs.len() != unsigned_inputs.len() {
-        return Err("the fee-signed transaction has another number of inputs".to_string());
-    }
-    for (i, input) in partial_inputs.iter().enumerate() {
-        let empty = Vec::<u8>::from(input.spending_proof.proof.clone()).is_empty();
-        if i == 0 && !empty {
-            return Err("the build already holds a proof for the reserve input".to_string());
-        }
-        if i > 0 && empty {
-            return Err(format!("fee input {i} has no proof in the build"));
+    match partial.inputs.as_vec().as_slice() {
+        [input] if Vec::<u8>::from(input.spending_proof.proof.clone()).is_empty() => {}
+        [_] => return Err("the build already holds a proof for the reserve input".to_string()),
+        other => {
+            return Err(format!(
+                "the build's partial transaction has {} inputs",
+                other.len()
+            ))
         }
     }
-    Ok(payout)
+    Ok(1)
 }
 
-/// Submit through `POST /redemption/submit`; through the node's `POST /transactions` if the
-/// tracker refuses or cannot be reached. Returns the id and which path was used.
-async fn submit(
+/// Submit through `POST /redemption/submit`, and through the node's `POST /transactions` when the
+/// tracker cannot submit it (no answer, or any refusal but 409). A 409 means the tracker no
+/// longer holds this build: a newer build of the note replaced it, or it expired. Nothing is
+/// sent anywhere then, so the newer build is the only one that can be submitted. Returns the id.
+pub async fn submit(
     context: &Context,
     signed: &Transaction,
     build: &BuildResponse,
@@ -431,7 +540,16 @@ async fn submit(
         Ok(response) => {
             report.line(format!("HTTP {}", response.status));
             report.line(response.pretty());
-            response.data("POST /redemption/submit", 200)
+            match response.data("POST /redemption/submit", 200) {
+                Err(e) if response.status == 409 => {
+                    return Err(format!(
+                        "{e}; the tracker no longer holds this build (a newer build of the note \
+                         replaced it, or it expired), so nothing was submitted, not through the \
+                         node either: run redeem again"
+                    ));
+                }
+                result => result,
+            }
         }
         Err(e) => Err(e),
     };
@@ -489,12 +607,14 @@ async fn submit(
     }
 }
 
-/// `redeem`.
+/// `redeem`: `amount` of the issuer's debt to the recipient, of which the payout is
+/// `amount - fee` and the miner fee at most `max_fee`.
 pub async fn redeem(
     context: &Context,
     recipient: &FileKey,
     issuer: &[u8; 33],
     amount: u64,
+    max_fee: u64,
     dry_run: bool,
     report: &mut Report,
 ) -> Result<(), String> {
@@ -618,24 +738,36 @@ pub async fn redeem(
         hex::encode(tracker_pubkey)
     ));
 
-    // 4. The build.
-    let build_request = json!({
-        "issuer_pubkey": hex::encode(issuer),
-        "recipient_pubkey": hex::encode(recipient_pk),
-        "amount": amount,
-        "timestamp": note.timestamp,
-        "issuer_signature": hex::encode(issuer_signature),
-        "emergency": false,
-        "denomination": "erg",
-    });
+    // 4. The build, asked for with the recipient's signature.
+    let request = signed_build_request(
+        recipient,
+        issuer,
+        amount,
+        &issuer_signature,
+        &context.tracker_nft,
+        now_ms(),
+    )?;
     report.line(format!(
-        "POST {}/redemption/build {build_request} (counts against the tracker's hourly build \
-         caps)",
-        context.tracker.url()
+        "build request signed by the recipient at request_timestamp {} ms; message ({} bytes: \
+         \"basis-build-v1\", tracker NFT, issuer, recipient, \"erg\", amount, request \
+         timestamp): {}",
+        request.request_timestamp,
+        request.message.len(),
+        hex::encode(&request.message)
+    ));
+    report.line(format!(
+        "receiver signature (65 bytes: a, z), verified: {}",
+        hex::encode(request.signature)
+    ));
+    report.line(format!(
+        "POST {}/redemption/build {} (counts against the tracker's hourly build caps; the next \
+         build request of this recipient must carry a later request_timestamp)",
+        context.tracker.url(),
+        request.body
     ));
     let response = context
         .tracker
-        .post("/redemption/build", &build_request)
+        .post("/redemption/build", &request.body)
         .await?;
     report.line(format!("HTTP {}", response.status));
     let data = match response.data("POST /redemption/build", 200) {
@@ -648,24 +780,23 @@ pub async fn redeem(
     let build: BuildResponse = serde_json::from_value(data)
         .map_err(|e| format!("POST /redemption/build: unexpected answer: {e}"))?;
     report.line(format!(
-        "build: reserve {} -> {} nanoERG; payout {} nanoERG; committed total debt {}; reserve \
-         tree value after: {} redeemed; first redemption: {}; fee {} nanoERG and change {} \
-         nanoERG to {} paid by the tracker",
+        "build: reserve {} -> {} nanoERG; payout {} nanoERG (the amount {amount} minus the miner \
+         fee {} nanoERG, fee paid by: {}); committed total debt {}; reserve tree value after: {} \
+         redeemed; first redemption: {}",
         build.reserve_box_id,
         build.reserve_output_value,
         build.recipient_output_value,
+        build.fee,
+        build.fee_paid_by,
         build.total_debt,
         build.new_already_redeemed,
-        build.is_first_redemption,
-        build.fee,
-        build.change_amount,
-        build.change_address
+        build.is_first_redemption
     ));
 
     let unsigned: UnsignedTransaction = serde_json::from_value(build.unsigned_tx.clone())
         .map_err(|e| format!("the build's unsigned transaction does not parse: {e}"))?;
     let partial: Transaction = serde_json::from_value(build.partial_tx.clone())
-        .map_err(|e| format!("the build's fee-signed transaction does not parse: {e}"))?;
+        .map_err(|e| format!("the build's partial transaction does not parse: {e}"))?;
     let build_state = local_wallet::state_context_from_headers(build.headers.clone())
         .map_err(|e| format!("the build's headers: {e}"))?;
 
@@ -680,16 +811,19 @@ pub async fn redeem(
         issuer_signature,
         tracker_nft: context.tracker_nft,
         tracker_pubkey,
+        max_fee,
     };
     let payout_index =
         check_redemption(&unsigned, &partial, &inputs, &data_inputs, &build, &expect)?;
-    report.line(
-        "checks before signing: OK (boxes re-read from the node; reserve input under the \
-         compiled contract, owned by the issuer, bound to our tracker NFT; every other input \
-         P2PK(tracker); context extension in Scala order with the note's values and verified \
-         signatures; reserve output keeps everything but the amount; one exact payout to \
-         P2PK(recipient); ERG in = ERG out; no token minted or burned)",
-    );
+    report.line(format!(
+        "checks before signing: OK (boxes re-read from the node; the only input is the issuer's \
+         reserve under the compiled contract, bound to our tracker NFT; context extension in \
+         Scala order with the note's values and verified signatures; outputs: the reserve minus \
+         the amount, the payout of the amount minus the fee to P2PK(recipient), the miner fee \
+         {} <= {max_fee} nanoERG; ERG in = ERG out; no token minted or burned; the tracker \
+         signed nothing)",
+        build.fee
+    ));
 
     let reserve_tree = tx::reserve_tree()?;
     let recipient_tree = tx::p2pk_tree(&recipient_pk)?;
@@ -758,4 +892,96 @@ pub async fn redeem(
     submit(context, &signed, &build, &expect, report).await?;
     report.line(format!("payout: {payout_line}"));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(h: &str) -> [u8; 33] {
+        hex::decode(h).unwrap().try_into().unwrap()
+    }
+
+    /// The worked examples of `basis_core` (`types.rs`, `worked_examples_of_the_signed_messages`):
+    /// the canary signs exactly these bytes. Issuer G, receiver 2G, tracker NFT 0x5a * 32,
+    /// 2026-11-22T00:00:00Z in ms.
+    #[test]
+    fn the_signed_messages_are_the_worked_examples() {
+        let issuer = key("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+        let receiver = key("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5");
+        let nft = [0x5a; 32];
+        let ts = 1_795_305_600_000u64;
+
+        // The note (and what /tracker/signature signs): 80 bytes.
+        let note = note_message(&issuer, &receiver, 1_000_000_000, ts, &nft).unwrap();
+        assert_eq!(
+            hex::encode(note),
+            concat!(
+                "87262ce92e4cc9c99666eb41bcab2a75ed76c937b50f9e441b4f5806138228ee",
+                "000000003b9aca00",
+                "000001a2008d7400",
+                "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+            )
+        );
+
+        // The build request of POST /redemption/build: 131 bytes for ERG.
+        let build = build_request_message(&nft, &issuer, &receiver, 500_000_000, ts + 60_000);
+        assert_eq!(build.len(), 131);
+        assert_eq!(
+            hex::encode(&build),
+            concat!(
+                "62617369732d6275696c642d7631",
+                "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+                "657267",
+                "000000001dcd6500",
+                "000001a2008e5e60"
+            )
+        );
+    }
+
+    /// The body carries the recipient's signature over exactly those bytes, verified with the
+    /// tracker's verifier, and no secret.
+    #[test]
+    fn the_build_request_is_signed_by_the_recipient() {
+        let (secret, _) = basis_store::schnorr::generate_keypair();
+        let recipient = FileKey::from_secret(secret).unwrap();
+        let issuer = basis_store::schnorr::generate_keypair().1;
+        let nft = [0x5a; 32];
+        let ts = 1_795_305_660_000u64;
+        let request =
+            signed_build_request(&recipient, &issuer, 500_000_000, &[0x11; 65], &nft, ts).unwrap();
+        let message =
+            build_request_message(&nft, &issuer, &recipient.public_key(), 500_000_000, ts);
+        assert_eq!(request.message, message);
+        basis_store::schnorr::schnorr_verify(&request.signature, &message, &recipient.public_key())
+            .unwrap();
+        // Not valid for another amount or another timestamp.
+        for other in [
+            build_request_message(&nft, &issuer, &recipient.public_key(), 500_000_001, ts),
+            build_request_message(&nft, &issuer, &recipient.public_key(), 500_000_000, ts + 1),
+        ] {
+            assert!(basis_store::schnorr::schnorr_verify(
+                &request.signature,
+                &other,
+                &recipient.public_key()
+            )
+            .is_err());
+        }
+        let body = &request.body;
+        assert_eq!(body["recipient_pubkey"], json!(recipient.public_key_hex()));
+        assert_eq!(body["issuer_pubkey"], json!(hex::encode(issuer)));
+        assert_eq!(body["amount"], json!(500_000_000u64));
+        assert_eq!(body["denomination"], json!("erg"));
+        assert_eq!(body["request_timestamp"], json!(ts));
+        assert_eq!(
+            body["receiver_signature"],
+            json!(hex::encode(request.signature))
+        );
+        assert_eq!(body["emergency"], json!(false));
+        let text = body.to_string();
+        assert!(!text.contains(&hex::encode(secret)));
+        assert!(!text.contains(&hex::encode_upper(secret)));
+    }
 }

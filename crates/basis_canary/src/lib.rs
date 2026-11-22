@@ -8,8 +8,9 @@
 //! 2. `note`: A signs the cumulative debt to B (the 80-byte Basis message) and posts it to
 //!    `POST /notes`. The tracker commits it in its next tracker box update.
 //! 3. `redeem`: B redeems from A's reserve with the tracker's help: `POST /tracker/signature`,
-//!    `POST /redemption/build`, a local proof of the reserve input with B's key, full validation,
-//!    then `POST /redemption/submit` (or the node, if the tracker refuses).
+//!    `POST /redemption/build` asked for with B's signature, a local proof of the reserve input
+//!    (the only input; the miner fee comes out of B's payout) with B's key, full validation, then
+//!    `POST /redemption/submit` (or the node, if the tracker cannot submit it).
 //!
 //! `status` reads the tracker's view of a key and `key-info` prints a key's public key and address.
 //!
@@ -155,11 +156,21 @@ pub async fn run(cli: Cli, report: &mut Report) -> Result<(), String> {
             secret_file,
             issuer_pubkey,
             amount,
+            max_fee_nano,
             dry_run,
         } => {
             let recipient = FileKey::read(secret_file)?;
             let issuer = tx::parse_pubkey("--issuer-pubkey", issuer_pubkey)?;
-            redeem::redeem(&context()?, &recipient, &issuer, *amount, *dry_run, report).await
+            redeem::redeem(
+                &context()?,
+                &recipient,
+                &issuer,
+                *amount,
+                *max_fee_nano,
+                *dry_run,
+                report,
+            )
+            .await
         }
     }
 }

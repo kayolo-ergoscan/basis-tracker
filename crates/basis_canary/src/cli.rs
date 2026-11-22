@@ -88,11 +88,16 @@ pub enum Command {
         /// Issuer (debtor, reserve owner) public key: 66 hex characters.
         #[arg(long)]
         issuer_pubkey: String,
-        /// Amount to redeem now, in nanoERG.
+        /// Amount to redeem now, in nanoERG: the reserve gives this much, the payout is this
+        /// minus the miner fee.
         #[arg(long)]
         amount: u64,
+        /// Largest miner fee, in nanoERG, the redemption may take out of the payout.
+        #[arg(long, value_name = "NANOERG", default_value_t = crate::tx::FEE)]
+        max_fee_nano: u64,
         /// Ask the tracker to build the redemption, print it, prove and validate it locally,
-        /// and submit nothing. The build still counts against the tracker's hourly caps.
+        /// and submit nothing. The build still counts against the tracker's hourly caps, and
+        /// the next build request must carry a later request_timestamp (the next run's clock).
         #[arg(long)]
         dry_run: bool,
     },
