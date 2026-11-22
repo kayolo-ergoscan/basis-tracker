@@ -8,6 +8,16 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ergo_lib::chain::ergo_state_context::ErgoStateContext;
+use ergo_lib::chain::parameters::Parameters;
+use ergo_lib::chain::transaction::unsigned::UnsignedTransaction;
+use ergo_lib::chain::transaction::Transaction;
+use ergo_lib::ergo_chain_types::{Header, PreHeader};
+use ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox;
+use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+use ergo_lib::wallet::secret_key::SecretKey;
+use ergo_lib::wallet::signing::TransactionContext;
+use ergo_lib::wallet::Wallet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -246,6 +256,197 @@ pub fn select_fee_boxes(boxes: &[UnspentBox], required: u64) -> Option<(Vec<Unsp
     None
 }
 
+/// Whether `s` is a 32-byte id in hex (box, token or transaction id).
+pub fn is_hex_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Read one box from the node's UTXO set through `GET /utxo/byIdBinary/{box_id}` and parse it.
+/// The box id computed from the returned bytes must equal `box_id`.
+pub async fn fetch_box(node: &NodeEndpoint, box_id: &str) -> Result<ErgoBox, String> {
+    if !is_hex_id(box_id) {
+        return Err(format!("not a box id: {box_id:?}"));
+    }
+    let (status, text) = node.get(&format!("/utxo/byIdBinary/{box_id}")).await?;
+    if status == 404 {
+        return Err(format!(
+            "box {box_id} is not in the node's UTXO set (spent or not confirmed yet)"
+        ));
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "GET /utxo/byIdBinary/{box_id} HTTP {status}: {text}"
+        ));
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse /utxo/byIdBinary/{box_id}: {e}"))?;
+    let bytes_hex = value["bytes"]
+        .as_str()
+        .ok_or_else(|| format!("/utxo/byIdBinary/{box_id}: no 'bytes' field"))?;
+    let bytes = hex::decode(bytes_hex).map_err(|e| format!("box {box_id} bytes: {e}"))?;
+    let ergo_box =
+        ErgoBox::sigma_parse_bytes(&bytes).map_err(|e| format!("parse box {box_id}: {e}"))?;
+    let parsed_id = String::from(ergo_box.box_id());
+    if !parsed_id.eq_ignore_ascii_case(box_id) {
+        return Err(format!(
+            "node returned box {parsed_id} when asked for {box_id}"
+        ));
+    }
+    Ok(ergo_box)
+}
+
+/// Signing context from the node's last 10 headers. `GET /blocks/lastHeaders/10` lists them
+/// oldest first; the context wants the newest first, and its pre-header is the newest header
+/// (so `pre_header.height` is the chain tip the outputs are created at).
+pub fn state_context_from_headers(mut headers: Vec<Header>) -> Result<ErgoStateContext, String> {
+    if headers.len() < 10 {
+        return Err(format!("need 10 block headers, got {}", headers.len()));
+    }
+    headers.sort_by(|a, b| b.height.cmp(&a.height));
+    headers.truncate(10);
+    let pre_header = PreHeader::from(headers[0].clone());
+    let headers: [Header; 10] = headers
+        .try_into()
+        .map_err(|_| "need exactly 10 block headers".to_string())?;
+    Ok(ErgoStateContext::new(
+        pre_header,
+        headers,
+        Parameters::default(),
+    ))
+}
+
+/// [`state_context_from_headers`] over `GET /blocks/lastHeaders/10` on `node`.
+pub async fn fetch_state_context(node: &NodeEndpoint) -> Result<ErgoStateContext, String> {
+    let (status, text) = node.get("/blocks/lastHeaders/10").await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("GET /blocks/lastHeaders/10 HTTP {status}: {text}"));
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse last headers: {e}"))?;
+    let headers: Vec<Header> =
+        serde_json::from_value(value).map_err(|e| format!("parse last headers: {e}"))?;
+    state_context_from_headers(headers)
+}
+
+/// The tracker's signing key, parsed from `ergo.tracker_secret_key`.
+///
+/// The scalar never leaves the process: it is only handed to the local prover. `Debug`
+/// prints the public key alone, and no error message contains the secret.
+#[derive(Clone)]
+pub struct TrackerKey {
+    secret: SecretKey,
+    public: [u8; 33],
+}
+
+impl std::fmt::Debug for TrackerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackerKey")
+            .field("public", &hex::encode(self.public))
+            .finish_non_exhaustive()
+    }
+}
+
+impl TrackerKey {
+    /// Parse a 32-byte big-endian secp256k1 scalar. Zero and values at or above the group
+    /// order are rejected.
+    pub fn from_secret_bytes(bytes: &[u8; 32]) -> Result<Self, String> {
+        let secret = SecretKey::dlog_from_bytes(bytes).ok_or_else(|| {
+            "tracker secret key is not a valid secp256k1 scalar (it must be below the group order)"
+                .to_string()
+        })?;
+        let public = match &secret {
+            SecretKey::DlogSecretKey(dlog) => {
+                if dlog.is_zero() {
+                    return Err("tracker secret key is zero".to_string());
+                }
+                let encoded = dlog
+                    .public_image()
+                    .h
+                    .sigma_serialize_bytes()
+                    .map_err(|e| format!("encode tracker public key: {e}"))?;
+                <[u8; 33]>::try_from(encoded.as_slice())
+                    .map_err(|_| "tracker public key is not 33 bytes".to_string())?
+            }
+            _ => return Err("tracker secret key is not a dlog secret".to_string()),
+        };
+        Ok(Self { secret, public })
+    }
+
+    /// The compressed public key `sk·G`.
+    pub fn public_key(&self) -> [u8; 33] {
+        self.public
+    }
+
+    /// Hex ErgoTree of `P2PK(sk·G)`.
+    pub fn p2pk_tree_hex(&self) -> String {
+        p2pk_tree_hex(&self.public)
+    }
+
+    /// Prove every input of `unsigned` with this key, then validate the signed transaction
+    /// against `state` (ERG and token preservation, dust, heights, every proof).
+    ///
+    /// `inputs` must be the boxes `unsigned` spends, in order. Every one of them must be locked by
+    /// exactly `P2PK(sk·G)`: the tracker never signs anything else.
+    pub fn sign(
+        &self,
+        unsigned: UnsignedTransaction,
+        inputs: Vec<ErgoBox>,
+        data_inputs: Vec<ErgoBox>,
+        state: &ErgoStateContext,
+    ) -> Result<Transaction, String> {
+        let own_tree = hex::decode(self.p2pk_tree_hex()).map_err(|e| e.to_string())?;
+        for (i, input) in inputs.iter().enumerate() {
+            let tree = input
+                .ergo_tree
+                .sigma_serialize_bytes()
+                .map_err(|e| format!("input {i} tree: {e}"))?;
+            if tree != own_tree {
+                return Err(format!(
+                    "input {i} ({}) is not locked by P2PK(tracker key); refusing to sign",
+                    String::from(input.box_id())
+                ));
+            }
+        }
+        let context = TransactionContext::new(unsigned, inputs.clone(), data_inputs.clone())
+            .map_err(|e| format!("transaction context: {e}"))?;
+        let wallet = Wallet::from_secrets(vec![self.secret.clone()]);
+        let signed = wallet
+            .sign_transaction(context, state, None)
+            .map_err(|e| format!("local signing failed: {e}"))?;
+        TransactionContext::new(signed.clone(), inputs, data_inputs)
+            .map_err(|e| format!("transaction context: {e}"))?
+            .validate(state)
+            .map_err(|e| format!("signed transaction does not validate: {e}"))?;
+        Ok(signed)
+    }
+}
+
+/// Submit a signed transaction through `POST /transactions` and return its id.
+pub async fn broadcast(node: &NodeEndpoint, tx: &Transaction) -> Result<String, String> {
+    let local_id = String::from(tx.id());
+    let body = serde_json::to_value(tx).map_err(|e| format!("encode transaction: {e}"))?;
+    let (status, text) = node.post_json("/transactions", &[], &body).await?;
+    if !(200..300).contains(&status) {
+        return Err(format!("POST /transactions HTTP {status}: {text}"));
+    }
+    // The node answers with the id as a JSON string.
+    let node_id = match serde_json::from_str::<Value>(&text) {
+        Ok(Value::String(id)) => id,
+        Ok(Value::Object(map)) => map
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        _ => text.trim().trim_matches('"').to_string(),
+    };
+    if !node_id.is_empty() && !node_id.eq_ignore_ascii_case(&local_id) {
+        return Err(format!(
+            "node accepted the transaction under id {node_id}, expected {local_id}"
+        ));
+    }
+    Ok(local_id)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -345,10 +546,11 @@ pub(crate) mod tests {
         pub body: String,
     }
 
-    /// Minimal HTTP/1.1 server on 127.0.0.1 answering every request with `respond(target)`
-    /// (`(status, body)`) and recording what it received. Never touches the network.
+    /// Minimal HTTP/1.1 server on 127.0.0.1 answering every request with
+    /// `respond(method, target, body)` (`(status, body)`) and recording what it received.
+    /// Never touches the network.
     pub(crate) async fn mock_node(
-        respond: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
+        respond: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> (String, Arc<Mutex<Vec<Seen>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -396,7 +598,7 @@ pub(crate) mod tests {
                     let mut request_line = head.lines().next().unwrap_or("").split_whitespace();
                     let method = request_line.next().unwrap_or("").to_string();
                     let target = request_line.next().unwrap_or("").to_string();
-                    let (status, payload) = respond(&method, &target);
+                    let (status, payload) = respond(&method, &target, &body);
                     seen.lock().unwrap().push(Seen {
                         method,
                         target,
@@ -448,7 +650,7 @@ pub(crate) mod tests {
     async fn scan_uses_public_by_address_and_skips_token_boxes() {
         let tree = p2pk_tree_hex(&PK);
         let tree_for_node = tree.clone();
-        let (url, seen) = mock_node(move |_, target| {
+        let (url, seen) = mock_node(move |_, target, _| {
             let offset = query_param(target, "offset").unwrap_or_default();
             let page: Vec<Value> = match offset.as_str() {
                 // Page 0: a full page (100 boxes): the NFT box, a foreign token box, and
@@ -536,7 +738,7 @@ pub(crate) mod tests {
         let tree_for_node = tree.clone();
         let (url, seen) =
             mock_node(
-                move |_, target| match query_param(target, "offset").as_deref() {
+                move |_, target, _| match query_param(target, "offset").as_deref() {
                     Some("0") => (
                         200,
                         Value::Array(vec![box_json(
@@ -563,17 +765,301 @@ pub(crate) mod tests {
         );
 
         let (url404, _) =
-            mock_node(|_, _| (404, r#"{"error":404,"reason":"not-found"}"#.to_string())).await;
+            mock_node(|_, _, _| (404, r#"{"error":404,"reason":"not-found"}"#.to_string())).await;
         let scan = scan_fee_boxes(&NodeEndpoint::new(&url404, None), "9addr", &tree, &[], 1)
             .await
             .unwrap();
         assert!(scan.boxes.is_empty());
 
-        let (url500, _) = mock_node(|_, _| (500, "boom".to_string())).await;
+        let (url500, _) = mock_node(|_, _, _| (500, "boom".to_string())).await;
         assert!(
             scan_fee_boxes(&NodeEndpoint::new(&url500, None), "9addr", &tree, &[], 1)
                 .await
                 .is_err()
         );
+    }
+
+    // ----- local signing -----
+
+    use ergo_lib::chain::transaction::unsigned::UnsignedTransaction;
+    use ergo_lib::chain::transaction::{TxId, UnsignedInput};
+    use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
+    use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{
+        BoxTokens, ErgoBoxCandidate, NonMandatoryRegisters,
+    };
+    use ergo_lib::ergotree_ir::chain::token::{Token, TokenAmount, TokenId};
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+    use ergo_lib::ergotree_ir::mir::constant::Constant;
+
+    /// Real mainnet-format headers (heights 123405..=123414, oldest first) from the Scala
+    /// client's test fixtures.
+    pub(crate) const LAST_HEADERS_JSON: &str = include_str!(
+        "../../../scala/src/test/resources/mockwebserver/node_responses/response_LastHeaders.json"
+    );
+
+    pub(crate) fn fixture_headers() -> Vec<Header> {
+        serde_json::from_str(LAST_HEADERS_JSON).unwrap()
+    }
+
+    pub(crate) fn fixture_state() -> ErgoStateContext {
+        state_context_from_headers(fixture_headers()).unwrap()
+    }
+
+    /// A freshly generated key: tests never use a real one.
+    pub(crate) fn fresh_key() -> ([u8; 32], TrackerKey) {
+        let (secret, _) = basis_store::schnorr::generate_keypair();
+        let key = TrackerKey::from_secret_bytes(&secret).unwrap();
+        (secret, key)
+    }
+
+    pub(crate) fn tree_of(pubkey: &[u8; 33]) -> ErgoTree {
+        ErgoTree::sigma_parse_bytes(&hex::decode(p2pk_tree_hex(pubkey)).unwrap()).unwrap()
+    }
+
+    /// A box as the UTXO set would hold it. `index` keeps ids distinct.
+    pub(crate) fn utxo_box(
+        tree: &ErgoTree,
+        value: u64,
+        tokens: &[([u8; 32], u64)],
+        registers_hex: &[&str],
+        creation_height: u32,
+        index: u16,
+    ) -> ErgoBox {
+        let tokens = if tokens.is_empty() {
+            None
+        } else {
+            Some(
+                BoxTokens::from_vec(
+                    tokens
+                        .iter()
+                        .map(|(id, amount)| Token {
+                            token_id: TokenId::from_str(&hex::encode(id)).unwrap(),
+                            amount: TokenAmount::try_from(*amount).unwrap(),
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            )
+        };
+        let registers: Vec<Constant> = registers_hex
+            .iter()
+            .map(|h| Constant::sigma_parse_bytes(&hex::decode(h).unwrap()).unwrap())
+            .collect();
+        ErgoBox::new(
+            BoxValue::try_from(value).unwrap(),
+            tree.clone(),
+            tokens,
+            NonMandatoryRegisters::try_from(registers).unwrap(),
+            creation_height,
+            TxId::zero(),
+            index,
+        )
+        .unwrap()
+    }
+
+    use std::str::FromStr;
+
+    #[test]
+    fn tracker_key_derives_the_public_key_and_rejects_bad_scalars() {
+        // sk = 1 gives the generator point.
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        assert_eq!(
+            TrackerKey::from_secret_bytes(&one).unwrap().public_key(),
+            PK
+        );
+
+        // Same public key as the secp256k1 crate derives for a fresh secret.
+        let (secret, expected_pk) = basis_store::schnorr::generate_keypair();
+        assert_eq!(
+            TrackerKey::from_secret_bytes(&secret).unwrap().public_key(),
+            expected_pk
+        );
+
+        assert!(TrackerKey::from_secret_bytes(&[0u8; 32])
+            .unwrap_err()
+            .contains("zero"));
+        // The group order n and anything above it are not scalars.
+        let n = hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+            .unwrap();
+        let n: [u8; 32] = n.try_into().unwrap();
+        assert!(TrackerKey::from_secret_bytes(&n).is_err());
+        assert!(TrackerKey::from_secret_bytes(&[0xff; 32]).is_err());
+
+        // Debug never shows the secret.
+        let printed = format!("{:?}", TrackerKey::from_secret_bytes(&secret).unwrap());
+        assert!(!printed.contains(&hex::encode(secret)));
+    }
+
+    #[test]
+    fn state_context_puts_the_newest_header_first() {
+        let state = fixture_state();
+        assert_eq!(state.pre_header.height, 123_414);
+        assert_eq!(state.headers[0].height, 123_414);
+        assert_eq!(state.headers[9].height, 123_405);
+        assert!(state_context_from_headers(fixture_headers()[..9].to_vec()).is_err());
+    }
+
+    fn spend_all_to(
+        inputs: &[ErgoBox],
+        out_tree: &ErgoTree,
+        fee: u64,
+        height: u32,
+    ) -> UnsignedTransaction {
+        let total: u64 = inputs.iter().map(|b| *b.value.as_u64()).sum();
+        let fee_tree = ErgoTree::sigma_parse_bytes(
+            &hex::decode(ergo_lib::wallet::miner_fee::MINERS_FEE_BASE16_BYTES).unwrap(),
+        )
+        .unwrap();
+        UnsignedTransaction::new_from_vec(
+            inputs
+                .iter()
+                .map(|b| UnsignedInput::new(b.box_id(), ContextExtension::empty()))
+                .collect(),
+            vec![],
+            vec![
+                ErgoBoxCandidate {
+                    value: BoxValue::try_from(total - fee).unwrap(),
+                    ergo_tree: out_tree.clone(),
+                    tokens: None,
+                    additional_registers: NonMandatoryRegisters::empty(),
+                    creation_height: height,
+                },
+                ErgoBoxCandidate {
+                    value: BoxValue::try_from(fee).unwrap(),
+                    ergo_tree: fee_tree,
+                    tokens: None,
+                    additional_registers: NonMandatoryRegisters::empty(),
+                    creation_height: height,
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sign_proves_own_inputs_and_validates() {
+        let (_, key) = fresh_key();
+        let tree = tree_of(&key.public_key());
+        let state = fixture_state();
+        let inputs = vec![
+            utxo_box(&tree, 3_000_000, &[], &[], 123_000, 0),
+            utxo_box(&tree, 2_000_000, &[], &[], 123_001, 1),
+        ];
+        let unsigned = spend_all_to(&inputs, &tree, 1_000_000, 123_414);
+        let signed = key.sign(unsigned, inputs, vec![], &state).unwrap();
+        assert_eq!(signed.inputs.len(), 2);
+        for input in signed.inputs.iter() {
+            assert!(!Vec::<u8>::from(input.spending_proof.proof.clone()).is_empty());
+        }
+    }
+
+    #[test]
+    fn sign_refuses_inputs_of_another_key() {
+        let (_, key) = fresh_key();
+        let (_, other) = fresh_key();
+        let state = fixture_state();
+        let inputs = vec![
+            utxo_box(&tree_of(&key.public_key()), 3_000_000, &[], &[], 123_000, 0),
+            utxo_box(
+                &tree_of(&other.public_key()),
+                2_000_000,
+                &[],
+                &[],
+                123_000,
+                1,
+            ),
+        ];
+        let unsigned = spend_all_to(&inputs, &tree_of(&key.public_key()), 1_000_000, 123_414);
+        let err = key.sign(unsigned, inputs, vec![], &state).unwrap_err();
+        assert!(err.contains("input 1"), "{err}");
+    }
+
+    #[test]
+    fn sign_rejects_a_transaction_that_does_not_validate() {
+        let (_, key) = fresh_key();
+        let tree = tree_of(&key.public_key());
+        let state = fixture_state();
+        let inputs = vec![utxo_box(&tree, 3_000_000, &[], &[], 123_000, 0)];
+        // Outputs created above the tip are invalid.
+        let unsigned = spend_all_to(&inputs, &tree, 1_000_000, 123_415);
+        let err = key.sign(unsigned, inputs, vec![], &state).unwrap_err();
+        assert!(err.contains("does not validate"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_box_checks_the_returned_id() {
+        let (_, key) = fresh_key();
+        let tree = tree_of(&key.public_key());
+        let wanted = utxo_box(&tree, 3_000_000, &[], &[], 123_000, 0);
+        let other = utxo_box(&tree, 3_000_000, &[], &[], 123_000, 1);
+        let wanted_id = String::from(wanted.box_id());
+        let wanted_hex = hex::encode(wanted.sigma_serialize_bytes().unwrap());
+        let other_hex = hex::encode(other.sigma_serialize_bytes().unwrap());
+        let wanted_id_for_node = wanted_id.clone();
+        let (url, seen) = mock_node(move |_, target, _| {
+            let id = target.rsplit('/').next().unwrap_or_default().to_string();
+            let bytes = if id == wanted_id_for_node {
+                wanted_hex.clone()
+            } else {
+                other_hex.clone()
+            };
+            (
+                200,
+                serde_json::json!({ "boxId": id, "bytes": bytes }).to_string(),
+            )
+        })
+        .await;
+        let node = NodeEndpoint::new(&url, None);
+        let fetched = fetch_box(&node, &wanted_id).await.unwrap();
+        assert_eq!(fetched, wanted);
+        assert_eq!(
+            seen.lock().unwrap()[0].target,
+            format!("/utxo/byIdBinary/{wanted_id}")
+        );
+
+        let liar = fetch_box(&node, &"00".repeat(32)).await.unwrap_err();
+        assert!(liar.contains("when asked for"), "{liar}");
+        assert!(fetch_box(&node, "../wallet").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn broadcast_posts_the_signed_transaction() {
+        let (secret, key) = fresh_key();
+        let tree = tree_of(&key.public_key());
+        let state = fixture_state();
+        let inputs = vec![utxo_box(&tree, 3_000_000, &[], &[], 123_000, 0)];
+        let unsigned = spend_all_to(&inputs, &tree, 1_000_000, 123_414);
+        let signed = key.sign(unsigned, inputs, vec![], &state).unwrap();
+        let expected_id = String::from(signed.id());
+
+        let (url, seen) = mock_node(|_, _, body| {
+            let v: Value = serde_json::from_str(body).unwrap();
+            (
+                200,
+                Value::String(v["id"].as_str().unwrap().to_string()).to_string(),
+            )
+        })
+        .await;
+        let node = NodeEndpoint::new(&url, None);
+        assert_eq!(broadcast(&node, &signed).await.unwrap(), expected_id);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(seen[0].target, "/transactions");
+        assert!(!seen[0].body.contains(&hex::encode(secret)));
+        assert!(!seen[0].headers.to_ascii_lowercase().contains("api_key"));
+
+        let (url_bad, _) = mock_node(|_, _, _| (200, "\"ff\"".to_string())).await;
+        assert!(broadcast(&NodeEndpoint::new(&url_bad, None), &signed)
+            .await
+            .is_err());
+        let (url_rej, _) =
+            mock_node(|_, _, _| (400, r#"{"error":400,"reason":"bad"}"#.to_string())).await;
+        assert!(broadcast(&NodeEndpoint::new(&url_rej, None), &signed)
+            .await
+            .unwrap_err()
+            .contains("HTTP 400"));
     }
 }

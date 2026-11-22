@@ -81,10 +81,12 @@ pub struct TrackerBoxUpdateConfig {
 
 The two node roles map to `ergo.scanner.*` and `ergo.wallet.*` in `config/basis.toml`;
 the wallet node falls back to the scanner node when `[ergo.wallet]` is unset.
-Chain-read endpoints (`/blockchain/transaction/byId`, `/blockchain/box/unspent/byTokenId`,
-`/utxo/byId`, `/info`) go to the scanner node; wallet endpoints (`/wallet/boxes/unspent`,
-`/utxo/byIdBinary` for wallet fee boxes, `/wallet/transaction/sign`) and `/transactions`
-broadcast go to the wallet node.
+Only public node endpoints are used, and no node API key is needed. Chain reads
+(`/blockchain/transaction/byId`, `/blockchain/box/unspent/byTokenId`, `/utxo/byId`,
+`/utxo/byIdBinary`, `/blocks/lastHeaders/10`, `/info`) and fee-box discovery
+(`POST /blockchain/box/unspent/byAddress`) go to the scanner node; only the `POST /transactions`
+broadcast goes to the `[ergo.wallet]` node. The transaction is signed in the tracker process with
+`ergo.tracker_secret_key`; no `/wallet/*` endpoint is called.
 
 **Critical Requirement**: `ergo.scanner.node_url` must be non-empty in the configuration; if it is empty, the tracker aborts on startup with exit code 1. This ensures the tracker cannot operate without proper connection to an Ergo node.
 
@@ -196,12 +198,12 @@ The background task executes the following algorithm in a continuous loop:
    - R5: Serialized `SAvlTree` constant containing the current AVL tree root digest (37 bytes total; see "R5 Register Serialization Format" below)
    - R6: Serialized `Coll[Byte]` constant containing the tracker NFT ID (preserved from the input tracker box)
 8. **Build Unsigned Transaction**:
-   - **Inputs**: the current tracker box (spends it) plus one or more wallet-owned P2PK/no-token boxes to pay the configured fee
+   - **Inputs**: the current tracker box (spends it) plus one or more token-free boxes at the tracker's own P2PK address, found with `POST /blockchain/box/unspent/byAddress` (`excludeMempoolSpent=true`), to pay the configured fee. Boxes holding any token are never used for fees.
    - **Outputs**: new tracker box with the same value and updated R4/R5/R6; fee output to the standard fee contract; optional change output to the change address
-   - **inputsRaw**: serialized bytes of the tracker box and all fee inputs
-   - **secrets.dlog**: the configured tracker secret key (hex) so the node can satisfy `proveDlog(trackerPubkey)`; may be omitted if the tracker key is already in the node wallet
-9. **Submit Transaction**:
-   - POST the unsigned transaction to `/wallet/transaction/sign` to obtain a signed transaction
+   - The input boxes are read from the UTXO set as bytes (`/utxo/byIdBinary/{id}`)
+9. **Sign and Submit Transaction**:
+   - Build the signing context from `/blocks/lastHeaders/10` (newest header first) and prove every input locally with `ergo.tracker_secret_key` (every input is `P2PK(tracker pk)`)
+   - Validate the signed transaction locally (ERG and token preservation, dust, heights, proofs)
    - POST the signed transaction to `/transactions` to broadcast it
    - Log the transaction ID on successful broadcast and mark it as pending confirmation
 10. **Error Handling**:
@@ -534,9 +536,9 @@ The service handles the following error conditions:
 2. **Configuration Errors**: Invalid configuration parameters (missing node URL, invalid tracker NFT ID)
 3. **HTTP Errors**: Network failures, node unreachable, API errors (5xx, 4xx)
 4. **No Tracker Box Found**: Tracker NFT ID not found on chain
-5. **No Fee Inputs**: Wallet has no suitable P2PK/no-token boxes to pay the update fee
-6. **Insufficient Fee Inputs**: Wallet boxes don't cover the configured fee
-7. **Signing Failed**: `/wallet/transaction/sign` rejected the unsigned transaction (bad inputs, missing secrets, etc.)
+5. **No Fee Inputs**: The tracker address holds no token-free boxes to pay the update fee
+6. **Insufficient Fee Inputs**: The token-free boxes at the tracker address don't cover the configured fee
+7. **Signing Failed**: local signing or validation failed (missing or mismatched `tracker_secret_key`, an input not locked by the tracker key, an invalid transaction)
 8. **Broadcast Failed**: `/transactions` rejected the signed transaction
 9. **Transaction Not Found**: Submitted transaction ID not found on chain after extended waiting
 10. **Serialization Errors**: Failed to decode ergoTree hex, parse ergoTree bytes, or encode addresses
@@ -554,7 +556,7 @@ The service handles the following error conditions:
 2. **Resource Management**: Proper handling of async resources and channels
 3. **Log Security**: No sensitive cryptographic information exposed in logs
 4. **Rate Limiting**: Built-in 10-minute interval prevents excessive resource usage
-5. **Secret Handling**: The configured `tracker_secret_key` is passed only to the node's `/wallet/transaction/sign` endpoint as a `dlog` secret; it is never logged or broadcast
+5. **Secret Handling**: The configured `tracker_secret_key` never leaves the tracker process: it is used only by the local prover, and it is never logged or sent to a node
 6. **Pending Transaction State**: Prevents duplicate submissions while waiting for confirmation
 
 ## Performance Characteristics

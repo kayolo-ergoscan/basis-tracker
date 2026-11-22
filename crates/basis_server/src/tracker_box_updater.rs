@@ -1,8 +1,9 @@
 //! Tracker Box Updater Service
 //!
 //! This module implements a background service that periodically updates the R4 and R5 register values
-//! of the tracker box every 10 minutes by submitting transactions to the Ergo blockchain via the
-//! node's /wallet/transaction/sign and /transactions endpoints.
+//! of the tracker box every 10 minutes. The update transaction is built and signed in this process
+//! with `ergo.tracker_secret_key` and submitted through the node's public `POST /transactions`;
+//! no node wallet endpoint is used.
 
 use std::sync::{Arc, RwLock};
 use tokio::time::{interval, Duration};
@@ -176,11 +177,12 @@ impl SharedTrackerState {
 /// Configuration for the tracker box updater
 #[derive(Debug, Clone)]
 pub struct TrackerBoxUpdateConfig {
-    /// Node hosting the tracker wallet: `/wallet/*`, transaction signing, and
-    /// broadcast go here.
+    /// Node that receives the signed update transaction (`POST /transactions`).
+    /// No wallet endpoint is called on it.
     pub wallet_node_url: String,
     pub wallet_api_key: Option<String>,
-    /// Node used for chain reads (`/blockchain/*`, `/utxo/*`, `/info`); needs
+    /// Node used for chain reads (`/blockchain/*`, `/utxo/*`, `/blocks/lastHeaders`,
+    /// `/info`) and fee-box discovery (`POST /blockchain/box/unspent/byAddress`); needs
     /// `extraIndex = true`.
     pub scanner_node_url: String,
     pub scanner_api_key: Option<String>,
@@ -259,12 +261,6 @@ pub struct ErgoBoxApi {
 pub struct AssetApi {
     pub token_id: String,
     pub amount: u64,
-}
-
-/// Wrapper for /utxo/byIdBinary response
-#[derive(Debug, serde::Deserialize)]
-struct BoxBinaryResponse {
-    pub bytes: String,
 }
 
 /// Encode an unsigned integer using Ergo's VLQ encoding.
@@ -959,49 +955,6 @@ impl TrackerBoxUpdater {
         Ok(scan.boxes)
     }
 
-    /// Fetch the hex-encoded serialized bytes of a box from the Ergo node.
-    async fn get_box_binary(
-        config: &TrackerBoxUpdateConfig,
-        box_id: &str,
-    ) -> Result<String, TrackerBoxUpdaterError> {
-        let client = basis_store::http::bounded_client();
-        let url = format!(
-            "{}/utxo/byIdBinary/{}",
-            config.wallet_node_url.trim_end_matches('/'),
-            box_id
-        );
-
-        let mut request = client.get(&url);
-        if let Some(ref api_key) = config.wallet_api_key {
-            request = request.header("api_key", api_key);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| TrackerBoxUpdaterError::HttpError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(TrackerBoxUpdaterError::HttpError(format!(
-                "HTTP {} fetching box binary {}: {}",
-                status, box_id, body
-            )));
-        }
-
-        let binary: BoxBinaryResponse = basis_store::http::read_json_capped(response)
-            .await
-            .map_err(|e| TrackerBoxUpdaterError::HttpError(format!("JSON parse error: {}", e)))
-            .and_then(|value| {
-                serde_json::from_value(value).map_err(|e| {
-                    TrackerBoxUpdaterError::HttpError(format!("JSON parse error: {}", e))
-                })
-            })?;
-
-        Ok(binary.bytes)
-    }
-
     /// Get the current blockchain height from the Ergo node.
     async fn get_node_height(
         config: &TrackerBoxUpdateConfig,
@@ -1043,106 +996,11 @@ impl TrackerBoxUpdater {
             .ok_or_else(|| TrackerBoxUpdaterError::HttpError("Missing fullHeight".to_string()))
     }
 
-    /// Sign an unsigned transaction using the Ergo node's /wallet/transaction/sign endpoint.
-    async fn sign_transaction(
-        config: &TrackerBoxUpdateConfig,
-        unsigned_tx: serde_json::Value,
-    ) -> Result<serde_json::Value, TrackerBoxUpdaterError> {
-        info!(
-            "Signing unsigned transaction: {}",
-            redacted_sign_request(&unsigned_tx)
-        );
-
-        let client = basis_store::http::bounded_client();
-        let url = format!(
-            "{}/wallet/transaction/sign",
-            config.wallet_node_url.trim_end_matches('/')
-        );
-
-        let mut request = client.post(&url).json(&unsigned_tx);
-        if let Some(ref api_key) = config.wallet_api_key {
-            request = request.header("api_key", api_key);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| TrackerBoxUpdaterError::SigningFailed(e.to_string()))?;
-
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        info!(
-            "/wallet/transaction/sign response: status={}, body={}",
-            status, body_text
-        );
-
-        if !status.is_success() {
-            return Err(TrackerBoxUpdaterError::SigningFailed(format!(
-                "HTTP {}: {}",
-                status, body_text
-            )));
-        }
-
-        serde_json::from_str(&body_text)
-            .map_err(|e| TrackerBoxUpdaterError::SigningFailed(format!("JSON parse error: {}", e)))
-    }
-
-    /// Broadcast a signed transaction to the Ergo node's /transactions endpoint.
-    async fn broadcast_transaction(
-        config: &TrackerBoxUpdateConfig,
-        signed_tx: &serde_json::Value,
-    ) -> Result<String, TrackerBoxUpdaterError> {
-        info!("Broadcasting signed transaction: {}", signed_tx);
-
-        let client = basis_store::http::bounded_client();
-        let url = format!(
-            "{}/transactions",
-            config.wallet_node_url.trim_end_matches('/')
-        );
-
-        let mut request = client.post(&url).json(signed_tx);
-        if let Some(ref api_key) = config.wallet_api_key {
-            request = request.header("api_key", api_key);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| TrackerBoxUpdaterError::BroadcastFailed(e.to_string()))?;
-
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        info!(
-            "/transactions broadcast response: status={}, body={}",
-            status, body_text
-        );
-
-        if !status.is_success() {
-            return Err(TrackerBoxUpdaterError::BroadcastFailed(format!(
-                "HTTP {}: {}",
-                status, body_text
-            )));
-        }
-
-        let body: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
-            TrackerBoxUpdaterError::BroadcastFailed(format!("JSON parse error: {}", e))
-        })?;
-
-        // The Ergo node's /transactions endpoint returns the tx id as a plain
-        // JSON string (e.g. "abc..."), not an object. Handle both forms.
-        match body {
-            serde_json::Value::String(tx_id) => Ok(tx_id),
-            _ => body["id"]
-                .as_str()
-                .or_else(|| body["txId"].as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    TrackerBoxUpdaterError::BroadcastFailed("Missing tx id".to_string())
-                }),
-        }
-    }
-
-    /// Submit a tracker box update transaction via /wallet/transaction/sign
+    /// Build, sign (locally, with `ergo.tracker_secret_key`) and broadcast the transaction that
+    /// commits `avl_root_digest` to the tracker box. See [`build_tracker_commit_tx`] for its shape.
+    ///
+    /// Public node endpoints only: `/blocks/lastHeaders/10`, `/blockchain/box/unspent/byAddress`
+    /// and `/utxo/byIdBinary/{id}` on the scanner node, `POST /transactions` on the broadcast node.
     async fn submit_tracker_update(
         tracker_nft_id: &str,
         config: &TrackerBoxUpdateConfig,
@@ -1150,129 +1008,92 @@ impl TrackerBoxUpdater {
         tracker_pubkey: &[u8; 33],
         avl_root_digest: &[u8; 33],
     ) -> Result<String, TrackerBoxUpdaterError> {
-        let mut r4_bytes = vec![0x07u8];
-        r4_bytes.extend_from_slice(tracker_pubkey);
-        let r4_value = hex::encode(&r4_bytes);
+        use crate::local_wallet::{self, NodeEndpoint, TrackerKey};
 
-        let mut r5_bytes = vec![0x64u8];
-        r5_bytes.extend_from_slice(avl_root_digest);
-        r5_bytes.push(0x03u8); // insert + update allowed (insertOrUpdate contract)
-        r5_bytes.extend_from_slice(&vlq_encode(32));
-        r5_bytes.extend_from_slice(&vlq_encode(0));
-        let r5_value = hex::encode(&r5_bytes);
+        let secret = config.tracker_secret_key.as_ref().ok_or_else(|| {
+            TrackerBoxUpdaterError::SigningFailed(
+                "ergo.tracker_secret_key is not configured".to_string(),
+            )
+        })?;
+        let key =
+            TrackerKey::from_secret_bytes(secret).map_err(TrackerBoxUpdaterError::SigningFailed)?;
+        if key.public_key() != *tracker_pubkey {
+            return Err(TrackerBoxUpdaterError::SigningFailed(
+                "ergo.tracker_secret_key does not belong to the tracker public key".to_string(),
+            ));
+        }
 
-        let mut output_registers = tracker_box.additional_registers.clone();
-        output_registers.insert("R4".to_string(), r4_value);
-        output_registers.insert("R5".to_string(), r5_value);
-        // R6 stores the tracker NFT ID as a Coll[Byte] constant so the tracker
-        // scanner can identify the box reliably.
-        let r6_value = format!("0e20{}", tracker_nft_id);
-        output_registers.insert("R6".to_string(), r6_value);
+        let chain = NodeEndpoint::new(&config.scanner_node_url, config.scanner_api_key.clone());
+        let state = local_wallet::fetch_state_context(&chain)
+            .await
+            .map_err(TrackerBoxUpdaterError::HttpError)?;
+        let height = state.pre_header.height;
+
+        let fee_boxes =
+            Self::find_fee_boxes(config, tracker_pubkey, &tracker_box.box_id, config.fee).await?;
+        let (fee_inputs, _) = match local_wallet::select_fee_boxes(&fee_boxes, config.fee) {
+            Some(selected) => selected,
+            None if fee_boxes.is_empty() => return Err(TrackerBoxUpdaterError::NoFeeInputs),
+            None => {
+                return Err(TrackerBoxUpdaterError::InsufficientFeeInputs {
+                    available: fee_boxes
+                        .iter()
+                        .fold(0u64, |a, b| a.saturating_add(b.value)),
+                    required: config.fee,
+                })
+            }
+        };
+
+        // Spend exactly what the UTXO set holds: the boxes are parsed from their bytes.
+        let tracker_input = local_wallet::fetch_box(&chain, &tracker_box.box_id)
+            .await
+            .map_err(TrackerBoxUpdaterError::HttpError)?;
+        let mut fee_input_boxes = Vec::with_capacity(fee_inputs.len());
+        for fee_box in &fee_inputs {
+            fee_input_boxes.push(
+                local_wallet::fetch_box(&chain, &fee_box.box_id)
+                    .await
+                    .map_err(TrackerBoxUpdaterError::HttpError)?,
+            );
+        }
 
         let change_address = match &config.change_address {
             Some(addr) if !addr.is_empty() => addr.clone(),
             _ => derive_change_address(tracker_pubkey)?,
         };
+        let change_tree = address_to_tree(&change_address)?;
 
-        let current_height = Self::get_node_height(config).await?;
-        let fee_boxes =
-            Self::find_fee_boxes(config, tracker_pubkey, &tracker_box.box_id, config.fee).await?;
+        let commit = build_tracker_commit_tx(
+            &tracker_input,
+            &fee_input_boxes,
+            tracker_nft_id,
+            tracker_pubkey,
+            avl_root_digest,
+            config.fee,
+            &change_tree,
+            height,
+        )?;
 
-        let (fee_inputs, fee_input_total) =
-            match crate::local_wallet::select_fee_boxes(&fee_boxes, config.fee) {
-                Some(selected) => selected,
-                None if fee_boxes.is_empty() => return Err(TrackerBoxUpdaterError::NoFeeInputs),
-                None => {
-                    return Err(TrackerBoxUpdaterError::InsufficientFeeInputs {
-                        available: fee_boxes
-                            .iter()
-                            .fold(0u64, |a, b| a.saturating_add(b.value)),
-                        required: config.fee,
-                    })
-                }
-            };
-        let fee_input_ids: Vec<String> = fee_inputs.iter().map(|b| b.box_id.clone()).collect();
+        let mut inputs = vec![tracker_input];
+        inputs.extend(fee_input_boxes);
+        let signed = key
+            .sign(commit.unsigned, inputs, Vec::new(), &state)
+            .map_err(TrackerBoxUpdaterError::SigningFailed)?;
+        info!(
+            "Tracker update {} signed locally: {} inputs, {} outputs, fee {} nanoERG, change {} nanoERG, height {}",
+            String::from(signed.id()),
+            signed.inputs.len(),
+            signed.outputs.len(),
+            commit.fee,
+            commit.change,
+            height
+        );
 
-        let mut inputs = vec![serde_json::json!({
-            "boxId": tracker_box.box_id,
-            "extension": serde_json::json!({})
-        })];
-        let mut inputs_raw = vec![Self::get_box_binary(config, &tracker_box.box_id).await?];
-
-        for fee_box_id in &fee_input_ids {
-            inputs.push(serde_json::json!({
-                "boxId": fee_box_id,
-                "extension": serde_json::json!({})
-            }));
-            inputs_raw.push(Self::get_box_binary(config, fee_box_id).await?);
-        }
-
-        // Fee inputs never hold tokens, so the change output carries none.
-        let change_amount = fee_input_total.saturating_sub(config.fee);
-
-        // Ensure the tracker NFT is always the first token in the output tracker box,
-        // followed by any other tokens preserved from the input tracker box.
-        let mut output_assets = Vec::new();
-        let mut other_assets = Vec::new();
-        for asset in &tracker_box.assets {
-            if asset.token_id == tracker_nft_id {
-                output_assets.push(asset.clone());
-            } else {
-                other_assets.push(asset.clone());
-            }
-        }
-        output_assets.extend(other_assets);
-
-        let mut outputs = vec![
-            serde_json::json!({
-                "value": tracker_box.value,
-                "ergoTree": tracker_box.ergo_tree,
-                "creationHeight": current_height,
-                "assets": output_assets,
-                "additionalRegisters": output_registers
-            }),
-            serde_json::json!({
-                "value": config.fee,
-                "ergoTree": "1005040004000e36100204a00b08cd0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ea02d192a39a8cc7a701730073011001020402d19683030193a38cc7b2a57300000193c2b2a57301007473027303830108cdeeac93b1a57304",
-                "creationHeight": current_height,
-                "assets": [],
-                "additionalRegisters": {}
-            }),
-        ];
-
-        if change_amount > 0 {
-            outputs.push(serde_json::json!({
-                "value": change_amount,
-                "ergoTree": change_address_to_ergo_tree(&change_address)?,
-                "creationHeight": current_height,
-                "assets": [],
-                "additionalRegisters": {}
-            }));
-        }
-
-        let secrets = config
-            .tracker_secret_key
-            .as_ref()
-            .map(|sk| vec![hex::encode(sk)])
-            .unwrap_or_default();
-
-        let unsigned_tx = serde_json::json!({
-            "tx": {
-                "inputs": inputs,
-                "dataInputs": [],
-                "outputs": outputs
-            },
-            "inputsRaw": inputs_raw,
-            "dataInputsRaw": [],
-            "secrets": {
-                "dlog": secrets
-            }
-        });
-
-        let signed_tx = Self::sign_transaction(config, unsigned_tx).await?;
-        let tx_id = Self::broadcast_transaction(config, &signed_tx).await?;
-
-        Ok(tx_id)
+        let broadcast_node =
+            NodeEndpoint::new(&config.wallet_node_url, config.wallet_api_key.clone());
+        local_wallet::broadcast(&broadcast_node, &signed)
+            .await
+            .map_err(TrackerBoxUpdaterError::BroadcastFailed)
     }
 
     /// Check if a transaction has been confirmed on-chain by querying the blockchain API
@@ -1309,17 +1130,6 @@ impl TrackerBoxUpdater {
             }
         }
     }
-}
-
-/// The `/wallet/transaction/sign` request without its `secrets` (the tracker's private key),
-/// for logging. The full request used to be logged at INFO on every update, which put the key
-/// that controls the tracker wallet, the tracker NFT box and tracker signatures into the logs (follow-up review N5).
-fn redacted_sign_request(request: &serde_json::Value) -> serde_json::Value {
-    let mut redacted = request.clone();
-    if let Some(object) = redacted.as_object_mut() {
-        object.remove("secrets");
-    }
-    redacted
 }
 
 /// Derive a P2PK change address from a compressed tracker public key.
@@ -1362,26 +1172,219 @@ fn change_address_to_ergo_tree(address_str: &str) -> Result<String, TrackerBoxUp
     })?))
 }
 
+/// Parse a P2PK or P2S address into its ErgoTree.
+fn address_to_tree(
+    address_str: &str,
+) -> Result<ergo_lib::ergotree_ir::ergo_tree::ErgoTree, TrackerBoxUpdaterError> {
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+    let tree_hex = change_address_to_ergo_tree(address_str)?;
+    let bytes = hex::decode(&tree_hex)
+        .map_err(|e| TrackerBoxUpdaterError::SerializationError(e.to_string()))?;
+    ErgoTree::sigma_parse_bytes(&bytes).map_err(|e| {
+        TrackerBoxUpdaterError::SerializationError(format!(
+            "ErgoTree of address '{}': {}",
+            address_str, e
+        ))
+    })
+}
+
+/// The unsigned transaction that commits a new AVL root digest, before signing.
+pub(crate) struct CommitTx {
+    pub unsigned: ergo_lib::chain::transaction::unsigned::UnsignedTransaction,
+    /// Miner fee paid by the transaction.
+    pub fee: u64,
+    /// Value of the change output; 0 when there is none.
+    pub change: u64,
+}
+
+/// R4 of the tracker box: `GroupElement(tracker pk)`, `07 ‖ pk33`.
+pub(crate) fn tracker_r4_bytes(tracker_pubkey: &[u8; 33]) -> Vec<u8> {
+    let mut bytes = vec![0x07u8];
+    bytes.extend_from_slice(tracker_pubkey);
+    bytes
+}
+
+/// R5 of the tracker box: `SAvlTree` with the given digest, insert + update allowed, 32-byte
+/// keys, no fixed value length: `64 ‖ digest33 ‖ 03 ‖ 20 ‖ 00`.
+pub(crate) fn tracker_r5_bytes(avl_root_digest: &[u8; 33]) -> Vec<u8> {
+    let mut bytes = vec![0x64u8];
+    bytes.extend_from_slice(avl_root_digest);
+    bytes.push(0x03u8); // insert + update allowed (insertOrUpdate contract)
+    bytes.extend_from_slice(&vlq_encode(32));
+    bytes.extend_from_slice(&vlq_encode(0));
+    bytes
+}
+
+/// R6 of the tracker box: the tracker NFT id as `Coll[Byte]`, `0e 20 ‖ id32`, so the tracker
+/// scanner can identify the box.
+pub(crate) fn tracker_r6_bytes(tracker_nft_id: &[u8; 32]) -> Vec<u8> {
+    let mut bytes = vec![0x0eu8, 0x20u8];
+    bytes.extend_from_slice(tracker_nft_id);
+    bytes
+}
+
+/// Build the transaction that commits `avl_root_digest` to the tracker box.
+///
+/// - inputs: `[tracker box, fee boxes...]`, empty context extensions, no data inputs;
+/// - output 0: the new tracker box: same value and script as the old one, created at
+///   `height`, tracker NFT first and then the old box's other tokens, R4 = tracker pk,
+///   R5 = AVL tree with `avl_root_digest`, R6 = tracker NFT id, any R7+ copied;
+/// - output 1: the miner fee;
+/// - output 2: change (fee inputs minus the fee) to `change_tree`, without tokens, when there
+///   is any.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_tracker_commit_tx(
+    tracker_box: &ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox,
+    fee_boxes: &[ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox],
+    tracker_nft_id: &str,
+    tracker_pubkey: &[u8; 33],
+    avl_root_digest: &[u8; 33],
+    fee: u64,
+    change_tree: &ergo_lib::ergotree_ir::ergo_tree::ErgoTree,
+    height: u32,
+) -> Result<CommitTx, TrackerBoxUpdaterError> {
+    use ergo_lib::chain::transaction::unsigned::UnsignedTransaction;
+    use ergo_lib::chain::transaction::UnsignedInput;
+    use ergo_lib::ergotree_ir::chain::context_extension::ContextExtension;
+    use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+    use ergo_lib::ergotree_ir::chain::ergo_box::{
+        BoxTokens, ErgoBoxCandidate, NonMandatoryRegisterId, NonMandatoryRegisters,
+    };
+    use ergo_lib::ergotree_ir::chain::token::{Token, TokenId};
+    use ergo_lib::ergotree_ir::ergo_tree::ErgoTree;
+    use ergo_lib::ergotree_ir::mir::constant::Constant;
+    use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+    use std::str::FromStr;
+
+    let ser = |what: &str, e: String| {
+        TrackerBoxUpdaterError::SerializationError(format!("commit tx {what}: {e}"))
+    };
+
+    let nft_bytes: [u8; 32] = hex::decode(tracker_nft_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| {
+            ser(
+                "tracker NFT id",
+                format!("not a 32-byte hex id: {tracker_nft_id}"),
+            )
+        })?;
+    let nft =
+        TokenId::from_str(tracker_nft_id).map_err(|e| ser("tracker NFT id", e.to_string()))?;
+
+    // Registers: R4..R6 rewritten, anything above copied unchanged.
+    let constant = |what: &str, bytes: Vec<u8>| {
+        Constant::sigma_parse_bytes(&bytes).map_err(|e| ser(what, e.to_string()))
+    };
+    let mut registers = vec![
+        constant("R4", tracker_r4_bytes(tracker_pubkey))?,
+        constant("R5", tracker_r5_bytes(avl_root_digest))?,
+        constant("R6", tracker_r6_bytes(&nft_bytes))?,
+    ];
+    for id in [
+        NonMandatoryRegisterId::R7,
+        NonMandatoryRegisterId::R8,
+        NonMandatoryRegisterId::R9,
+    ] {
+        match tracker_box.additional_registers.get_constant(id) {
+            Ok(Some(c)) => registers.push(c),
+            Ok(None) => break,
+            Err(e) => return Err(ser("tracker box register", format!("{id:?}: {e}"))),
+        }
+    }
+    let registers =
+        NonMandatoryRegisters::try_from(registers).map_err(|e| ser("registers", e.to_string()))?;
+
+    // Tokens: the tracker NFT first, then the old tracker box's other tokens in order.
+    let old_tokens: Vec<Token> = tracker_box
+        .tokens
+        .as_ref()
+        .map(|t| t.as_vec().clone())
+        .unwrap_or_default();
+    let (nft_tokens, other_tokens): (Vec<Token>, Vec<Token>) =
+        old_tokens.into_iter().partition(|t| t.token_id == nft);
+    if nft_tokens.len() != 1 || u64::from(nft_tokens[0].amount) != 1 {
+        return Err(ser(
+            "tracker box",
+            format!(
+                "box {} must hold tracker NFT {} exactly once with amount 1",
+                String::from(tracker_box.box_id()),
+                tracker_nft_id
+            ),
+        ));
+    }
+    let mut new_tokens = nft_tokens;
+    new_tokens.extend(other_tokens);
+    let new_tokens = BoxTokens::from_vec(new_tokens).map_err(|e| ser("tokens", e.to_string()))?;
+
+    let fee_total = fee_boxes
+        .iter()
+        .try_fold(0u64, |acc, b| acc.checked_add(*b.value.as_u64()))
+        .ok_or_else(|| ser("fee inputs", "value overflow".to_string()))?;
+    if fee_total < fee {
+        return Err(TrackerBoxUpdaterError::InsufficientFeeInputs {
+            available: fee_total,
+            required: fee,
+        });
+    }
+    let change = fee_total - fee;
+
+    let fee_tree_bytes = hex::decode(ergo_lib::wallet::miner_fee::MINERS_FEE_BASE16_BYTES)
+        .map_err(|e| ser("fee tree", e.to_string()))?;
+    let fee_tree =
+        ErgoTree::sigma_parse_bytes(&fee_tree_bytes).map_err(|e| ser("fee tree", e.to_string()))?;
+    let value = |what: &str, v: u64| BoxValue::try_from(v).map_err(|e| ser(what, e.to_string()));
+
+    let mut outputs = vec![
+        ErgoBoxCandidate {
+            value: tracker_box.value,
+            ergo_tree: tracker_box.ergo_tree.clone(),
+            tokens: Some(new_tokens),
+            additional_registers: registers,
+            creation_height: height,
+        },
+        ErgoBoxCandidate {
+            value: value("fee", fee)?,
+            ergo_tree: fee_tree,
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: height,
+        },
+    ];
+    if change > 0 {
+        outputs.push(ErgoBoxCandidate {
+            value: value("change", change)?,
+            ergo_tree: change_tree.clone(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: height,
+        });
+    }
+
+    let mut inputs = vec![UnsignedInput::new(
+        tracker_box.box_id(),
+        ContextExtension::empty(),
+    )];
+    for fee_box in fee_boxes {
+        inputs.push(UnsignedInput::new(
+            fee_box.box_id(),
+            ContextExtension::empty(),
+        ));
+    }
+    let unsigned = UnsignedTransaction::new_from_vec(inputs, Vec::new(), outputs)
+        .map_err(|e| ser("transaction", e.to_string()))?;
+    Ok(CommitTx {
+        unsigned,
+        fee,
+        change,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sign_request_is_logged_without_the_tracker_secret() {
-        let secret_hex = "5c".repeat(32);
-        let request = serde_json::json!({
-            "tx": { "inputs": [], "dataInputs": [], "outputs": [] },
-            "inputsRaw": [],
-            "dataInputsRaw": [],
-            "secrets": { "dlog": [secret_hex.clone()] }
-        });
-        let logged = redacted_sign_request(&request).to_string();
-        assert!(
-            !logged.contains(&secret_hex),
-            "secret leaked into: {logged}"
-        );
-        assert!(logged.contains("\"tx\""));
-    }
 
     #[test]
     fn test_confirmation_depth_current_tip() {
@@ -1443,7 +1446,7 @@ mod tests {
         let tree_for_node = tree.clone();
         let tracker_box_id = "ab".repeat(32);
         let tracker_box_for_node = tracker_box_id.clone();
-        let (url, seen) = mock_node(move |_, target| {
+        let (url, seen) = mock_node(move |_, target, _| {
             if target.contains("offset=0") {
                 let page = serde_json::json!([
                     {
@@ -1490,5 +1493,258 @@ mod tests {
                 && r.target.starts_with("/blockchain/box/unspent/byAddress?")));
         let expected_address = crate::local_wallet::p2pk_address(&PK).unwrap();
         assert_eq!(seen[0].body, format!("\"{expected_address}\""));
+    }
+
+    /// Fixture for the commit transaction: a tracker box at P2PK(fresh key) holding the NFT, as
+    /// `init-box` creates it, plus its API view.
+    pub(crate) struct CommitFixture {
+        pub secret: [u8; 32],
+        pub pubkey: [u8; 33],
+        pub nft: [u8; 32],
+        pub tracker_box: ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox,
+        pub tracker_api: ErgoBoxApi,
+    }
+
+    pub(crate) fn commit_fixture(extra_tokens: &[([u8; 32], u64)]) -> CommitFixture {
+        use crate::local_wallet::tests::{fresh_key, tree_of, utxo_box};
+        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+        let (secret, key) = fresh_key();
+        let pubkey = key.public_key();
+        let nft = [0x11u8; 32];
+        let mut tokens = vec![(nft, 1u64)];
+        tokens.extend_from_slice(extra_tokens);
+        let r4 = hex::encode(tracker_r4_bytes(&pubkey));
+        let r5 = basis_store::ergo_scanner::empty_reserve_tree_register();
+        let r6 = hex::encode(tracker_r6_bytes(&nft));
+        let tracker_box = utxo_box(
+            &tree_of(&pubkey),
+            1_000_000,
+            &tokens,
+            &[&r4, &r5, &r6],
+            123_000,
+            0,
+        );
+        let tracker_api = ErgoBoxApi {
+            box_id: String::from(tracker_box.box_id()),
+            value: 1_000_000,
+            ergo_tree: crate::local_wallet::p2pk_tree_hex(&pubkey),
+            assets: tokens
+                .iter()
+                .map(|(id, amount)| AssetApi {
+                    token_id: hex::encode(id),
+                    amount: *amount,
+                })
+                .collect(),
+            additional_registers: [("R4", r4), ("R5", r5), ("R6", r6)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            creation_height: 123_000,
+            address: None,
+        };
+        let _ = tracker_box.sigma_serialize_bytes().unwrap();
+        CommitFixture {
+            secret,
+            pubkey,
+            nft,
+            tracker_box,
+            tracker_api,
+        }
+    }
+
+    /// The whole commit path against a mock node: headers, byAddress, byIdBinary and
+    /// POST /transactions only; the transaction is signed in-process and valid.
+    #[tokio::test]
+    async fn commit_is_signed_locally_and_uses_public_endpoints_only() {
+        use crate::local_wallet::tests::{mock_node, tree_of, utxo_box, LAST_HEADERS_JSON};
+        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+        let fx = commit_fixture(&[]);
+        let tree = tree_of(&fx.pubkey);
+        let fee_box = utxo_box(&tree, 5_000_000, &[], &[], 123_100, 1);
+        let fee_box_id = String::from(fee_box.box_id());
+        let tracker_box_id = fx.tracker_api.box_id.clone();
+
+        let binaries: std::collections::HashMap<String, String> = [
+            (
+                tracker_box_id.clone(),
+                hex::encode(fx.tracker_box.sigma_serialize_bytes().unwrap()),
+            ),
+            (
+                fee_box_id.clone(),
+                hex::encode(fee_box.sigma_serialize_bytes().unwrap()),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let tree_hex = crate::local_wallet::p2pk_tree_hex(&fx.pubkey);
+        let page = serde_json::json!([
+            {
+                "boxId": tracker_box_id,
+                "value": 1_000_000u64,
+                "ergoTree": tree_hex,
+                "assets": [{ "tokenId": hex::encode(fx.nft), "amount": 1 }],
+                "additionalRegisters": {},
+                "creationHeight": 123_000
+            },
+            {
+                "boxId": fee_box_id,
+                "value": 5_000_000u64,
+                "ergoTree": tree_hex,
+                "assets": [],
+                "additionalRegisters": {},
+                "creationHeight": 123_100
+            }
+        ])
+        .to_string();
+
+        let (url, seen) = mock_node(move |method, target, body| {
+            let path = target.split('?').next().unwrap_or_default();
+            match (method, path) {
+                ("GET", "/blocks/lastHeaders/10") => (200, LAST_HEADERS_JSON.to_string()),
+                ("POST", "/blockchain/box/unspent/byAddress") => {
+                    if target.contains("offset=0&") {
+                        (200, page.clone())
+                    } else {
+                        (200, "[]".to_string())
+                    }
+                }
+                ("GET", p) if p.starts_with("/utxo/byIdBinary/") => {
+                    let id = p.trim_start_matches("/utxo/byIdBinary/");
+                    match binaries.get(id) {
+                        Some(bytes) => (
+                            200,
+                            serde_json::json!({ "boxId": id, "bytes": bytes }).to_string(),
+                        ),
+                        None => (404, "{}".to_string()),
+                    }
+                }
+                ("POST", "/transactions") => {
+                    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+                    (
+                        200,
+                        serde_json::Value::String(v["id"].as_str().unwrap().to_string())
+                            .to_string(),
+                    )
+                }
+                _ => (500, format!("unexpected {method} {target}")),
+            }
+        })
+        .await;
+
+        let config = TrackerBoxUpdateConfig {
+            wallet_node_url: url.clone(),
+            scanner_node_url: url,
+            tracker_secret_key: Some(fx.secret),
+            fee: 1_000_000,
+            ..Default::default()
+        };
+        let new_digest = [0x42u8; 33];
+        let tx_id = TrackerBoxUpdater::submit_tracker_update(
+            &hex::encode(fx.nft),
+            &config,
+            &fx.tracker_api,
+            &fx.pubkey,
+            &new_digest,
+        )
+        .await
+        .unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        for request in &seen {
+            assert!(
+                !request.target.starts_with("/wallet") && !request.target.starts_with("/utils"),
+                "non-public endpoint used: {}",
+                request.target
+            );
+            assert!(
+                !request.body.contains(&hex::encode(fx.secret)),
+                "secret left the process"
+            );
+            assert!(!request.headers.to_ascii_lowercase().contains("api_key"));
+        }
+        let posted = seen
+            .iter()
+            .find(|r| r.target == "/transactions")
+            .expect("transaction broadcast");
+        let tx: serde_json::Value = serde_json::from_str(&posted.body).unwrap();
+        assert_eq!(tx["id"].as_str().unwrap(), tx_id);
+
+        // Inputs: tracker box first, then the fee box, each with a proof.
+        let inputs = tx["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0]["boxId"], tracker_box_id);
+        assert_eq!(inputs[1]["boxId"], fee_box_id);
+        for input in inputs {
+            assert!(!input["spendingProof"]["proofBytes"]
+                .as_str()
+                .unwrap()
+                .is_empty());
+        }
+        assert!(tx["dataInputs"].as_array().unwrap().is_empty());
+
+        // Output 0: the new tracker box.
+        let outputs = tx["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 3);
+        let out0 = &outputs[0];
+        assert_eq!(out0["value"], 1_000_000u64);
+        assert_eq!(out0["ergoTree"], tree_hex);
+        assert_eq!(out0["creationHeight"], 123_414);
+        assert_eq!(out0["assets"][0]["tokenId"], hex::encode(fx.nft));
+        assert_eq!(out0["assets"][0]["amount"], 1);
+        assert_eq!(out0["assets"].as_array().unwrap().len(), 1);
+        let regs = &out0["additionalRegisters"];
+        assert_eq!(regs["R4"], format!("07{}", hex::encode(fx.pubkey)));
+        assert_eq!(regs["R5"], format!("64{}032000", hex::encode(new_digest)));
+        assert_eq!(regs["R6"], format!("0e20{}", hex::encode(fx.nft)));
+
+        // Output 1: the miner fee; output 2: change back to the tracker address.
+        assert_eq!(outputs[1]["value"], 1_000_000u64);
+        assert_eq!(
+            outputs[1]["ergoTree"],
+            ergo_lib::wallet::miner_fee::MINERS_FEE_BASE16_BYTES
+        );
+        assert_eq!(outputs[2]["value"], 4_000_000u64);
+        assert_eq!(outputs[2]["ergoTree"], tree_hex);
+        assert!(outputs[2]["assets"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_without_secret_key_fails_before_any_request() {
+        let fx = commit_fixture(&[]);
+        let config = TrackerBoxUpdateConfig {
+            wallet_node_url: "http://127.0.0.1:1".to_string(),
+            scanner_node_url: "http://127.0.0.1:1".to_string(),
+            tracker_secret_key: None,
+            ..Default::default()
+        };
+        let err = TrackerBoxUpdater::submit_tracker_update(
+            &hex::encode(fx.nft),
+            &config,
+            &fx.tracker_api,
+            &fx.pubkey,
+            &[0x42u8; 33],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("tracker_secret_key"), "{err}");
+
+        // A key that is not the tracker's is refused too.
+        let (other_secret, _) = basis_store::schnorr::generate_keypair();
+        let config = TrackerBoxUpdateConfig {
+            tracker_secret_key: Some(other_secret),
+            ..config
+        };
+        let err = TrackerBoxUpdater::submit_tracker_update(
+            &hex::encode(fx.nft),
+            &config,
+            &fx.tracker_api,
+            &fx.pubkey,
+            &[0x42u8; 33],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("does not belong"), "{err}");
     }
 }
