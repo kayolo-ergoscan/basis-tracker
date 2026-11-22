@@ -102,18 +102,28 @@ tracker_nft_id = ""
 # 2. Ergo P2PK address: "9fRusAarL1KkrWQVsxSRVYnvWxaAT2A96cKtNn9tvPh5XUyCisr33"
 tracker_public_key = ""
 
+# Tracker secret key (32 bytes, hex) - REQUIRED. The server signs tracker box commits and
+# redemption signatures in-process with it; it is never sent to a node. Startup is refused
+# when it is missing, malformed, zero, or not the secret of tracker_public_key (sk*G != pk).
+tracker_secret_key = ""
+
 [ergo.scanner]
-node_url = "http://127.0.0.1:9053"   # Scanner node: chain reads and box scanning; needs extraIndex = true
-api_key = "hello"                    # API key for authenticated nodes
+node_url = "http://127.0.0.1:9053"   # Scanner node: chain reads, box scanning, fee-box discovery; needs extraIndex = true
+# api_key = "hello"                  # Optional: every endpoint the tracker calls is public
 timeout_secs = 30                    # Request timeout in seconds
 
-# Optional: separate node hosting the tracker wallet (/wallet/* endpoints, schnorr
-# signing, transaction broadcast). No extra indices needed on this node; when the
-# section is unset, the scanner node is used for everything.
+# Optional: separate node that receives the tracker's signed transactions
+# (POST /transactions). When the section is unset, the scanner node is used.
 # [ergo.wallet]
 # node_url = "http://127.0.0.1:9053"
-# api_key = "hello"
 ```
+
+The tracker needs neither a node wallet nor a node API key. It calls only public node
+endpoints: `GET /info`, `GET /blockchain/*`, `GET /utxo/*`, `GET /blocks/lastHeaders/10`,
+`POST /blockchain/box/unspent/byAddress` and `POST /transactions`. Transaction fees are paid
+from the token-free boxes at `P2PK(tracker_public_key)`, so fund that address with plain
+ERG. Boxes holding any token, such as the tracker box with the tracker NFT, are never spent
+for fees.
 
 ### Redemption Configuration
 
@@ -228,12 +238,16 @@ The Tracker Public Key is used by the tracker server to:
    - Can be provided as hex string: `02dada811a888cd0dc7a0a41739a3ad9b0f427741fe6ca19700cf1a51200c96bf7`
    - Can be provided as Ergo P2PK address: `9fRusAarL1KkrWQVsxSRVYnvWxaAT2A96cKtNn9tvPh5XUyCisr33`
 
-2. **Configure the public key** in `config/basis.toml`
+2. **Configure the public key and its secret key** in `config/basis.toml`
    ```toml
    tracker_public_key = "your_public_key_or_p2pk_address_here"
+   tracker_secret_key = "64_hex_characters"
    ```
 
-3. **The tracker will use this key** to sign transactions updating the tracker box R4 register
+3. **The tracker signs with the secret key in-process** (tracker box updates and redemption
+   signatures). The server refuses to start unless `tracker_secret_key·G` equals
+   `tracker_public_key`, and it commits only to a tracker box locked by
+   `P2PK(tracker_public_key)`.
 
 ### Format Options
 
@@ -271,15 +285,13 @@ tracker_nft_id = ""
 
 [ergo.scanner]
 # Any public node works, but note the default is LOCALHOST. A plaintext remote node sees every
-# scanning request; keep the tracker wallet on a LOCAL node via [ergo.wallet] so the wallet
-# api_key -- which grants full wallet access -- never crosses the network.
+# scanning request. No API key is needed: the tracker calls public endpoints only and signs
+# locally, so no wallet credential ever crosses the network.
 node_url = "http://127.0.0.1:9053"
-api_key = "hello"
 timeout_secs = 30
 
 # [ergo.wallet]
 # node_url = "http://127.0.0.1:9053"
-# api_key = "hello"
 
 [redemption]
 enforce_acceptance_policy = true

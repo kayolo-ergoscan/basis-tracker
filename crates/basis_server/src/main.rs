@@ -95,6 +95,15 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // The tracker signs its commits and redemption signatures in-process: refuse to start
+    // without a valid tracker secret key that belongs to the configured tracker public key.
+    // Printed to stderr as well, so the reason is visible whatever RUST_LOG says.
+    if let Err(msg) = config.check_tracker_keys() {
+        eprintln!("{msg}");
+        tracing::error!("{}", msg);
+        std::process::exit(1);
+    }
+
     // Initialize real Ergo scanner with blockchain monitoring
     tracing::info!("Initializing Ergo scanner with blockchain monitoring...");
 

@@ -779,6 +779,60 @@ impl AppConfig {
         }
     }
 
+    /// Startup check of the tracker key pair. `ergo.tracker_secret_key` must be set, be 32 bytes
+    /// of hex, be a non-zero secp256k1 scalar below the group order, and belong to
+    /// `ergo.tracker_public_key` (`sk·G == pk`). Returns the public key.
+    ///
+    /// The tracker signs its commit transactions and redemption signatures in-process, so it
+    /// cannot run without the key. No error message contains the secret or any part of it.
+    pub fn check_tracker_keys(&self) -> Result<[u8; 33], String> {
+        let secret_hex = match &self.ergo.tracker_secret_key {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => {
+                return Err(
+                    "refusing to start: ergo.tracker_secret_key is not set. The tracker \
+                     signs its commits and redemption signatures locally; set it to the 32-byte \
+                     hex secret key of ergo.tracker_public_key."
+                        .to_string(),
+                )
+            }
+        };
+        let bytes = hex::decode(secret_hex).map_err(|_| {
+            "refusing to start: ergo.tracker_secret_key is not valid hex (expected 64 hex \
+             characters)"
+                .to_string()
+        })?;
+        let secret: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            format!(
+                "refusing to start: ergo.tracker_secret_key must be 32 bytes (64 hex characters), \
+                 got {} bytes",
+                bytes.len()
+            )
+        })?;
+        let key = crate::local_wallet::TrackerKey::from_secret_bytes(&secret)
+            .map_err(|e| format!("refusing to start: {e}"))?;
+        let configured = match self.tracker_public_key_bytes() {
+            Ok(Some(pk)) => pk,
+            Ok(None) => {
+                return Err("refusing to start: ergo.tracker_public_key is not set".to_string())
+            }
+            Err(e) => {
+                return Err(format!(
+                    "refusing to start: ergo.tracker_public_key is invalid: {e}"
+                ))
+            }
+        };
+        if key.public_key() != configured {
+            return Err(format!(
+                "refusing to start: ergo.tracker_secret_key does not belong to \
+                 ergo.tracker_public_key {} (the secret key's public key is {})",
+                hex::encode(configured),
+                hex::encode(key.public_key())
+            ));
+        }
+        Ok(configured)
+    }
+
     /// Get the tracker private key bytes (if configured)
     /// Reads the tracker_secret_key from the configuration file.
     /// TODO: Implement secure storage (e.g., HSM, key vault, encrypted keystore) for production use.
@@ -1299,5 +1353,53 @@ mod tests {
             .build()
             .unwrap();
         assert!(reject_legacy_node_section(&config).is_ok());
+    }
+
+    #[test]
+    fn tracker_key_check_requires_a_matching_secret() {
+        let (secret, pubkey) = basis_store::schnorr::generate_keypair();
+        let secret_hex = hex::encode(secret);
+        let with = |pk: Option<String>, sk: Option<String>| {
+            let mut config = minimal_config();
+            config.ergo.tracker_public_key = pk;
+            config.ergo.tracker_secret_key = sk;
+            config.check_tracker_keys()
+        };
+
+        // Hex public key and P2PK address both work.
+        assert_eq!(
+            with(Some(hex::encode(pubkey)), Some(secret_hex.clone())).unwrap(),
+            pubkey
+        );
+        let address = basis_offchain::ergo_tx::pubkey_to_address(&hex::encode(pubkey)).unwrap();
+        assert_eq!(
+            with(Some(address), Some(format!(" {secret_hex}\n"))).unwrap(),
+            pubkey
+        );
+
+        let err = |pk: Option<String>, sk: Option<String>| with(pk, sk).unwrap_err();
+        let pk = || Some(hex::encode(pubkey));
+        assert!(err(pk(), None).contains("tracker_secret_key is not set"));
+        assert!(err(pk(), Some(String::new())).contains("tracker_secret_key is not set"));
+        assert!(err(pk(), Some("zz".repeat(32))).contains("not valid hex"));
+        assert!(err(pk(), Some("ab".repeat(31))).contains("got 31 bytes"));
+        assert!(err(pk(), Some("00".repeat(32))).contains("zero"));
+        let order = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
+        assert!(err(pk(), Some(order.to_string())).contains("not a valid secp256k1 scalar"));
+        assert!(err(None, Some(secret_hex.clone())).contains("tracker_public_key is not set"));
+
+        let (_, other_pubkey) = basis_store::schnorr::generate_keypair();
+        let mismatch = err(Some(hex::encode(other_pubkey)), Some(secret_hex.clone()));
+        assert!(mismatch.contains("does not belong"), "{mismatch}");
+        assert!(mismatch.contains(&hex::encode(pubkey)));
+
+        // No message ever carries the secret.
+        for message in [
+            mismatch,
+            err(pk(), Some(format!("{}zz", &secret_hex[..62]))),
+            err(pk(), Some(secret_hex[..62].to_string())),
+        ] {
+            assert!(!message.contains(&secret_hex[..16]), "{message}");
+        }
     }
 }

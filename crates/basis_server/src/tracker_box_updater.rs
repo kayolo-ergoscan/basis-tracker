@@ -174,8 +174,8 @@ impl SharedTrackerState {
     }
 }
 
-/// Configuration for the tracker box updater
-#[derive(Debug, Clone)]
+/// Configuration for the tracker box updater. `Debug` redacts the tracker secret key.
+#[derive(Clone)]
 pub struct TrackerBoxUpdateConfig {
     /// Node that receives the signed update transaction (`POST /transactions`).
     /// No wallet endpoint is called on it.
@@ -198,6 +198,35 @@ pub struct TrackerBoxUpdateConfig {
     /// tracker box. Token-backed reserves store the tracker NFT in R6, so
     /// they are returned by `byTokenId` queries and must be filtered out.
     pub reserve_contract_addresses: Vec<String>,
+}
+
+impl std::fmt::Debug for TrackerBoxUpdateConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackerBoxUpdateConfig")
+            .field("wallet_node_url", &self.wallet_node_url)
+            .field(
+                "wallet_api_key",
+                &self.wallet_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("scanner_node_url", &self.scanner_node_url)
+            .field(
+                "scanner_api_key",
+                &self.scanner_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("update_interval_seconds", &self.update_interval_seconds)
+            .field("fee", &self.fee)
+            .field("change_address", &self.change_address)
+            .field(
+                "tracker_secret_key",
+                &self.tracker_secret_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("min_confirmation_depth", &self.min_confirmation_depth)
+            .field(
+                "reserve_contract_addresses",
+                &self.reserve_contract_addresses,
+            )
+            .finish()
+    }
 }
 
 impl Default for TrackerBoxUpdateConfig {
@@ -306,6 +335,13 @@ const MAX_PENDING_MISSING_CYCLES: u32 = 3;
 /// (and the pending notes reverted so a fresh update can be submitted).
 fn pending_tx_is_dropped(missing_cycles: u32) -> bool {
     missing_cycles >= MAX_PENDING_MISSING_CYCLES
+}
+
+/// Whether the tracker can spend `box_ergo_tree_hex`: it must be exactly `P2PK(tracker_pubkey)`.
+/// A tracker box under any other script would be committed to with a transaction the tracker
+/// key cannot sign, or by spending a box the operator does not control.
+fn tracker_box_is_p2pk_of(box_ergo_tree_hex: &str, tracker_pubkey: &[u8; 33]) -> bool {
+    box_ergo_tree_hex.eq_ignore_ascii_case(&crate::local_wallet::p2pk_tree_hex(tracker_pubkey))
 }
 
 /// Whether the previously confirmed tracker box has disappeared from the chain
@@ -489,6 +525,20 @@ impl TrackerBoxUpdater {
             // Refresh the confirmed box id in shared state from the live node.
             shared_state.set_tracker_box_id(tracker_box.box_id.clone());
 
+            // The tracker box must be locked by P2PK(tracker pk); otherwise the tracker key
+            // cannot spend it. Reads and reconciliation below still run; committing does not.
+            let tracker_box_spendable =
+                tracker_box_is_p2pk_of(&tracker_box.ergo_tree, &tracker_pubkey);
+            if !tracker_box_spendable {
+                error!(
+                    "Tracker box {} is not locked by P2PK(tracker public key {}): its ErgoTree is {}. \
+                     Refusing to commit until ergo.tracker_public_key / tracker_nft_id match the tracker box.",
+                    tracker_box.box_id,
+                    hex::encode(tracker_pubkey),
+                    tracker_box.ergo_tree
+                );
+            }
+
             // Reorg re-validation: if the box previously treated as confirmed is no
             // longer the one carrying the tracker NFT, the confirming update was
             // orphaned (or the chain was reorganized). Revert any pending notes so
@@ -565,6 +615,10 @@ impl TrackerBoxUpdater {
                     info!("AVL root digest unchanged, skipping redundant update");
                     continue;
                 }
+            }
+
+            if !tracker_box_spendable {
+                continue;
             }
 
             match Self::submit_tracker_update(
@@ -1746,5 +1800,39 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("does not belong"), "{err}");
+    }
+
+    #[test]
+    fn tracker_box_must_be_p2pk_of_the_tracker_key() {
+        let (_, pubkey) = basis_store::schnorr::generate_keypair();
+        let (_, other) = basis_store::schnorr::generate_keypair();
+        let own = crate::local_wallet::p2pk_tree_hex(&pubkey);
+        assert!(tracker_box_is_p2pk_of(&own, &pubkey));
+        assert!(tracker_box_is_p2pk_of(&own.to_uppercase(), &pubkey));
+        assert!(!tracker_box_is_p2pk_of(
+            &crate::local_wallet::p2pk_tree_hex(&other),
+            &pubkey
+        ));
+        // A script that merely contains the key is not P2PK of it.
+        assert!(!tracker_box_is_p2pk_of(&format!("{own}00"), &pubkey));
+        assert!(!tracker_box_is_p2pk_of(
+            ergo_lib::wallet::miner_fee::MINERS_FEE_BASE16_BYTES,
+            &pubkey
+        ));
+    }
+
+    #[test]
+    fn updater_config_debug_redacts_the_secret() {
+        let secret = [0x5cu8; 32];
+        let config = TrackerBoxUpdateConfig {
+            tracker_secret_key: Some(secret),
+            wallet_api_key: Some("wallet-key".to_string()),
+            ..Default::default()
+        };
+        let printed = format!("{config:?}");
+        assert!(!printed.contains(&hex::encode(secret)));
+        assert!(!printed.contains("92, 92, 92"), "{printed}");
+        assert!(!printed.contains("wallet-key"));
+        assert!(printed.contains("<redacted>"));
     }
 }

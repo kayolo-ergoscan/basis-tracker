@@ -73,23 +73,25 @@ tracker_nft_id = "your_tracker_nft_token_id_here"
 # min_collateralization_ratio = 1.1
 # Tracker public key - can be hex-encoded public key or P2PK address
 tracker_public_key = "your_tracker_public_key_or_p2pk_address_here"
-# Tracker secret key for local signing (hex-encoded, 32 bytes)
-# If provided, the server will sign redemption transactions locally instead of using the Ergo node API
+# Tracker secret key (hex-encoded, 32 bytes). REQUIRED: the server signs its tracker box
+# commits and redemption signatures in-process with it and refuses to start without it, or
+# when it does not belong to tracker_public_key. It is never sent to a node.
+# Fee boxes are the token-free boxes at P2PK(tracker_public_key); fund that address.
 # WARNING: never commit this value to version control
 tracker_secret_key = "your_tracker_secret_key_here"
 
-# Scanner node: chain reads and box scanning (/blockchain/*, /utxo/*).
+# Scanner node: chain reads, box scanning and fee-box discovery (/info, /blockchain/*,
+# /utxo/*, /blocks/lastHeaders). Public endpoints only: api_key is optional.
 # This node MUST run with extraIndex = true (see docs/ergo_node_setup.md).
 [ergo.scanner]
 start_height = 0
 node_url = "http://127.0.0.1:9053"
-api_key = "your_node_api_key_here"
+# api_key = "your_node_api_key_here"
 timeout_secs = 30
 
-# Tracker wallet node: /wallet/* endpoints, schnorr signing, and transaction
-# broadcast. Hosts the tracker wallet; no extra indices needed. Uncomment to use
-# a separate node (e.g. a local wallet-only node while scanning via a remote
-# extra-indexed node); when unset, the scanner node is used for everything.
+# Broadcast node: receives signed transactions (POST /transactions) only. No node wallet
+# and no API key are needed; no extra indices needed. Uncomment to broadcast through a
+# separate node; when unset, the scanner node is used for everything.
 # [ergo.wallet]
 # node_url = "http://127.0.0.1:9053"
 # api_key = "your_wallet_node_api_key_here"
