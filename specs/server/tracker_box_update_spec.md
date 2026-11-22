@@ -199,8 +199,9 @@ The background task executes the following algorithm in a continuous loop:
    - R6: Serialized `Coll[Byte]` constant containing the tracker NFT ID (preserved from the input tracker box)
 8. **Build Unsigned Transaction**:
    - **Inputs**: the current tracker box (spends it) plus one or more token-free boxes at the tracker's own P2PK address, found with `POST /blockchain/box/unspent/byAddress` (`excludeMempoolSpent=true`), to pay the configured fee. Boxes holding any token are never used for fees.
-   - **Outputs**: new tracker box with the same value and updated R4/R5/R6; fee output to the standard fee contract; optional change output to the change address
+   - **Outputs**: new tracker box with the same value and updated R4/R5/R6 (tracker NFT first, the old box's other tokens after it); fee output to the standard fee contract; a change output to the change address whenever value is left. Only a leftover below the minimum value of that change box (360 nanoERG per serialized byte) is added to the fee instead
    - The input boxes are read from the UTXO set as bytes (`/utxo/byIdBinary/{id}`)
+   - Before signing, the transaction is refused unless every input token reaches the outputs with its full amount (nothing burned or minted) and the tracker NFT appears exactly once: first in output 0, amount 1
 9. **Sign and Submit Transaction**:
    - Build the signing context from `/blocks/lastHeaders/10` (newest header first) and prove every input locally with `ergo.tracker_secret_key` (every input is `P2PK(tracker pk)`)
    - Validate the signed transaction locally (ERG and token preservation, dust, heights, proofs)

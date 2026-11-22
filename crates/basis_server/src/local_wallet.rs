@@ -421,6 +421,112 @@ impl TrackerKey {
     }
 }
 
+/// Minimum value the node accepts for `candidate`: its serialized size times
+/// `min_value_per_byte` (360 nanoERG per byte). The size is measured with the candidate's own
+/// value, since the value is part of the encoding.
+pub fn min_box_value(
+    candidate: &ergo_lib::ergotree_ir::chain::ergo_box::ErgoBoxCandidate,
+) -> Result<u64, String> {
+    use ergo_lib::chain::transaction::TxId;
+    let as_box = ErgoBox::from_box_candidate(candidate, TxId::zero(), 0)
+        .map_err(|e| format!("size of output: {e}"))?;
+    let size = as_box
+        .sigma_serialize_bytes()
+        .map_err(|e| format!("size of output: {e}"))?
+        .len() as u64;
+    Ok(size * Parameters::default().min_value_per_byte() as u64)
+}
+
+fn token_totals<'a>(
+    token_lists: impl Iterator<Item = Option<&'a ergo_lib::ergotree_ir::chain::ergo_box::BoxTokens>>,
+) -> Result<std::collections::BTreeMap<String, u64>, String> {
+    let mut totals = std::collections::BTreeMap::new();
+    for tokens in token_lists.flatten() {
+        for token in tokens.iter() {
+            let total = totals.entry(String::from(token.token_id)).or_insert(0u64);
+            *total = total
+                .checked_add(u64::from(token.amount))
+                .ok_or_else(|| "token amount overflow".to_string())?;
+        }
+    }
+    Ok(totals)
+}
+
+/// Pre-signing check that the transaction moves tokens and nothing else: every token of
+/// `inputs` reaches the outputs with exactly the same total amount (nothing burned), and no
+/// output token is new, except `mint` (`(token id, amount)`), which must then be absent from
+/// the inputs and appear with exactly that amount.
+pub fn check_tokens_preserved(
+    inputs: &[ErgoBox],
+    outputs: &[ergo_lib::ergotree_ir::chain::ergo_box::ErgoBoxCandidate],
+    mint: Option<(&str, u64)>,
+) -> Result<(), String> {
+    let input_totals = token_totals(inputs.iter().map(|b| b.tokens.as_ref()))?;
+    let mut output_totals = token_totals(outputs.iter().map(|b| b.tokens.as_ref()))?;
+    if let Some((mint_id, mint_amount)) = mint {
+        let mint_id = mint_id.to_ascii_lowercase();
+        if input_totals.contains_key(&mint_id) {
+            return Err(format!(
+                "token {mint_id} to mint is already held by an input"
+            ));
+        }
+        match output_totals.remove(&mint_id) {
+            Some(amount) if amount == mint_amount => {}
+            Some(amount) => {
+                return Err(format!(
+                    "minted token {mint_id}: outputs hold {amount}, expected {mint_amount}"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "minted token {mint_id} is missing from the outputs"
+                ))
+            }
+        }
+    }
+    for (token_id, in_amount) in &input_totals {
+        let out_amount = output_totals.get(token_id).copied().unwrap_or(0);
+        if out_amount != *in_amount {
+            return Err(format!(
+                "token {token_id} would be burned or changed: inputs hold {in_amount}, outputs {out_amount}"
+            ));
+        }
+    }
+    if let Some(token_id) = output_totals
+        .keys()
+        .find(|id| !input_totals.contains_key(*id))
+    {
+        return Err(format!(
+            "token {token_id} appears in the outputs but in no input"
+        ));
+    }
+    Ok(())
+}
+
+/// Pre-signing check that the tracker NFT appears exactly once in all outputs: as the first
+/// token of output 0, with amount 1.
+pub fn check_nft_only_in_output0(
+    outputs: &[ergo_lib::ergotree_ir::chain::ergo_box::ErgoBoxCandidate],
+    nft_id: &str,
+) -> Result<(), String> {
+    let nft_id = nft_id.to_ascii_lowercase();
+    let mut places = Vec::new();
+    for (i, output) in outputs.iter().enumerate() {
+        for (j, token) in output.tokens.iter().flat_map(|t| t.iter()).enumerate() {
+            if String::from(token.token_id) == nft_id {
+                places.push((i, j, u64::from(token.amount)));
+            }
+        }
+    }
+    match places.as_slice() {
+        [(0, 0, 1)] => Ok(()),
+        [] => Err(format!("tracker NFT {nft_id} is missing from the outputs")),
+        _ => Err(format!(
+            "tracker NFT {nft_id} must appear once, first in output 0 with amount 1; found (output, position, amount) {places:?}"
+        )),
+    }
+}
+
 /// Submit a signed transaction through `POST /transactions` and return its id.
 pub async fn broadcast(node: &NodeEndpoint, tx: &Transaction) -> Result<String, String> {
     let local_id = String::from(tx.id());

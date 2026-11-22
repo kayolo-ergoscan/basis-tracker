@@ -1182,6 +1182,7 @@ impl TrackerBoxUpdater {
 
         let mut inputs = vec![tracker_input];
         inputs.extend(fee_input_boxes);
+        check_commit_tx(&commit.unsigned, &inputs, tracker_nft_id)?;
         let signed = key
             .sign(commit.unsigned, inputs, Vec::new(), &state)
             .map_err(TrackerBoxUpdaterError::SigningFailed)?;
@@ -1331,6 +1332,22 @@ pub(crate) fn tracker_r6_bytes(tracker_nft_id: &[u8; 32]) -> Vec<u8> {
     bytes
 }
 
+/// Pre-signing assertions on a commit transaction: no token is burned, minted or changed
+/// (every input token reaches the outputs with its full amount), and the tracker NFT appears
+/// exactly once, first in output 0, with amount 1.
+pub(crate) fn check_commit_tx(
+    unsigned: &ergo_lib::chain::transaction::unsigned::UnsignedTransaction,
+    inputs: &[ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox],
+    tracker_nft_id: &str,
+) -> Result<(), TrackerBoxUpdaterError> {
+    let outputs = unsigned.output_candidates.as_vec();
+    crate::local_wallet::check_tokens_preserved(inputs, outputs, None)
+        .and_then(|()| crate::local_wallet::check_nft_only_in_output0(outputs, tracker_nft_id))
+        .map_err(|e| {
+            TrackerBoxUpdaterError::SigningFailed(format!("refusing to sign the commit: {e}"))
+        })
+}
+
 /// Build the transaction that commits `avl_root_digest` to the tracker box.
 ///
 /// - inputs: `[tracker box, fee boxes...]`, empty context extensions, no data inputs;
@@ -1338,8 +1355,11 @@ pub(crate) fn tracker_r6_bytes(tracker_nft_id: &[u8; 32]) -> Vec<u8> {
 ///   `height`, tracker NFT first and then the old box's other tokens, R4 = tracker pk,
 ///   R5 = AVL tree with `avl_root_digest`, R6 = tracker NFT id, any R7+ copied;
 /// - output 1: the miner fee;
-/// - output 2: change (fee inputs minus the fee) to `change_tree`, without tokens, when there
-///   is any.
+/// - output 2: change (fee inputs minus the fee) to `change_tree`, without tokens, whenever
+///   value is left. A leftover below the minimum value of that change box (360 nanoERG per
+///   serialized byte) cannot form a box; it is added to the miner fee instead.
+///
+/// Fee boxes must hold no token.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tracker_commit_tx(
     tracker_box: &ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox,
@@ -1425,6 +1445,15 @@ pub(crate) fn build_tracker_commit_tx(
     new_tokens.extend(other_tokens);
     let new_tokens = BoxTokens::from_vec(new_tokens).map_err(|e| ser("tokens", e.to_string()))?;
 
+    if let Some(with_tokens) = fee_boxes.iter().find(|b| b.tokens.is_some()) {
+        return Err(ser(
+            "fee inputs",
+            format!(
+                "fee box {} holds tokens; fee boxes must be token-free",
+                String::from(with_tokens.box_id())
+            ),
+        ));
+    }
     let fee_total = fee_boxes
         .iter()
         .try_fold(0u64, |acc, b| acc.checked_add(*b.value.as_u64()))
@@ -1435,13 +1464,33 @@ pub(crate) fn build_tracker_commit_tx(
             required: fee,
         });
     }
-    let change = fee_total - fee;
+    let leftover = fee_total - fee;
 
     let fee_tree_bytes = hex::decode(ergo_lib::wallet::miner_fee::MINERS_FEE_BASE16_BYTES)
         .map_err(|e| ser("fee tree", e.to_string()))?;
     let fee_tree =
         ErgoTree::sigma_parse_bytes(&fee_tree_bytes).map_err(|e| ser("fee tree", e.to_string()))?;
     let value = |what: &str, v: u64| BoxValue::try_from(v).map_err(|e| ser(what, e.to_string()));
+
+    // Change whenever value is left; only dust that cannot form a box goes to the miner.
+    let change_output = if leftover >= BoxValue::MIN_RAW {
+        let candidate = ErgoBoxCandidate {
+            value: value("change", leftover)?,
+            ergo_tree: change_tree.clone(),
+            tokens: None,
+            additional_registers: NonMandatoryRegisters::empty(),
+            creation_height: height,
+        };
+        let min_value =
+            crate::local_wallet::min_box_value(&candidate).map_err(|e| ser("change", e))?;
+        (leftover >= min_value).then_some(candidate)
+    } else {
+        None
+    };
+    let (fee, change) = match change_output {
+        Some(_) => (fee, leftover),
+        None => (fee + leftover, 0),
+    };
 
     let mut outputs = vec![
         ErgoBoxCandidate {
@@ -1459,15 +1508,7 @@ pub(crate) fn build_tracker_commit_tx(
             creation_height: height,
         },
     ];
-    if change > 0 {
-        outputs.push(ErgoBoxCandidate {
-            value: value("change", change)?,
-            ergo_tree: change_tree.clone(),
-            tokens: None,
-            additional_registers: NonMandatoryRegisters::empty(),
-            creation_height: height,
-        });
-    }
+    outputs.extend(change_output);
 
     let mut inputs = vec![UnsignedInput::new(
         tracker_box.box_id(),
@@ -1936,5 +1977,260 @@ mod tests {
             2,
             "disabled heartbeat must not call the node"
         );
+    }
+
+    fn build_for_test(
+        fx: &CommitFixture,
+        fee_values: &[u64],
+        fee: u64,
+    ) -> (
+        CommitTx,
+        Vec<ergo_lib::ergotree_ir::chain::ergo_box::ErgoBox>,
+    ) {
+        use crate::local_wallet::tests::{tree_of, utxo_box};
+        let tree = tree_of(&fx.pubkey);
+        let fee_boxes: Vec<_> = fee_values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| utxo_box(&tree, *v, &[], &[], 123_100, 1 + i as u16))
+            .collect();
+        let commit = build_tracker_commit_tx(
+            &fx.tracker_box,
+            &fee_boxes,
+            &hex::encode(fx.nft),
+            &fx.pubkey,
+            &[0x42u8; 33],
+            fee,
+            &tree,
+            123_414,
+        )
+        .unwrap();
+        let mut inputs = vec![fx.tracker_box.clone()];
+        inputs.extend(fee_boxes);
+        (commit, inputs)
+    }
+
+    fn output_values(commit: &CommitTx) -> Vec<u64> {
+        commit
+            .unsigned
+            .output_candidates
+            .iter()
+            .map(|o| *o.value.as_u64())
+            .collect()
+    }
+
+    #[test]
+    fn commit_keeps_change_and_folds_only_dust() {
+        let fx = commit_fixture(&[]);
+        let fee = 1_000_000;
+
+        // Plenty left: a change output with all of it.
+        let (commit, _) = build_for_test(&fx, &[5_000_000], fee);
+        assert_eq!(output_values(&commit), vec![1_000_000, fee, 4_000_000]);
+        assert_eq!((commit.fee, commit.change), (fee, 4_000_000));
+
+        // Exactly the fee: no change, no folding.
+        let (commit, _) = build_for_test(&fx, &[fee], fee);
+        assert_eq!(output_values(&commit), vec![1_000_000, fee]);
+        assert_eq!((commit.fee, commit.change), (fee, 0));
+
+        // The smallest change box the node accepts is still created.
+        let change_box = |v: u64| {
+            use ergo_lib::ergotree_ir::chain::ergo_box::box_value::BoxValue;
+            use ergo_lib::ergotree_ir::chain::ergo_box::{ErgoBoxCandidate, NonMandatoryRegisters};
+            ErgoBoxCandidate {
+                value: BoxValue::try_from(v).unwrap(),
+                ergo_tree: crate::local_wallet::tests::tree_of(&fx.pubkey),
+                tokens: None,
+                additional_registers: NonMandatoryRegisters::empty(),
+                creation_height: 123_414,
+            }
+        };
+        let min = crate::local_wallet::min_box_value(&change_box(20_000)).unwrap();
+        assert!(
+            min > 10_000 && min < 30_000,
+            "P2PK change box minimum {min}"
+        );
+        let (commit, _) = build_for_test(&fx, &[fee + min], fee);
+        assert_eq!(output_values(&commit), vec![1_000_000, fee, min]);
+
+        // Dust below the minimum goes to the miner; ERG is conserved either way.
+        let (commit, _) = build_for_test(&fx, &[fee + min - 1], fee);
+        assert_eq!(output_values(&commit), vec![1_000_000, fee + min - 1]);
+        assert_eq!((commit.fee, commit.change), (fee + min - 1, 0));
+        let (commit, _) = build_for_test(&fx, &[fee + 5], fee);
+        assert_eq!(output_values(&commit), vec![1_000_000, fee + 5]);
+
+        // Both shapes sign and pass full validation (no dust output, ERG preserved).
+        let key = crate::local_wallet::TrackerKey::from_secret_bytes(&fx.secret).unwrap();
+        let state = crate::local_wallet::tests::fixture_state();
+        for fee_inputs in [vec![fee + min], vec![fee + min - 1], vec![600_000, 400_005]] {
+            let (commit, inputs) = build_for_test(&fx, &fee_inputs, fee);
+            key.sign(commit.unsigned, inputs, vec![], &state).unwrap();
+        }
+    }
+
+    #[test]
+    fn commit_refuses_token_fee_boxes_and_insufficient_fees() {
+        use crate::local_wallet::tests::{tree_of, utxo_box};
+        let fx = commit_fixture(&[]);
+        let tree = tree_of(&fx.pubkey);
+        let token_box = utxo_box(&tree, 5_000_000, &[([0x77; 32], 10)], &[], 123_100, 1);
+        let err = build_tracker_commit_tx(
+            &fx.tracker_box,
+            &[token_box],
+            &hex::encode(fx.nft),
+            &fx.pubkey,
+            &[0x42u8; 33],
+            1_000_000,
+            &tree,
+            123_414,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("token-free"), "{err}");
+
+        let small = utxo_box(&tree, 500_000, &[], &[], 123_100, 1);
+        let err = build_tracker_commit_tx(
+            &fx.tracker_box,
+            &[small],
+            &hex::encode(fx.nft),
+            &fx.pubkey,
+            &[0x42u8; 33],
+            1_000_000,
+            &tree,
+            123_414,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err,
+            TrackerBoxUpdaterError::InsufficientFeeInputs { .. }
+        ));
+    }
+
+    #[test]
+    fn commit_keeps_every_tracker_box_token_and_puts_the_nft_first() {
+        // The tracker box also holds another token, listed before the NFT.
+        let other = [0x33u8; 32];
+        let mut fx = commit_fixture(&[(other, 5)]);
+        {
+            use crate::local_wallet::tests::{tree_of, utxo_box};
+            let r4 = hex::encode(tracker_r4_bytes(&fx.pubkey));
+            let r5 = basis_store::ergo_scanner::empty_reserve_tree_register();
+            let r6 = hex::encode(tracker_r6_bytes(&fx.nft));
+            fx.tracker_box = utxo_box(
+                &tree_of(&fx.pubkey),
+                1_000_000,
+                &[(other, 5), (fx.nft, 1)],
+                &[&r4, &r5, &r6],
+                123_000,
+                0,
+            );
+        }
+        let (commit, inputs) = build_for_test(&fx, &[5_000_000], 1_000_000);
+        let out0 = &commit.unsigned.output_candidates.as_vec()[0];
+        let tokens: Vec<(String, u64)> = out0
+            .tokens
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|t| (String::from(t.token_id), u64::from(t.amount)))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![(hex::encode(fx.nft), 1), (hex::encode(other), 5)]
+        );
+        check_commit_tx(&commit.unsigned, &inputs, &hex::encode(fx.nft)).unwrap();
+    }
+
+    #[test]
+    fn pre_signing_check_rejects_burns_mints_and_misplaced_nfts() {
+        use crate::local_wallet::tests::{tree_of, utxo_box};
+        use ergo_lib::chain::transaction::unsigned::UnsignedTransaction;
+        use ergo_lib::ergotree_ir::chain::ergo_box::{BoxTokens, ErgoBoxCandidate};
+        use ergo_lib::ergotree_ir::chain::token::{Token, TokenAmount, TokenId};
+        use std::str::FromStr;
+
+        let other = [0x33u8; 32];
+        let fx = commit_fixture(&[(other, 5)]);
+        let nft_hex = hex::encode(fx.nft);
+        let (commit, inputs) = build_for_test(&fx, &[5_000_000], 1_000_000);
+        check_commit_tx(&commit.unsigned, &inputs, &nft_hex).unwrap();
+
+        let token = |id: [u8; 32], amount: u64| Token {
+            token_id: TokenId::from_str(&hex::encode(id)).unwrap(),
+            amount: TokenAmount::try_from(amount).unwrap(),
+        };
+        let with_outputs = |edit: &dyn Fn(&mut Vec<ErgoBoxCandidate>)| {
+            let mut outputs = commit.unsigned.output_candidates.as_vec().clone();
+            edit(&mut outputs);
+            UnsignedTransaction::new_from_vec(
+                commit.unsigned.inputs.as_vec().clone(),
+                vec![],
+                outputs,
+            )
+            .unwrap()
+        };
+        let rejects = |tx: UnsignedTransaction, needle: &str| {
+            let err = check_commit_tx(&tx, &inputs, &nft_hex)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "expected '{needle}' in: {err}");
+        };
+
+        // Burning the other token (output 0 keeps only the NFT).
+        rejects(
+            with_outputs(&|o| {
+                o[0].tokens = Some(BoxTokens::from_vec(vec![token(fx.nft, 1)]).unwrap())
+            }),
+            "would be burned",
+        );
+        // Burning the NFT.
+        rejects(
+            with_outputs(&|o| {
+                o[0].tokens = Some(BoxTokens::from_vec(vec![token(other, 5)]).unwrap())
+            }),
+            "would be burned",
+        );
+        // NFT moved to the change output.
+        rejects(
+            with_outputs(&|o| {
+                o[0].tokens = Some(BoxTokens::from_vec(vec![token(other, 5)]).unwrap());
+                o[2].tokens = Some(BoxTokens::from_vec(vec![token(fx.nft, 1)]).unwrap());
+            }),
+            "must appear once",
+        );
+        // NFT not first in output 0.
+        rejects(
+            with_outputs(&|o| {
+                o[0].tokens =
+                    Some(BoxTokens::from_vec(vec![token(other, 5), token(fx.nft, 1)]).unwrap())
+            }),
+            "must appear once",
+        );
+        // A token that no input holds.
+        rejects(
+            with_outputs(&|o| {
+                o[2].tokens = Some(BoxTokens::from_vec(vec![token([0x99; 32], 1)]).unwrap())
+            }),
+            "in no input",
+        );
+
+        // An input token missing from the outputs because a token-bearing box was added as
+        // an input: refused before signing.
+        let mut more_inputs = inputs.clone();
+        more_inputs.push(utxo_box(
+            &tree_of(&fx.pubkey),
+            1_000_000,
+            &[([0x55; 32], 7)],
+            &[],
+            123_100,
+            9,
+        ));
+        let err = check_commit_tx(&commit.unsigned, &more_inputs, &nft_hex)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would be burned"), "{err}");
     }
 }
