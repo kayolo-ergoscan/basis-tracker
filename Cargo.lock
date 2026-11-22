@@ -355,6 +355,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "basis_canary"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "basis_offchain",
+ "basis_server",
+ "basis_store",
+ "clap",
+ "ergo-lib",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "basis_cli"
 version = "0.1.0"
 dependencies = [

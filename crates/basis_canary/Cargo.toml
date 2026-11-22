@@ -1,0 +1,32 @@
+[package]
+name = "basis_canary"
+version = "0.1.0"
+edition = "2021"
+license = "CC0-1.0"
+description = "Closed canary of a Basis tracker: reserve, note, commit, redemption, signed locally with keys read from files"
+
+[lib]
+name = "basis_canary"
+path = "src/lib.rs"
+
+[[bin]]
+name = "basis_canary"
+path = "src/main.rs"
+
+# Only crates the tracker already uses, with the same features: building the canary together
+# with basis_server must not change any feature of the server's dependencies. HTTP goes through
+# basis_store's re-export of reqwest.
+[dependencies]
+basis_offchain = { path = "../basis_offchain" }
+basis_server = { path = "../basis_server" }
+basis_store = { path = "../basis_store" }
+ergo-lib = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+hex = "0.4"
+clap = { version = "4.0", features = ["derive"] }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = "3.10"
