@@ -42,8 +42,8 @@ if ps -p "$PID" > /dev/null 2>&1; then
     # Send SIGTERM signal
     kill "$PID"
     
-    # Wait for process to terminate
-    TIMEOUT=10
+    # Wait for process to terminate (the server's own shutdown deadline is 20 s)
+    TIMEOUT=25
     COUNTER=0
     while ps -p "$PID" > /dev/null 2>&1 && [ $COUNTER -lt $TIMEOUT ]; do
         sleep 1

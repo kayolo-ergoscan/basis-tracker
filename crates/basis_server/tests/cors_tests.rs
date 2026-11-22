@@ -271,6 +271,7 @@ mod cors_tests {
                             .reconcile_with_confirmed_digest(&digest, &box_id, height);
                         let _ = response_tx.send(result);
                     }
+                    TrackerCommand::Shutdown => break,
                     TrackerCommand::ExchangeNotes { .. } => {}
                     TrackerCommand::ListStagedExchanges { response_tx } => {
                         let result = redemption_manager.tracker.list_staged_exchanges();

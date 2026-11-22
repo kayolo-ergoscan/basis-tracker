@@ -212,7 +212,7 @@ This is a minimal utility that runs `basis_store::tests::run_all_tests()` and ex
 **Purpose**: Gracefully stop the running server
 **Features**:
 - Reads PID from `server.pid`
-- Sends SIGTERM, waits up to 10 seconds
+- Sends SIGTERM, waits up to 25 seconds (the server shuts down within 20)
 - Falls back to SIGKILL if necessary
 - Cleans up stale PID files
 - Colored output

@@ -306,6 +306,7 @@ mod redemption_api_tests {
                             .reconcile_with_confirmed_digest(&digest, &box_id, height);
                         let _ = response_tx.send(result);
                     }
+                    TrackerCommand::Shutdown => break,
                     TrackerCommand::ExchangeNotes {
                         issuer_pubkey,
                         recipient_pubkey,

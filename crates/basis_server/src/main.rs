@@ -21,7 +21,7 @@ use basis_server::{
     TrackerBoxUpdateConfig, TrackerBoxUpdater, TrackerCommand, TrackerEvent,
 };
 use basis_store::{
-    ergo_scanner::{start_scanner, NodeConfig, ReserveEvent, ServerState},
+    ergo_scanner::{start_scanner, NodeConfig, ReserveEvent, ScannerError, ServerState},
     tracker_scanner::{create_tracker_server_state, TrackerNodeConfig},
     ReserveTracker,
 };
@@ -124,13 +124,23 @@ async fn main() {
         }
     };
 
+    // Every background loop (the reserve scanner, the tracker box updater) and the HTTP server
+    // stop when this is sent, once, on SIGTERM or SIGINT.
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     // Start the scanner background task
-    if let Err(e) = start_scanner(ergo_scanner.clone()).await {
-        tracing::warn!("Failed to start background scanner: {}", e);
-        tracing::info!("Continuing without background scanner...");
-    } else {
-        tracing::info!("Ergo scanner started successfully");
-    }
+    let reserve_scanner_task =
+        match start_scanner(ergo_scanner.clone(), shutdown_tx.subscribe()).await {
+            Ok(task) => {
+                tracing::info!("Ergo scanner started successfully");
+                Some(task)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start background scanner: {}", e);
+                tracing::info!("Continuing without background scanner...");
+                None
+            }
+        };
 
     // Get tracker public key from config early, needed for shared state
     let tracker_pubkey = if let Some(tracker_pubkey_bytes) = match config.tracker_public_key_bytes()
@@ -268,8 +278,10 @@ async fn main() {
 
     // Spawn tracker thread (using tokio::task::spawn_blocking for CPU-bound work)
     let shared_state_for_tracker = shared_tracker_state_for_updater.clone(); // Also pass shared state for updater
-                                                                             // Joined at shutdown: the thread ends after its current command once every sender of `tx`
-                                                                             // is gone, and closes data/notes on the way out.
+
+    // Joined at shutdown: `TrackerCommand::Shutdown` ends the loop after the commands sent
+    // before it, and the thread closes data/notes on the way out.
+    let tracker_stop_tx = tx.clone();
     let tracker_thread = tokio::task::spawn_blocking(move || {
         use basis_store::RedemptionManager;
 
@@ -288,6 +300,9 @@ async fn main() {
 
         while let Some(cmd) = rx.blocking_recv() {
             tracing::debug!("Tracker thread received command: {:?}", cmd);
+            if matches!(cmd, TrackerCommand::Shutdown) {
+                break;
+            }
             // A panic while handling one command must not end this loop: every endpoint that
             // talks to the tracker would then report "tracker unavailable" until a restart
             // (follow-up review N3). The panicking command's response sender is dropped, so
@@ -603,6 +618,8 @@ async fn main() {
                         .reconcile_with_confirmed_digest(&digest, &box_id, height);
                     let _ = response_tx.send(result);
                 }
+                // Handled before the match.
+                TrackerCommand::Shutdown => {}
             }));
             if outcome.is_err() {
                 tracing::error!(
@@ -610,6 +627,9 @@ async fn main() {
                 );
             }
         }
+        // Closes data/notes.
+        drop(redemption_manager);
+        tracing::info!("Tracker thread stopped; note store closed");
     });
 
     // Create tracker box updater
@@ -677,11 +697,6 @@ async fn main() {
             config.transaction.heartbeat_blocks
         );
     }
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-
-    // Clone the channel for the tracker updater
-    let _updater_shutdown_rx = shutdown_tx.subscribe();
-
     // Start the tracker box updater in the background
     let updater_config = tracker_box_config.clone();
     let shared_state_clone = shared_tracker_state_for_updater.clone();
@@ -904,8 +919,6 @@ async fn main() {
             "/config/reserve-collateral",
             get(get_reserve_collateral_config),
         )
-        // Moved, not cloned: once the server stops, the router holds the last AppState and
-        // with it the last tracker command sender besides the updater's.
         .with_state(app_state)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         // Authorization runs after auth so an AuthContext is always present.
@@ -978,39 +991,39 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Tokio drives this listener, so it must be non-blocking. A blocking one made `accept` wait
+    // in the kernel for the next client: requests were still served, but a shutdown signal was
+    // not seen until somebody connected (and a debug build panics on it).
+    if let Err(e) = std_listener.set_nonblocking(true) {
+        tracing::error!(
+            "Failed to make the listener on {} non-blocking: {}",
+            addr,
+            e
+        );
+        std::process::exit(1);
+    }
 
     // Scanner is already started via start_scanner() above
     // No need for duplicate background scanner task
 
     tracing::info!("Starting axum server...");
-    let stop_signal = shutdown_signal(shutdown_tx.clone());
-    if config.server.tls_enabled() {
-        serve_tls(std_listener, app, &config.server, stop_signal).await;
-    } else {
-        if config.server.auth_enabled() {
-            tracing::warn!(
-                "Authentication is enabled but TLS is not. Credentials and signatures \
-                 will be sent over plaintext. Configure tls_cert_path and tls_key_path \
-                 for production use."
-            );
-        }
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("Failed to convert TCP listener: {}", e);
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = axum::serve(listener, app)
-            .with_graceful_shutdown(stop_signal)
-            .await
-        {
-            tracing::error!("Server error: {}", e);
+    let server = serve(std_listener, app, &config.server, shutdown_tx.subscribe());
+    tokio::pin!(server);
+    tokio::select! {
+        _ = &mut server => {
+            // Before a signal the server only returns after an error it has logged.
+            tracing::error!("HTTP server stopped unexpectedly");
             std::process::exit(1);
         }
+        _ = shutdown_signal(shutdown_tx.clone()) => {}
     }
-
-    finish_shutdown(updater_task, tracker_thread).await
+    let background = Background {
+        updater: updater_task,
+        reserve_scanner: reserve_scanner_task,
+        tracker_stop_tx,
+        tracker_thread,
+    };
+    shutdown(tokio::time::Instant::now(), server, background).await
 }
 
 /// Stop a tracker that cannot start. Most of these checks run before tracing is initialised,
@@ -1023,12 +1036,16 @@ fn exit_on_startup_error(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-/// How long the shutdown waits for each of: open HTTP requests (TLS; plain HTTP requests are
-/// bounded by the 30 s request timeout), the tracker box updater, and the tracker thread.
-const SHUTDOWN_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+/// The whole shutdown, from the signal to the exit, takes at most this long.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Resolves on SIGTERM or SIGINT. Then the servers stop accepting connections and the tracker
-/// box updater is told to stop after its current cycle.
+/// The end of [`SHUTDOWN_DEADLINE`] that is kept for the tracker thread. Open connections and
+/// the background loops get the time before it, so the note store is closed even when one of
+/// them is stuck.
+const TRACKER_STOP_TIME: Duration = Duration::from_secs(5);
+
+/// Resolves on SIGTERM or SIGINT. Then the servers stop accepting connections, and the reserve
+/// scanner and the tracker box updater are told to stop after their current cycle.
 async fn shutdown_signal(stop_background: tokio::sync::broadcast::Sender<()>) {
     let interrupt = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -1058,36 +1075,112 @@ async fn shutdown_signal(stop_background: tokio::sync::broadcast::Sender<()>) {
     let _ = stop_background.send(());
 }
 
-/// After the HTTP server has stopped: wait for the tracker box updater to finish its current
-/// cycle, then for the tracker thread to finish its current command and close the note store
-/// (every sender of its channel is gone by then), and exit 0.
-async fn finish_shutdown(
-    updater_task: tokio::task::JoinHandle<()>,
+/// What runs besides the HTTP server and has to stop before the process exits.
+struct Background {
+    updater: tokio::task::JoinHandle<()>,
+    reserve_scanner: Option<tokio::task::JoinHandle<Result<(), ScannerError>>>,
+    tracker_stop_tx: tokio::sync::mpsc::Sender<TrackerCommand>,
     tracker_thread: tokio::task::JoinHandle<()>,
+}
+
+/// Finish the shutdown that a signal at `signalled` started, and exit 0 within
+/// [`SHUTDOWN_DEADLINE`] of it.
+///
+/// The HTTP server no longer accepts connections, and the reserve scanner and the tracker box
+/// updater were told to stop after their current cycle. Until [`TRACKER_STOP_TIME`] before the
+/// deadline, open connections may finish and both loops may end. Then the tracker thread gets
+/// `TrackerCommand::Shutdown`: it handles the commands sent before it, closes the note store
+/// and ends, and is waited for until the deadline. Whatever still runs then is logged and ends
+/// with the process.
+async fn shutdown(
+    signalled: tokio::time::Instant,
+    server: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    background: Background,
 ) -> ! {
-    tracing::info!("HTTP server stopped; waiting for the tracker box updater");
-    if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, updater_task)
+    use tokio::time::timeout_at;
+    let deadline = signalled + SHUTDOWN_DEADLINE;
+    let drain_deadline = deadline - TRACKER_STOP_TIME;
+    let mut late = Vec::new();
+
+    match timeout_at(drain_deadline, server).await {
+        Ok(()) => tracing::info!("HTTP server stopped"),
+        Err(_) => late.push("open HTTP connections"),
+    }
+    if timeout_at(drain_deadline, background.updater)
         .await
         .is_err()
     {
+        late.push("the tracker box updater");
+    }
+    if let Some(mut scanner) = background.reserve_scanner {
+        if timeout_at(drain_deadline, &mut scanner).await.is_err() {
+            scanner.abort();
+            late.push("the reserve scanner");
+        }
+    }
+    // A send error means the thread has already ended.
+    let stop = background.tracker_stop_tx.send(TrackerCommand::Shutdown);
+    let _ = timeout_at(deadline, stop).await;
+    drop(background.tracker_stop_tx);
+    if timeout_at(deadline, background.tracker_thread)
+        .await
+        .is_err()
+    {
+        late.push("the tracker thread");
+    }
+
+    let took = signalled.elapsed();
+    if late.is_empty() {
+        tracing::info!("Shutdown complete in {:.1?}", took);
+    } else {
         tracing::warn!(
-            "Tracker box updater still busy after {:?}; continuing shutdown",
-            SHUTDOWN_STEP_TIMEOUT
+            "Shutdown deadline: exiting after {:.1?} without waiting longer for {}",
+            took,
+            late.join(", ")
         );
     }
-    match tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, tracker_thread).await {
-        Ok(_) => tracing::info!("Tracker thread stopped; note store closed"),
-        Err(_) => tracing::warn!(
-            "Tracker thread still running after {:?}; exiting anyway",
-            SHUTDOWN_STEP_TIMEOUT
-        ),
-    }
-    tracing::info!("Shutdown complete");
     std::process::exit(0)
 }
 
+/// Serve the app until `stop` receives the shutdown message; then stop accepting connections
+/// and let open ones finish. [`shutdown`] bounds how long that may take.
+async fn serve(
+    listener: std::net::TcpListener,
+    app: Router,
+    server_config: &ServerConfig,
+    mut stop: tokio::sync::broadcast::Receiver<()>,
+) {
+    let stopped = async move {
+        let _ = stop.recv().await;
+    };
+    if server_config.tls_enabled() {
+        return serve_tls(listener, app, server_config, stopped).await;
+    }
+    if server_config.auth_enabled() {
+        tracing::warn!(
+            "Authentication is enabled but TLS is not. Credentials and signatures \
+             will be sent over plaintext. Configure tls_cert_path and tls_key_path \
+             for production use."
+        );
+    }
+    let listener = match tokio::net::TcpListener::from_std(listener) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("Failed to convert TCP listener: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(stopped)
+        .await
+    {
+        tracing::error!("Server error: {}", e);
+        std::process::exit(1);
+    }
+}
+
 /// Serve the app over HTTPS using the configured certificate and key, until `stop_signal`
-/// resolves; open connections then get [`SHUTDOWN_STEP_TIMEOUT`] to finish.
+/// resolves; open connections then get until [`TRACKER_STOP_TIME`] before the shutdown deadline.
 async fn serve_tls(
     listener: std::net::TcpListener,
     app: Router,
@@ -1130,7 +1223,7 @@ async fn serve_tls(
         let handle = handle.clone();
         async move {
             stop_signal.await;
-            handle.graceful_shutdown(Some(SHUTDOWN_STEP_TIMEOUT));
+            handle.graceful_shutdown(Some(SHUTDOWN_DEADLINE - TRACKER_STOP_TIME));
         }
     });
     if let Err(e) = server.handle(handle).serve(app.into_make_service()).await {

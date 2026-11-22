@@ -273,4 +273,8 @@ pub enum TrackerCommand {
         height: u64,
         response_tx: tokio::sync::oneshot::Sender<Result<usize, basis_store::NoteError>>,
     },
+    /// Stop the tracker thread: it handles the commands sent before this one, closes the note
+    /// store and ends. Sent once, at shutdown, after the HTTP server and the tracker box updater
+    /// have stopped.
+    Shutdown,
 }

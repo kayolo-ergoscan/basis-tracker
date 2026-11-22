@@ -36,11 +36,14 @@ storage keeps its keyspace open, and every journal is fsynced each second
 (`fsync_ms = 1000`): a process crash loses no acknowledged write, a power loss at most about
 one second of writes.
 
-On SIGTERM or SIGINT the server stops accepting connections and lets open requests finish
-(TLS: at most 30 s; plain HTTP requests are bounded by the 30 s request timeout). The tracker
-box updater is told to stop and finishes its current cycle (waited for up to 30 s). Then the
-tracker thread finishes its current command and closes the note store, and the process exits
-with status 0.
+On SIGTERM or SIGINT the server stops accepting connections, and the reserve scanner and the
+tracker box updater are told to stop after their current cycle. The whole shutdown takes at
+most 20 s from the signal. Open connections and both loops get the first 15 s. Then the
+tracker thread gets `TrackerCommand::Shutdown`: it handles the commands sent before it, closes
+the note store and is joined, within the last 5 s, so the note store is closed even when a
+client holds a connection open. Whatever still runs at the deadline is logged and ends with the
+process, which exits with status 0. With nothing in flight the shutdown takes about 2 s: each
+fjall keyspace waits up to one fsync interval to close.
 
 ## Dependencies
 

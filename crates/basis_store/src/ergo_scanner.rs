@@ -1240,11 +1240,16 @@ impl ServerState {
     }
 }
 
-/// Start the scanner in background
-pub async fn start_scanner(state: ServerState) -> Result<(), ScannerError> {
+/// Start the reserve scanner loop in the background.
+///
+/// The loop stops at its next wait once `shutdown` receives a message or its sender is
+/// dropped; await the returned handle to know when it has.
+pub async fn start_scanner(
+    state: ServerState,
+    shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> Result<tokio::task::JoinHandle<Result<(), ScannerError>>, ScannerError> {
     let state = Arc::new(state);
-    tokio::spawn(reserve_scanner_loop(state.clone()));
-    Ok(())
+    Ok(tokio::spawn(reserve_scanner_loop(state, shutdown)))
 }
 
 /// Create a scanner with default configuration
@@ -1340,8 +1345,27 @@ impl Default for NodeConfig {
     }
 }
 
-/// Reserve scanner loop (background task)
-pub async fn reserve_scanner_loop(state: Arc<ServerState>) -> Result<(), ScannerError> {
+/// Sleep for `duration`. Returns true, early, when the shutdown signal arrives first or its
+/// sender is gone.
+async fn sleep_unless_shutdown(
+    shutdown: &mut tokio::sync::broadcast::Receiver<()>,
+    duration: Duration,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown.recv() => true,
+        _ = tokio::time::sleep(duration) => false,
+    }
+}
+
+/// Reserve scanner loop (background task).
+///
+/// Runs until `shutdown` fires: a cycle in progress is finished, and the loop returns at the
+/// wait that follows it.
+pub async fn reserve_scanner_loop(
+    state: Arc<ServerState>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), ScannerError> {
     info!("Starting reserve scanner background loop");
 
     let mut consecutive_failures = 0;
@@ -1386,8 +1410,13 @@ pub async fn reserve_scanner_loop(state: Arc<ServerState>) -> Result<(), Scanner
                                     "Too many consecutive failures ({}), waiting before retry",
                                     consecutive_failures
                                 );
-                                tokio::time::sleep(Duration::from_secs(60)).await;
                                 // Wait longer after many failures
+                                if sleep_unless_shutdown(&mut shutdown, Duration::from_secs(60))
+                                    .await
+                                {
+                                    info!("Reserve scanner stopped");
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -1401,7 +1430,10 @@ pub async fn reserve_scanner_loop(state: Arc<ServerState>) -> Result<(), Scanner
                         "Too many consecutive failures ({}), waiting before retry",
                         consecutive_failures
                     );
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    if sleep_unless_shutdown(&mut shutdown, Duration::from_secs(60)).await {
+                        info!("Reserve scanner stopped");
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1412,7 +1444,10 @@ pub async fn reserve_scanner_loop(state: Arc<ServerState>) -> Result<(), Scanner
         } else {
             Duration::from_secs(30) // Normal wait
         };
-        tokio::time::sleep(wait_time).await;
+        if sleep_unless_shutdown(&mut shutdown, wait_time).await {
+            info!("Reserve scanner stopped");
+            return Ok(());
+        }
     }
 }
 
@@ -2957,5 +2992,22 @@ mod tests {
             .resolve_issuer_reserve(owner, &crate::DenomKey::Erg)
             .expect("issuer must keep working");
         assert_eq!(resolved.box_id, tracked_box);
+    }
+
+    #[tokio::test]
+    async fn reserve_scanner_loop_stops_on_shutdown() {
+        // Nothing listens on port 1: each cycle fails at once and the loop waits 10 s to retry.
+        let state = c4_test_state(NodeConfig {
+            node_url: "http://127.0.0.1:1".to_string(),
+            ..Default::default()
+        });
+        let (stop_tx, stop_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let scanner = start_scanner(state, stop_rx).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), scanner)
+            .await
+            .expect("the scanner stops at its wait instead of sleeping on");
+        assert!(matches!(result, Ok(Ok(()))), "{result:?}");
     }
 }
