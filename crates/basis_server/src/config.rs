@@ -245,17 +245,18 @@ pub struct ReserveTokenConfig {
     pub min_collateralization_ratio: Option<f64>,
 }
 
-/// Tracker wallet node configuration (`[ergo.wallet]`).
+/// Broadcast node configuration (`[ergo.wallet]`; the name is kept for existing configs).
 ///
-/// Used for every endpoint that touches the tracker's wallet or broadcasts
-/// transactions (`/wallet/*`, schnorr signing, `/transactions`). No extra indices
-/// are needed on this node. When `node_url` is empty, the scanner node is used.
+/// The tracker sends its locally signed transactions here through `POST /transactions` and
+/// uses no other endpoint of this node: no node wallet and no API key are needed, and no
+/// extra indices. When `node_url` is empty, the scanner node is used.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WalletNodeConfig {
-    /// Ergo node URL hosting the tracker wallet; empty means "use the scanner node".
+    /// Ergo node URL for broadcasts; empty means "use the scanner node".
     #[serde(default)]
     pub node_url: String,
-    /// API key for the wallet node; empty means "use the scanner node's key".
+    /// Optional API key for that node (`POST /transactions` does not need one); empty means
+    /// "use the scanner node's key".
     #[serde(default)]
     pub api_key: Option<String>,
 }
@@ -267,7 +268,7 @@ pub struct ErgoConfig {
     /// Scanner node configuration: chain reads and box scanning
     /// (`/blockchain/*`, `/utxo/*`, `/info`). Requires `extraIndex = true` on the node.
     pub scanner: NodeConfig,
-    /// Tracker wallet node configuration; falls back to `scanner` when unset.
+    /// Broadcast node (`POST /transactions`); falls back to `scanner` when unset.
     #[serde(default)]
     pub wallet: WalletNodeConfig,
     /// Basis reserve contract P2S address (ERG-backed reserve)
@@ -283,8 +284,9 @@ pub struct ErgoConfig {
     pub reserve_tokens: std::collections::HashMap<String, ReserveTokenConfig>,
     /// Tracker server's public key for the Ergo blockchain (hex-encoded, 33 bytes for compressed format)
     pub tracker_public_key: Option<String>,
-    /// Tracker server's secret key for local signing (hex-encoded, 32 bytes)
-    /// If provided, the server will sign redemption transactions locally instead of using the Ergo node API
+    /// Tracker secret key (hex-encoded, 32 bytes). Required: the tracker signs its commit
+    /// transactions, redemption fee inputs and tracker signatures in-process with it. It is
+    /// never sent to a node or anywhere else; the server refuses to start without it.
     pub tracker_secret_key: Option<String>,
 }
 
@@ -596,9 +598,9 @@ impl AppConfig {
         config
     }
 
-    /// Get the tracker wallet node `(url, api_key)`: `/wallet/*` endpoints, schnorr
-    /// signing, and transaction broadcast go here. Falls back to the scanner node
-    /// when `ergo.wallet.node_url` / `ergo.wallet.api_key` are not configured.
+    /// Get the broadcast node `(url, api_key)`: signed transactions go here through
+    /// `POST /transactions`. Falls back to the scanner node when `ergo.wallet.node_url` /
+    /// `ergo.wallet.api_key` are not configured.
     pub fn ergo_wallet_node(&self) -> (String, Option<String>) {
         let url = if self.ergo.wallet.node_url.is_empty() {
             self.ergo.scanner.node_url.clone()

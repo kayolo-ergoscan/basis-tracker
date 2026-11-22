@@ -285,7 +285,7 @@ pub struct ErgoBoxApi {
     pub additional_registers: std::collections::HashMap<String, String>,
     pub creation_height: u32,
     /// Box address (P2PK or P2S). Present on `/blockchain/box/unspent/byTokenId`
-    /// responses but not on `/wallet/boxes/unspent` inner `box` objects.
+    /// responses; optional because other box sources omit it.
     pub address: Option<String>,
 }
 
