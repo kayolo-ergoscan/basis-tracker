@@ -364,8 +364,8 @@ pub async fn apply_journaled_against(
                 "tracker reserve tree digest {tracker}, R5 of the reserve output {expected}"
             ));
             write_back(storage, &marked);
-            // Mined: it no longer holds back a commit.
-            shared_state.forget_submitted_redemptions(&[entry.tx_id.clone()]);
+            // Applied: it no longer holds back a commit.
+            shared_state.forget_submitted_redemptions(std::slice::from_ref(&entry.tx_id));
             Ok(Applied::Mismatch)
         }
         (expected, tracker) => {
@@ -664,7 +664,7 @@ pub async fn drop_journal_entry(
         );
     }
     let shared = state.shared_tracker_state.lock().await.clone();
-    shared.forget_submitted_redemptions(&[entry.tx_id.clone()]);
+    shared.forget_submitted_redemptions(std::slice::from_ref(&entry.tx_id));
     warn!(
         "Operator dropped journaled redemption {} ({} of {} -> {} in {}, cumulative {}{}): nothing was applied. If it is mined after all, the tracker's reserve tree is out of step with the chain.",
         entry.tx_id,

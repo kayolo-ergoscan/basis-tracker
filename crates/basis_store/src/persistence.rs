@@ -625,7 +625,7 @@ impl NoteStorage {
             batch.insert(&self.issuer_index, issuer_pubkey, value);
         }
         if let Some(value) = recipient_index_value {
-            batch.insert(&self.recipient_index, &note.recipient_pubkey, value);
+            batch.insert(&self.recipient_index, note.recipient_pubkey, value);
         }
         batch.insert(
             &self.reserve_avl_journal_partition,
