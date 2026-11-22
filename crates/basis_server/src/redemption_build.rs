@@ -1864,9 +1864,10 @@ async fn build_redemption_inner(
             Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "tracker unavailable"),
         };
 
-        // The miner fee is paid by explicit fee inputs, not deducted from the
-        // reserve output, so the simulated post-redemption collateral only
-        // decreases by the redeemed amount (fee = 0 here).
+        // The reserve output loses exactly the redeemed amount, whoever pays the miner fee: an
+        // ERG redemption pays it out of the payout (the recipient gets `amount - fee`), a token
+        // redemption from the tracker's fee inputs. So the simulated post-redemption collateral
+        // decreases by the redeemed amount only (fee = 0 here).
         if let Err(e) = crate::acceptance::redemption_check::check_redemption_policy_compliance(
             &issuer_pubkey,
             &recipient_pubkey,
