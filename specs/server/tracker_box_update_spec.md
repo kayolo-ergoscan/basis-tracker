@@ -275,6 +275,13 @@ To prevent submitting redundant updates during blockchain propagation:
    the pending notes are promoted and staged exchanges evaluated. A confirmed commit is so
    noticed within a minute instead of at the next cycle; the cycles, and with them the commits,
    keep the 600 s interval, and only the cycles decide that a transaction was dropped
+8. Note statuses follow the submitted digest, not the notes at the time of the broadcast. Every
+   note whose value behind the digest differs from its confirmed value records that value as
+   its pending value (that is what the chain holds once the commit confirms), but it is
+   `pending` only while its stored total still is that value. A note raised after the digest
+   was read stays `local_only` (round 5, review 5a): once the commit confirms, its confirmed
+   value is the digest's, and it becomes `confirmed` with the commit of its raise. A dropped
+   commit clears every pending value, of `pending` and `local_only` notes alike
 
 ### State Update Process
 

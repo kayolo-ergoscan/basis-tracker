@@ -936,6 +936,104 @@ mod confirmation_state_tests {
         assert_eq!(manager.mark_notes_pending([0x77; 33], "tx2", 3).unwrap(), 0);
     }
 
+    /// Round 5, review 5a: a note raised after the digest was taken gets the digest's value as
+    /// its pending value but is not `Pending`, so it is not shown as `Confirmed` once the update
+    /// confirms; the committed value is the digest's, and the next update confirms the raise.
+    #[test]
+    fn a_note_raised_after_the_snapshot_is_not_shown_as_pending() {
+        let mut manager = make_manager();
+        let issuer_secret = [1u8; 32];
+        let issuer = issuer_pubkey(&issuer_secret);
+        let (a, b) = ([2u8; 33], [3u8; 33]);
+        manager
+            .add_note(&issuer, &create_note(&issuer_secret, &a, 1_000, 1))
+            .unwrap();
+        manager
+            .add_note(&issuer, &create_note(&issuer_secret, &b, 700, 2))
+            .unwrap();
+        let submitted = manager.get_state().avl_root_digest;
+        // A is raised while the update is built.
+        manager
+            .add_note(&issuer, &create_note(&issuer_secret, &a, 1_500, 3))
+            .unwrap();
+        assert_eq!(manager.mark_notes_pending(submitted, "tx1", 1).unwrap(), 1, "B only");
+
+        let status = |m: &TrackerStateManager, who: &crate::PubKey| {
+            m.get_confirmation(&issuer, who, &crate::DenomKey::Erg).unwrap()
+        };
+        let a_mark = status(&manager, &a);
+        assert_eq!(a_mark.status, NoteConfirmationStatus::LocalOnly);
+        assert_eq!(a_mark.pending_total_debt, Some(1_000), "what the update commits");
+        assert_eq!(status(&manager, &b).status, NoteConfirmationStatus::Pending);
+
+        manager.confirm_pending_notes(submitted, "box1", 2).unwrap();
+        let a_confirmed = status(&manager, &a);
+        assert_eq!(a_confirmed.status, NoteConfirmationStatus::LocalOnly);
+        assert_eq!(a_confirmed.confirmed_total_debt, Some(1_000));
+        assert_eq!(status(&manager, &b).status, NoteConfirmationStatus::Confirmed);
+        // The committed tree (A at 1000, B at 700) matches the digest: B's proof works. A, like
+        // any note raised after a commit, waits for the commit of its raise.
+        assert!(manager
+            .generate_committed_tracker_lookup_proof(&issuer, &b, &crate::DenomKey::Erg)
+            .is_ok());
+        assert!(matches!(
+            manager.generate_committed_tracker_lookup_proof(&issuer, &a, &crate::DenomKey::Erg),
+            Err(crate::NoteError::NoteNotConfirmed)
+        ));
+
+        // The next update commits the raise.
+        let next = manager.get_state().avl_root_digest;
+        assert_eq!(manager.mark_notes_pending(next, "tx2", 3).unwrap(), 1, "A only");
+        manager.confirm_pending_notes(next, "box2", 4).unwrap();
+        let a_next = status(&manager, &a);
+        assert_eq!(a_next.status, NoteConfirmationStatus::Confirmed);
+        assert_eq!(a_next.confirmed_total_debt, Some(1_500));
+        let proof = manager
+            .generate_committed_tracker_lookup_proof(&issuer, &a, &crate::DenomKey::Erg)
+            .unwrap();
+        assert_eq!(proof.value, 1_500u64.to_be_bytes().to_vec());
+    }
+
+    /// Round 5, review 5a: a dropped update takes every pending value with it, also the one of
+    /// a note raised while the update was in flight (it is `LocalOnly`, not `Pending`).
+    #[test]
+    fn a_reverted_update_clears_the_pending_value_of_a_raised_note() {
+        let mut manager = make_manager();
+        let issuer_secret = [1u8; 32];
+        let issuer = issuer_pubkey(&issuer_secret);
+        let a = [2u8; 33];
+        manager
+            .add_note(&issuer, &create_note(&issuer_secret, &a, 1_000, 1))
+            .unwrap();
+        let submitted = manager.get_state().avl_root_digest;
+        assert_eq!(manager.mark_notes_pending(submitted, "tx1", 1).unwrap(), 1);
+        manager
+            .add_note(&issuer, &create_note(&issuer_secret, &a, 1_500, 2))
+            .unwrap();
+        let raised = manager
+            .get_confirmation(&issuer, &a, &crate::DenomKey::Erg)
+            .unwrap();
+        assert_eq!(raised.status, NoteConfirmationStatus::LocalOnly);
+        assert_eq!(raised.pending_total_debt, Some(1_000));
+
+        assert_eq!(manager.revert_pending_notes().unwrap(), 1);
+        let reverted = manager
+            .get_confirmation(&issuer, &a, &crate::DenomKey::Erg)
+            .unwrap();
+        assert_eq!(reverted.status, NoteConfirmationStatus::LocalOnly);
+        assert_eq!(reverted.pending_total_debt, None);
+        assert_eq!(reverted.pending_tx_id, None);
+        // A later confirmation with nothing marked promotes nothing.
+        manager.confirm_pending_notes(submitted, "box1", 2).unwrap();
+        assert_eq!(
+            manager
+                .get_confirmation(&issuer, &a, &crate::DenomKey::Erg)
+                .unwrap()
+                .confirmed_total_debt,
+            None
+        );
+    }
+
     #[test]
     fn committed_proof_unaffected_by_later_unconfirmed_notes() {
         let mut manager = make_manager();

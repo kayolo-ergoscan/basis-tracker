@@ -1033,14 +1033,34 @@ impl TrackerStateManager {
         self.confirmations.clone()
     }
 
-    /// Mark every note whose local value differs from its confirmed value as
-    /// `Pending`, recording the value that the in-flight update transaction will
-    /// commit. Returns the number of notes transitioned to `Pending`.
+    /// The stored total (`amount_collected`) of every note, by note key.
+    fn stored_totals(&self) -> Result<std::collections::HashMap<NoteKeyBytes, u64>, NoteError> {
+        Ok(self
+            .storage
+            .get_all_notes_with_issuer()?
+            .into_iter()
+            .map(|(issuer_pubkey, note)| {
+                let key = Self::confirmation_key(
+                    &issuer_pubkey,
+                    &note.recipient_pubkey,
+                    &note.denomination,
+                );
+                (key, note.amount_collected)
+            })
+            .collect())
+    }
+
+    /// Record the value that the in-flight update transaction will commit as the pending value
+    /// of every note whose committed value changes, and mark it `Pending` when its stored total
+    /// still is that value. Returns the number of notes marked `Pending`.
     ///
     /// The values recorded are the ones behind `digest` (the digest the update transaction
     /// commits), not the values at the time of the call: a note posted while the update was
-    /// being built is not in `digest` and stays `LocalOnly` (follow-up review N2). When the
-    /// values behind `digest` are no longer known (it is not among the last
+    /// being built is not in `digest` and stays `LocalOnly` (follow-up review N2). A note raised
+    /// in that window gets the value behind `digest` as its pending value, since that is what
+    /// the chain will hold, but it is not `Pending`: its stored total is not in flight, and
+    /// marking it `Pending` showed it as `Confirmed` one commit early (round 5, review 5a). When
+    /// the values behind `digest` are no longer known (it is not among the last
     /// [`RECENT_DIGEST_VALUES`] live digests), nothing is marked: the notes stay `LocalOnly`
     /// and the next update commits them.
     pub fn mark_notes_pending(
@@ -1062,20 +1082,38 @@ impl TrackerStateManager {
                 return Ok(0);
             }
         };
+        // The stored totals now. Unreadable storage marks nothing `Pending` (every status
+        // falls back to `LocalOnly`), but the pending values are still recorded: the chain
+        // will hold them once the update confirms.
+        let stored = self.stored_totals().unwrap_or_else(|e| {
+            tracing::warn!(
+                "Update tx {}: stored note totals unreadable ({:?}); its notes stay LocalOnly until the next reconcile",
+                tx_id,
+                e
+            );
+            std::collections::HashMap::new()
+        });
         let mut count = 0usize;
 
-        for (key, local_value) in values {
+        for (key, committed_value) in values {
             let entry = self
                 .confirmations
                 .entry(key)
                 .or_insert_with(NoteConfirmation::local_only);
 
-            if Some(local_value) != entry.confirmed_total_debt {
-                entry.pending_total_debt = Some(local_value);
+            if Some(committed_value) != entry.confirmed_total_debt {
+                entry.pending_total_debt = Some(committed_value);
                 entry.pending_tx_id = Some(tx_id.to_string());
-                entry.status = NoteConfirmationStatus::Pending;
+                let stored_value = stored.get(&key).copied();
+                entry.status = if stored_value == Some(committed_value) {
+                    count += 1;
+                    NoteConfirmationStatus::Pending
+                } else if stored_value.is_some() && stored_value == entry.confirmed_total_debt {
+                    NoteConfirmationStatus::Confirmed
+                } else {
+                    NoteConfirmationStatus::LocalOnly
+                };
                 let _ = self.storage.store_confirmation(&key, entry);
-                count += 1;
             }
         }
 
@@ -1143,36 +1181,37 @@ impl TrackerStateManager {
         Ok(count)
     }
 
-    /// Revert every `Pending` note back to its prior state (used when an update
-    /// transaction is dropped or rejected). Clears pending metadata and recomputes
-    /// the status from the local value versus the confirmed value. Returns the
-    /// number of notes reverted.
+    /// Drop the in-flight update's pending values (used when an update transaction is dropped
+    /// or rejected): every note that has one loses it, `Pending` or not, and its status is
+    /// recomputed from the stored total versus the confirmed value. A note raised while the
+    /// update was in flight is `LocalOnly` but still carries a pending value; leaving it there
+    /// let a later confirmation promote the value of a transaction that never made it (round 5,
+    /// review 5a). Returns the number of notes reverted.
     pub fn revert_pending_notes(&mut self) -> Result<usize, NoteError> {
-        let notes = self.storage.get_all_notes_with_issuer()?;
+        let stored = self.stored_totals()?;
         let mut count = 0usize;
 
-        for (issuer_pubkey, note) in &notes {
-            let key =
-                Self::confirmation_key(issuer_pubkey, &note.recipient_pubkey, &note.denomination);
-            let is_pending = self
-                .confirmations
-                .get(&key)
-                .map(|c| c.status == NoteConfirmationStatus::Pending)
-                .unwrap_or(false);
-
-            if is_pending {
-                if let Some(entry) = self.confirmations.get_mut(&key) {
-                    entry.pending_total_debt = None;
-                    entry.pending_tx_id = None;
-                    let local_value = note.amount_collected;
-                    entry.status = if Some(local_value) == entry.confirmed_total_debt {
+        let keys: Vec<NoteKeyBytes> = self
+            .confirmations
+            .iter()
+            .filter(|(_, c)| {
+                c.pending_total_debt.is_some() || c.status == NoteConfirmationStatus::Pending
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            if let Some(entry) = self.confirmations.get_mut(&key) {
+                entry.pending_total_debt = None;
+                entry.pending_tx_id = None;
+                let stored_value = stored.get(&key).copied();
+                entry.status =
+                    if stored_value.is_some() && stored_value == entry.confirmed_total_debt {
                         NoteConfirmationStatus::Confirmed
                     } else {
                         NoteConfirmationStatus::LocalOnly
                     };
-                    let _ = self.storage.store_confirmation(&key, entry);
-                    count += 1;
-                }
+                let _ = self.storage.store_confirmation(&key, entry);
+                count += 1;
             }
         }
 
