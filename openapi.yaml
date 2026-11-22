@@ -1161,8 +1161,11 @@ paths:
         '409':
           description: >-
             `request_timestamp` not greater than the recipient's previous build
-            request (replay), the issuer has more than one tracked reserve, or
-            the committed state is ahead of a consented decrease
+            request (replay), the issuer has more than one tracked reserve, a
+            redemption of this reserve submitted through `/redemption/submit` is
+            still waiting for the chain ("... has redemption <tx id> waiting for
+            the chain ..."), or the committed state is ahead of a consented
+            decrease
           content:
             application/json:
               schema:
@@ -1208,6 +1211,14 @@ paths:
         replaced by a newer build of the same note (issuer, recipient,
         denomination). An unknown, expired, replaced or used entry is 409; a
         build that is never submitted blocks nothing.
+
+        The redemption state follows the chain (round 5): the redemption is
+        journaled before the broadcast and applied to the note
+        (`amount_redeemed`) and the reserve tree only once it is in a block,
+        `[confirmation] min_depth` deep (checked every 60 s). Until then the
+        note shows the previous `amount_redeemed`, and `/redemption/build` of
+        the same reserve answers 409. A redemption in no mempool and not on
+        chain for 10 checks (about 10 minutes) is dropped unapplied.
       operationId: submitRedemption
       tags:
         - Redemption
@@ -1234,7 +1245,10 @@ paths:
           description: >-
             Internal server error, or the node did not accept the transaction
             ("the node did not accept redemption <id>; build it again with POST
-            /redemption/build"); the node's URL and answer are logged, never returned
+            /redemption/build"; nothing is journaled), or the node's answer was
+            lost ("the node did not answer for redemption <id>; the tracker
+            watches the chain for it ..."; it stays journaled and is applied if
+            mined); the node's URL and answer are logged, never returned
           content:
             application/json:
               schema:

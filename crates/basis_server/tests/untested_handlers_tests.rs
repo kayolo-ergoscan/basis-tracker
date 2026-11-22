@@ -659,6 +659,42 @@ mod untested_handlers {
         assert_eq!(status, StatusCode::OK, "body: {:?}", body);
         assert!(body.success, "error: {:?}", body.error);
 
+        // Round 5 (C8): the submit journals the stored values and applies nothing; the note
+        // changes once the redemption confirmer finds the transaction in a block.
+        let journaled = state.tracker_storage.journaled_redemptions().unwrap();
+        assert_eq!(journaled.len(), 1);
+        assert_eq!(journaled[0].tx_id, body.data.as_ref().unwrap().tx_id);
+        assert_eq!(
+            (journaled[0].redeemed_amount, journaled[0].new_already_redeemed),
+            (1_000, 1_000),
+            "the stored entry's amounts, not the wire values"
+        );
+        assert_eq!(note_redeemed(&state, issuer, recipient).await, 0);
+        let shared = state.shared_tracker_state.lock().await.clone();
+        assert_eq!(shared.get_submitted_redemptions().len(), 1);
+
+        basis_server::redemption_confirmer::apply_journaled(
+            &state.tracker_storage,
+            &shared,
+            &state.tx,
+            &journaled[0],
+        )
+        .await
+        .unwrap();
+        assert!(state.tracker_storage.journaled_redemptions().unwrap().is_empty());
+        assert!(shared.get_submitted_redemptions().is_empty());
+        assert_eq!(
+            note_redeemed(&state, issuer, recipient).await,
+            1_000,
+            "state must advance by the stored entry amount, not the wire value"
+        );
+    }
+
+    async fn note_redeemed(
+        state: &basis_server::AppState,
+        issuer: basis_store::PubKey,
+        recipient: basis_store::PubKey,
+    ) -> u64 {
         let (tx, rx) = tokio::sync::oneshot::channel();
         state
             .tx
@@ -670,15 +706,50 @@ mod untested_handlers {
             })
             .await
             .unwrap();
-        let note = rx
-            .await
+        rx.await
             .expect("tracker should answer the note lookup")
             .expect("note lookup should succeed")
-            .expect("note should exist");
+            .expect("note should exist")
+            .amount_redeemed
+    }
 
+    /// Round 5 (C8): a broadcast whose answer is lost (the node may have the transaction)
+    /// keeps the redemption journaled, so the confirmer follows it, and says so.
+    #[tokio::test]
+    async fn test_submit_redemption_without_an_answer_stays_journaled() {
+        // Accepts the request, then closes the connection without answering.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                drop(socket);
+            }
+        });
+        let state = mock_state_with_config(&node_url).await;
+        let (unsigned_tx, signed_tx) = record_pending(&state, ISSUER_HEX, RECIPIENT_HEX, 1_000);
+        let req = submit_request(unsigned_tx, signed_tx);
+        let (status, body) = submit_redemption(
+            axum::extract::State(state.clone()),
+            axum::extract::Json(req),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {:?}", body);
+        let msg = body.error.clone().unwrap_or_default();
+        assert!(msg.contains("did not answer"), "{msg}");
+        assert!(!msg.contains("127.0.0.1"), "{msg}");
+        assert_eq!(state.tracker_storage.journaled_redemptions().unwrap().len(), 1);
         assert_eq!(
-            note.amount_redeemed, 1_000,
-            "state must advance by the stored entry amount, not the wire value"
+            state
+                .shared_tracker_state
+                .lock()
+                .await
+                .get_submitted_redemptions()
+                .len(),
+            1
         );
     }
 
@@ -715,8 +786,11 @@ mod untested_handlers {
 
         let (unsigned_tx, signed_tx) = record_pending(&state, ISSUER_HEX, RECIPIENT_HEX, 1_000);
         let req = submit_request(unsigned_tx, signed_tx);
-        let (status, body) =
-            submit_redemption(axum::extract::State(state), axum::extract::Json(req)).await;
+        let (status, body) = submit_redemption(
+            axum::extract::State(state.clone()),
+            axum::extract::Json(req),
+        )
+        .await;
 
         assert_eq!(
             status,
@@ -724,6 +798,8 @@ mod untested_handlers {
             "body: {:?}",
             body
         );
+        // Round 5 (C8): the node does not have it, so nothing stays journaled.
+        assert!(state.tracker_storage.journaled_redemptions().unwrap().is_empty());
         assert!(!body.success);
         let msg = body.error.clone().unwrap_or_default();
         assert!(

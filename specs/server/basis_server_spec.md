@@ -79,8 +79,10 @@ fjall keyspace waits up to one fsync interval to close.
   ERG reserves pay the miner fee out of the payout (only the reserve is spent, the tracker signs
   nothing, `fee_paid_by: "recipient"`), token reserves use tracker-signed fee inputs
   (`fee_paid_by: "tracker"`)
-- `POST /redemption/submit` - Tracker-assisted redemption step 2: broadcast a signed redemption
-  transaction and sync local state
+- `POST /redemption/submit` - Tracker-assisted redemption step 2: journal and broadcast a signed
+  redemption transaction. The note and the reserve tree follow once it is in a block,
+  `[confirmation] min_depth` deep (the redemption confirmer, every 60 s); meanwhile builds of
+  that reserve answer 409 (round 5, see `specs/server/redemption_state_spec.md`)
 - `GET /proof/redemption` - Get redemption-specific proof with tracker state digest
 
 ### Tracker State and Proof Endpoints

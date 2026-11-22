@@ -9,6 +9,7 @@ pub mod local_wallet;
 pub mod models;
 pub mod note_limits;
 pub mod redemption_build;
+pub mod redemption_confirmer;
 pub mod reserve_api;
 pub mod store;
 pub mod tracker_box_updater;

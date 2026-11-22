@@ -868,6 +868,29 @@ impl World {
         shared.set_confirmed(digest, box_id, height);
     }
 
+    /// What the redemption confirmer does once a redemption submitted through the tracker is
+    /// in a block, deep enough (round 5, C8): it applies the journaled redemption to the note
+    /// and the reserve tree, and removes it from the journal.
+    async fn confirm_redemptions(&self) {
+        let shared = self.state.shared_tracker_state.lock().await.clone();
+        for entry in self.state.tracker_storage.journaled_redemptions().unwrap() {
+            basis_server::redemption_confirmer::apply_journaled(
+                &self.state.tracker_storage,
+                &shared,
+                &self.state.tx,
+                &entry,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(self
+            .state
+            .tracker_storage
+            .journaled_redemptions()
+            .unwrap()
+            .is_empty());
+    }
+
     /// What the scanner does when a reserve box of A is in a block: it replaces the reserve
     /// it succeeds in both reserve stores.
     async fn admit_reserve(&self, reserve: &ErgoBox) {
@@ -1383,6 +1406,24 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
             .unwrap_or_default()
     );
     assert_eq!(recorded.data_input_ids.len(), 1, "the tracker box");
+    // Round 5 (C8): the tracker records the redemption once the chain has it.
+    let journaled = w.state.tracker_storage.journaled_redemptions().unwrap();
+    assert_eq!(journaled.len(), 1);
+    assert_eq!(journaled[0].tx_id, String::from(first.id()));
+    assert_eq!(
+        (journaled[0].redeemed_amount, journaled[0].new_already_redeemed),
+        (100_000_000, 100_000_000)
+    );
+    let note = fetch_note(&w.context(), &w.a.pk, &w.b.pk)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (note.amount_collected, note.amount_redeemed),
+        (300_000_000, 0),
+        "nothing is recorded before the chain has it"
+    );
+    w.confirm_redemptions().await;
     let note = fetch_note(&w.context(), &w.a.pk, &w.b.pk)
         .await
         .unwrap()
@@ -1431,6 +1472,7 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
         (w.b.tree(), 249_000_000)
     );
     assert_eq!(second.inputs.len(), 1);
+    w.confirm_redemptions().await;
     let note = fetch_note(&w.context(), &w.a.pk, &w.b.pk)
         .await
         .unwrap()
@@ -1458,6 +1500,13 @@ async fn the_canary_runs_the_whole_flow_against_the_tracker() {
         .ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
         .await;
     w.node.wallet_rejects.store(false, Ordering::SeqCst);
+    // The tracker's node refused it, so the tracker journaled nothing to follow.
+    assert!(w
+        .state
+        .tracker_storage
+        .journaled_redemptions()
+        .unwrap()
+        .is_empty());
     for expected in [
         "the tracker did not submit it: POST /redemption/submit: HTTP 500: the node did not \
          accept redemption",

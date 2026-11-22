@@ -844,3 +844,55 @@ async fn a_build_that_is_never_submitted_does_not_block_the_next_one() {
     let (status, _) = h.build(h.request(amount)).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
+
+/// Round 5 (C8): while a redemption of the reserve waits for the chain (it is journaled), a
+/// build of that reserve is refused with 409 naming it; one of another issuer or denomination
+/// does not block. Once it is applied or dropped (no longer journaled), builds work again.
+#[tokio::test]
+async fn a_reserve_with_a_journaled_redemption_builds_nothing() {
+    let h = harness(Node::Healthy, 12).await;
+    let waiting = basis_store::persistence::JournaledRedemption {
+        tx_id: "5e".repeat(32),
+        reserve_box_id: String::from(h.reserve.box_id()),
+        issuer_pubkey: hex::encode(h.issuer_pk),
+        recipient_pubkey: hex::encode(h.recipient_pk),
+        denomination: DenomKey::Erg.denomination_id(),
+        redeemed_amount: 10_000_000,
+        new_already_redeemed: 10_000_000,
+        data_input_ids: vec![String::from(h.tracker_box.box_id())],
+        submitted_at_ms: 1,
+        missing_checks: 0,
+        apply_error: None,
+    };
+    let others = [
+        basis_store::persistence::JournaledRedemption {
+            tx_id: "6f".repeat(32),
+            issuer_pubkey: hex::encode([0x02; 33]),
+            ..waiting.clone()
+        },
+        basis_store::persistence::JournaledRedemption {
+            tx_id: "7a".repeat(32),
+            denomination: DenomKey::Token([0x7c; 32]).denomination_id(),
+            ..waiting.clone()
+        },
+    ];
+    for other in &others {
+        h.state.tracker_storage.journal_redemption(other).unwrap();
+    }
+    let (status, body) = h.build(h.request(20_000_000)).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.error);
+
+    h.state.tracker_storage.journal_redemption(&waiting).unwrap();
+    let (status, body) = h.build(h.request(20_000_000)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let error = body.error.unwrap();
+    assert!(error.contains(&waiting.tx_id), "{error}");
+    assert!(error.contains("waiting for the chain"), "{error}");
+
+    h.state
+        .tracker_storage
+        .remove_journaled_redemption(&waiting.tx_id)
+        .unwrap();
+    let (status, body) = h.build(h.request(20_000_000)).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.error);
+}

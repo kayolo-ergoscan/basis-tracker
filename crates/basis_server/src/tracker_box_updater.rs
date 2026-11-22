@@ -200,15 +200,27 @@ impl SharedTrackerState {
     /// Remember a redemption `/redemption/submit` just broadcast (round 5, item 3), so the
     /// updater does not spend the tracker box it reads while it waits in the mempool.
     pub fn record_submitted_redemption(&self, tx_id: String, data_input_ids: Vec<String>) {
+        self.record_submitted_redemption_at(tx_id, data_input_ids, std::time::Instant::now());
+    }
+
+    /// [`Self::record_submitted_redemption`] for a redemption submitted at `submitted_at`: the
+    /// redemption journal at startup (round 5, C8), so a restart does not restart the
+    /// deferral limit.
+    pub fn record_submitted_redemption_at(
+        &self,
+        tx_id: String,
+        data_input_ids: Vec<String>,
+        submitted_at: std::time::Instant,
+    ) {
         let mut submitted = self
             .submitted_redemptions
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        submitted.retain(|r| r.tx_id != tx_id);
+        submitted.retain(|r| !r.tx_id.eq_ignore_ascii_case(&tx_id));
         submitted.push(SubmittedRedemption {
             tx_id,
             data_input_ids,
-            submitted_at: std::time::Instant::now(),
+            submitted_at,
         });
         let excess = submitted.len().saturating_sub(MAX_SUBMITTED_REDEMPTIONS);
         submitted.drain(..excess);
@@ -231,7 +243,7 @@ impl SharedTrackerState {
             .submitted_redemptions
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        submitted.retain(|r| !tx_ids.contains(&r.tx_id));
+        submitted.retain(|r| !tx_ids.iter().any(|id| id.eq_ignore_ascii_case(&r.tx_id)));
     }
 }
 
@@ -1004,6 +1016,15 @@ impl TrackerBoxUpdater {
         } else {
             Ok(None)
         }
+    }
+
+    /// Round 5 (C8): whether `tx_id` is in a block at least `min_confirmation_depth` deep: one
+    /// chain lookup on the scanner node, plus one `/info` read once it is in a block.
+    pub async fn confirmed_deep_enough(
+        config: &TrackerBoxUpdateConfig,
+        tx_id: &str,
+    ) -> Result<bool, TrackerBoxUpdaterError> {
+        Ok(Self::poll_pending_commit(config, tx_id).await?.is_some())
     }
 
     /// Whether the commit `tx_id`, in a block at `confirming.inclusion_height`, is at least

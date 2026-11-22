@@ -718,6 +718,25 @@ async fn main() {
             config.transaction.heartbeat_blocks
         );
     }
+    // Round 5 (C8): redemptions submitted before a restart still wait for the chain, and still
+    // hold back a commit that would spend the tracker box they read.
+    basis_server::redemption_confirmer::restore_submitted_redemptions(
+        &tracker_storage,
+        &shared_tracker_state_for_updater,
+    );
+    let confirmer_task = tokio::spawn(basis_server::redemption_confirmer::run(
+        tracker_box_config.clone(),
+        tracker_storage.clone(),
+        shared_tracker_state_for_updater.clone(),
+        tx.clone(),
+        basis_server::redemption_confirmer::REDEMPTION_CHECK_INTERVAL,
+        shutdown_tx.subscribe(),
+    ));
+    tracing::info!(
+        "Redemption confirmer started: submitted redemptions are applied once in a block, {} deep",
+        config.confirmation.min_depth
+    );
+
     // Start the tracker box updater in the background
     let updater_config = tracker_box_config.clone();
     let shared_state_clone = shared_tracker_state_for_updater.clone();
@@ -1064,6 +1083,7 @@ async fn main() {
     }
     let background = Background {
         updater: updater_task,
+        confirmer: confirmer_task,
         reserve_scanner: reserve_scanner_task,
         tracker_stop_tx,
         tracker_thread,
@@ -1123,6 +1143,7 @@ async fn shutdown_signal(stop_background: tokio::sync::broadcast::Sender<()>) {
 /// What runs besides the HTTP server and has to stop before the process exits.
 struct Background {
     updater: tokio::task::JoinHandle<()>,
+    confirmer: tokio::task::JoinHandle<()>,
     reserve_scanner: Option<tokio::task::JoinHandle<Result<(), ScannerError>>>,
     tracker_stop_tx: tokio::sync::mpsc::Sender<TrackerCommand>,
     tracker_thread: tokio::task::JoinHandle<()>,
@@ -1131,9 +1152,10 @@ struct Background {
 /// Finish the shutdown that a signal at `signalled` started, and exit 0 within
 /// [`SHUTDOWN_DEADLINE`] of it.
 ///
-/// The HTTP server no longer accepts connections, and the reserve scanner and the tracker box
-/// updater were told to stop after their current cycle. Until [`TRACKER_STOP_TIME`] before the
-/// deadline, open connections may finish and both loops may end. Then the tracker thread gets
+/// The HTTP server no longer accepts connections, and the reserve scanner, the tracker box
+/// updater and the redemption confirmer were told to stop after their current cycle. Until
+/// [`TRACKER_STOP_TIME`] before the deadline, open connections may finish and the loops may
+/// end. Then the tracker thread gets
 /// `TrackerCommand::Shutdown`: it handles the commands sent before it, closes the note store
 /// and ends, and is waited for until the deadline. Whatever still runs then is logged and ends
 /// with the process.
@@ -1156,6 +1178,12 @@ async fn shutdown(
         .is_err()
     {
         late.push("the tracker box updater");
+    }
+    if timeout_at(drain_deadline, background.confirmer)
+        .await
+        .is_err()
+    {
+        late.push("the redemption confirmer");
     }
     if let Some(mut scanner) = background.reserve_scanner {
         if timeout_at(drain_deadline, &mut scanner).await.is_err() {

@@ -569,7 +569,9 @@ counting the change that returns there.
 
 ### POST /redemption/submit
 
-Broadcasts the fully-signed transaction via the node and then **syncs local state**.
+Journals the fully-signed transaction, broadcasts it via the node, and leaves the state sync to
+the **redemption confirmer**, which applies it once the chain has it (round 5, C8; see "State
+follows the chain" below).
 
 **Request Body:**
 ```json
@@ -593,19 +595,57 @@ otherwise `400 Bad Request`. The caller-supplied `issuer_pubkey` / `recipient_pu
 `redeemed_amount` / `new_already_redeemed` fields are accepted for backward compatibility but
 **ignored (deprecated)**: all state derives from the stored build entry.
 
-**State-sync contract (required):** after a successful broadcast the tracker MUST:
+**State-sync contract (required):** once the redemption is in a block, at least
+`[confirmation] min_depth` deep (default 2), the tracker MUST:
 
 1. Increment the note's `amount_redeemed` by the build entry's redeemed amount (note accounting;
-   cumulative redeemed against total debt), refreshing the note timestamp.
+   cumulative redeemed against total debt). The note timestamp is part of the issuer's signed
+   message and stays as signed.
 2. Sync the reserve AVL tree entry to the build entry's `new_already_redeemed` keyed with the note's
-   **pre-refresh** payment timestamp (the on-chain reserve tree value is
-   `payment_timestamp || already_redeemed`). This value comes from the build response,
-   not from the note record — the two diverge for fresh reserves or repaired state.
+   payment timestamp (the on-chain reserve tree value is `payment_timestamp || already_redeemed`).
+   This value comes from the build entry, not from the note record.
 
-If the sync fails, the tx is already on-chain: the error is logged and the response
-still returns the tx id; state must then be repaired manually (see below). A submit
-that skips this sync leaves the reserve tree stale, and the next `/redemption/build`
-will find no reserve whose on-chain R5 matches the local digest.
+**State follows the chain (round 5, C8).** Until round 4 the submit applied both steps right
+after the broadcast, so a redemption that never reached a block (dropped from the mempool, or
+invalidated by a tracker commit that spent its data input) left the note and the reserve tree
+one redemption ahead of the chain, and the reserve built nothing until an operator repaired it.
+Now:
+
+1. **Journal.** Before the broadcast the submit writes the redemption (tx id, reserve box,
+   issuer, recipient, denomination, redeemed amount, `new_already_redeemed`, data inputs, submit
+   time) into the journal: partition `redemption_journal` of the `tracker_boxes` store, JSON per
+   tx id. A broadcast the node refuses (an error answer, or no connection) removes it again and
+   answers `500` "the node did not accept redemption ...". A broadcast whose answer is lost
+   keeps it (the node may have the transaction) and answers `500` "the node did not answer for
+   redemption ...; the tracker watches the chain for it". A successful broadcast answers `200`
+   with the tx id, as before; nothing is applied yet.
+2. **Confirmer.** Every 60 s the redemption confirmer looks each journaled redemption up, in the
+   mempools first and then on chain (the tracker box updater's lookup order):
+   - in a block, at least `[confirmation] min_depth` deep: applied (the two steps above, as one
+     `CompleteRedemption` with the cumulative value) and removed from the journal;
+   - in a mempool, or in a block not deep enough yet: kept;
+   - in neither for 10 consecutive checks (about 10 minutes): dropped, never applied. The note
+     and the reserve tree are as before the build, and the recipient can build it again;
+   - a node error: kept, not counted;
+   - applying fails (the tracker's state no longer matches the build): kept with the error,
+     logged once and tried again at every check. An operator repair (`/redeem/complete` below,
+     with the same `new_already_redeemed`) records it, and the next attempt finds it applied.
+3. **Idempotent apply.** `CompleteRedemption` with an explicit `new_already_redeemed` that the
+   note's `amount_redeemed` and the reserve tree value both already equal changes nothing and
+   succeeds: the confirmer and an operator repair may both send the same redemption. Any other
+   value must still be the note's `amount_redeemed + redeemed_amount`.
+4. **Builds wait.** While a reserve (issuer and denomination) has a journaled redemption,
+   `/redemption/build` answers `409 Conflict` naming it: a second build would spend the same
+   reserve box, and the reserve tree is one redemption behind the chain until it is applied.
+5. **Restart.** The journal is on disk. At startup its redemptions are again among those that
+   hold back a commit (with their submit time, so the 20-minute limit is not restarted), and
+   the confirmer follows them.
+
+Not done in round 5: **scanner reconciliation** of a redemption that did not go through this
+tracker's submit (submitted through another node after the tracker's broadcast was refused, as
+the canary does, or one the journal dropped and that was mined later). The tracker's reserve
+tree is then behind the chain, and the build answers that no reserve matches the tracker's
+reserve tree until an operator records it with `/redeem/complete`, as before.
 
 **Commits wait for it (round 5).** The broadcast redemption reads the tracker box as its data
 input, and a tracker commit spends that box. The submit records the redemption's tx id and data

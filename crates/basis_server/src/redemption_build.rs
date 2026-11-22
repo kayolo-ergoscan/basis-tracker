@@ -318,22 +318,49 @@ impl NodeClient {
         crate::local_wallet::state_context_from_headers(self.last_headers().await?)
     }
 
-    async fn broadcast(&self, tx: &Value) -> Result<String, String> {
+    async fn broadcast(&self, tx: &Value) -> Result<String, BroadcastFailure> {
         let client = basis_store::http::bounded_client();
         let url = format!("{}/transactions", self.url);
         let mut req = client.post(&url).json(tx);
         if let Some(ref k) = self.api_key {
             req = req.header("api_key", k);
         }
-        let resp = req.send().await.map_err(|e| format!("broadcast: {e}"))?;
+        let resp = req.send().await.map_err(|e| {
+            if e.is_connect() {
+                BroadcastFailure::Refused(format!("broadcast: {e}"))
+            } else {
+                BroadcastFailure::NoAnswer(format!("broadcast: {e}"))
+            }
+        })?;
         let status = resp.status();
         let body = basis_store::http::read_body_capped(resp)
             .await
             .unwrap_or_default();
         if !status.is_success() {
-            return Err(format!("broadcast rejected HTTP {status}: {body}"));
+            return Err(BroadcastFailure::Refused(format!(
+                "broadcast rejected HTTP {status}: {body}"
+            )));
         }
         Ok(parse_broadcast_tx_id(&body))
+    }
+}
+
+/// Why a broadcast failed (round 5, C8): it decides whether the redemption journal keeps the
+/// redemption.
+#[derive(Debug)]
+enum BroadcastFailure {
+    /// The node answered with an error, or no connection was made: it does not have the
+    /// transaction.
+    Refused(String),
+    /// The request went out but no answer came back: the node may have the transaction.
+    NoAnswer(String),
+}
+
+impl std::fmt::Display for BroadcastFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BroadcastFailure::Refused(e) | BroadcastFailure::NoAnswer(e) => f.write_str(e),
+        }
     }
 }
 
@@ -1477,6 +1504,39 @@ async fn build_redemption_inner(
         crate::api::ensure_single_issuer_reserve(state, &payload.issuer_pubkey, &denomination).await
     {
         return api_err(StatusCode::CONFLICT, msg);
+    }
+
+    // Round 5 (C8): while a redemption of this reserve waits for the chain, a build would spend
+    // the same reserve box, and the reserve tree is one redemption behind the chain until the
+    // confirmer applies it.
+    match crate::redemption_confirmer::waiting_redemption(
+        &state.tracker_storage,
+        &issuer_hex,
+        &denomination,
+    ) {
+        Ok(None) => {}
+        Ok(Some(waiting)) => {
+            return api_err(
+                StatusCode::CONFLICT,
+                format!(
+                    "the reserve of issuer {issuer_hex} in {} has redemption {} waiting for the \
+                     chain; build again once it is confirmed, or once it is dropped (about {} \
+                     minutes in no mempool)",
+                    denomination.denomination_id(),
+                    waiting.tx_id,
+                    crate::redemption_confirmer::MAX_REDEMPTION_MISSING_CHECKS as u64
+                        * crate::redemption_confirmer::REDEMPTION_CHECK_INTERVAL.as_secs()
+                        / 60
+                ),
+            )
+        }
+        Err(e) => {
+            tracing::error!("Cannot read the redemption journal: {e}");
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the tracker cannot read its redemption journal",
+            );
+        }
     }
 
     // Tracker lookup proof (context var #8) + authoritative total debt.
@@ -2678,26 +2738,6 @@ pub async fn submit_redemption(
         }
     };
 
-    let node = NodeClient::wallet(&state);
-    let tx_id = match node.broadcast(&payload.signed_tx).await {
-        Ok(tx_id) => tx_id,
-        Err(e) => {
-            // SECURITY (round 4, C2): the node's URL and answer stay in the log.
-            tracing::warn!(
-                "redemption {} broadcast failed: {e}",
-                pending.unsigned_tx_id
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(error_response(format!(
-                    "the node did not accept redemption {}; build it again with \
-                     POST /redemption/build",
-                    pending.unsigned_tx_id
-                ))),
-            );
-        }
-    };
-
     // Round 5, item 3: the updater holds back a commit that would spend the tracker box this
     // redemption reads as its data input while the redemption waits in the mempool.
     let data_input_ids: Vec<String> = payload
@@ -2712,38 +2752,126 @@ pub async fn submit_redemption(
                 .collect()
         })
         .unwrap_or_default();
+
+    // Round 5 (C8): the redemption state follows the chain. The redemption is journaled before
+    // it is broadcast, and the redemption confirmer applies it to the note and the reserve tree
+    // once it is in a block, deep enough (`crate::redemption_confirmer`): not here. The reserve
+    // tree value is the cumulative amount the build proved on chain.
+    let journaled = basis_store::persistence::JournaledRedemption {
+        tx_id: pending.unsigned_tx_id.to_ascii_lowercase(),
+        reserve_box_id: pending.reserve_box_id.clone(),
+        issuer_pubkey: hex::encode(issuer_pubkey),
+        recipient_pubkey: hex::encode(recipient_pubkey),
+        denomination: pending.denomination.denomination_id(),
+        redeemed_amount: pending.redeemed_amount,
+        new_already_redeemed: pending.new_already_redeemed,
+        data_input_ids: data_input_ids.clone(),
+        submitted_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default(),
+        missing_checks: 0,
+        apply_error: None,
+    };
+    if let Err(e) = state.tracker_storage.journal_redemption(&journaled) {
+        tracing::error!(
+            "redemption {} cannot be journaled, so it is not broadcast: {:?}",
+            pending.unsigned_tx_id,
+            e
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(error_response(format!(
+                "the tracker cannot record redemption {}, so it did not submit it; build it \
+                 again with POST /redemption/build",
+                pending.unsigned_tx_id
+            ))),
+        );
+    }
+
+    let node = NodeClient::wallet(&state);
+    let tx_id = match node.broadcast(&payload.signed_tx).await {
+        Ok(tx_id) => tx_id,
+        Err(BroadcastFailure::Refused(e)) => {
+            // SECURITY (round 4, C2): the node's URL and answer stay in the log.
+            tracing::warn!(
+                "redemption {} broadcast failed: {e}",
+                pending.unsigned_tx_id
+            );
+            // The node does not have it: there is nothing to follow.
+            if let Err(e) = state
+                .tracker_storage
+                .remove_journaled_redemption(&journaled.tx_id)
+            {
+                tracing::error!(
+                    "refused redemption {} stays journaled: {:?}",
+                    journaled.tx_id,
+                    e
+                );
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_response(format!(
+                    "the node did not accept redemption {}; build it again with \
+                     POST /redemption/build",
+                    pending.unsigned_tx_id
+                ))),
+            );
+        }
+        Err(BroadcastFailure::NoAnswer(e)) => {
+            tracing::warn!(
+                "redemption {} broadcast got no answer: {e}; it stays journaled",
+                pending.unsigned_tx_id
+            );
+            // The node may have it: the confirmer follows it like a broadcast one.
+            state
+                .shared_tracker_state
+                .lock()
+                .await
+                .record_submitted_redemption(journaled.tx_id.clone(), data_input_ids);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_response(format!(
+                    "the node did not answer for redemption {}; the tracker watches the chain \
+                     for it and records it if it is mined. Its reserve builds nothing until \
+                     then, or until it is dropped (about {} minutes in no mempool)",
+                    pending.unsigned_tx_id,
+                    crate::redemption_confirmer::MAX_REDEMPTION_MISSING_CHECKS as u64
+                        * crate::redemption_confirmer::REDEMPTION_CHECK_INTERVAL.as_secs()
+                        / 60
+                ))),
+            );
+        }
+    };
+    if !tx_id.eq_ignore_ascii_case(&journaled.tx_id) {
+        // A signed transaction has the id of its unsigned one; follow what the node reports.
+        tracing::warn!(
+            "redemption {} was accepted under id {}; journaling that id",
+            journaled.tx_id,
+            tx_id
+        );
+        let renamed = basis_store::persistence::JournaledRedemption {
+            tx_id: tx_id.to_ascii_lowercase(),
+            ..journaled.clone()
+        };
+        if let Err(e) = state
+            .tracker_storage
+            .journal_redemption(&renamed)
+            .and_then(|()| {
+                state
+                    .tracker_storage
+                    .remove_journaled_redemption(&journaled.tx_id)
+            })
+        {
+            tracing::error!("journaling redemption {} failed: {:?}", tx_id, e);
+        }
+    }
+
     state
         .shared_tracker_state
         .lock()
         .await
         .record_submitted_redemption(tx_id.clone(), data_input_ids);
-
-    // Sync local note + reserve tree state with the broadcast transaction. The reserve
-    // tree value must be the cumulative amount proven on-chain (from the build), which
-    // can differ from the note's cumulative redeemed amount when reserves were created
-    // fresh or state was repaired.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if state
-        .tx
-        .send(TrackerCommand::CompleteRedemption {
-            issuer_pubkey,
-            recipient_pubkey,
-            denomination: pending.denomination,
-            redeemed_amount: pending.redeemed_amount,
-            new_already_redeemed: Some(pending.new_already_redeemed),
-            response_tx: tx,
-        })
-        .await
-        .is_err()
-    {
-        tracing::error!(tx_id, "tracker thread unavailable; local state not synced");
-    } else {
-        match rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!(tx_id, ?e, "local redemption state sync failed"),
-            Err(_) => tracing::error!(tx_id, "tracker dropped state sync response"),
-        }
-    }
 
     (
         StatusCode::OK,
