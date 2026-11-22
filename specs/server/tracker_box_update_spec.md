@@ -84,8 +84,10 @@ the wallet node falls back to the scanner node when `[ergo.wallet]` is unset.
 Only public node endpoints are used, and no node API key is needed. Chain reads
 (`/blockchain/transaction/byId`, `/blockchain/box/unspent/byTokenId`, `/utxo/byId`,
 `/utxo/byIdBinary`, `/blocks/lastHeaders/10`, `/info`) and fee-box discovery
-(`POST /blockchain/box/unspent/byAddress`) go to the scanner node; only the `POST /transactions`
-broadcast goes to the `[ergo.wallet]` node. The transaction is signed in the tracker process with
+(`POST /blockchain/box/unspent/byAddress`) go to the scanner node; the `POST /transactions`
+broadcast goes to the `[ergo.wallet]` node. A pending commit is looked up in the mempool
+(`GET /transactions/unconfirmed/byTransactionId/{id}`) of the `[ergo.wallet]` node and, when it
+is another node, of the scanner node. The transaction is signed in the tracker process with
 `ergo.tracker_secret_key`; no `/wallet/*` endpoint is called.
 
 **Critical Requirement**: `ergo.scanner.node_url` must be non-empty in the configuration; if it is empty, the tracker aborts on startup with exit code 1. This ensures the tracker cannot operate without proper connection to an Ergo node.
@@ -186,7 +188,7 @@ impl SharedTrackerState {
 The background task executes the following algorithm in a continuous loop:
 
 1. **Wait for Interval**: Use tokio::time::interval to wait for the configured update period (10 minutes)
-2. **Check Pending Transaction**: If a transaction was previously submitted but not yet confirmed, check its confirmation status via `/blockchain/transaction/byId`. Only update `last_submitted_digest` after confirmation.
+2. **Check Pending Transaction**: If a transaction was previously submitted but not yet confirmed, check where it is: first the mempool (`/transactions/unconfirmed/byTransactionId`), then the chain (`/blockchain/transaction/byId`). Only update `last_submitted_digest` after confirmation.
 3. **Access Shared State**: Read the current AVL tree root digest and tracker public key
 4. **Skip Unchanged State**: If the AVL root digest hasn't changed since the last confirmed submission, skip the update cycle, unless a heartbeat is due: with `[transaction] heartbeat_blocks` > 0 (default 720) and the tracker box at least that many blocks old (`/info` height minus the box creation height), the unchanged digest is recommitted through the normal path so the box never ages into the 2160-block emergency window
 5. **Find Tracker Box**: Query the blockchain for the tracker box using the tracker NFT ID via `/blockchain/box/unspent/byTokenId`
@@ -232,10 +234,17 @@ Attempt to decode value on failed cursor: DownField(tokenId),DownArray,DownField
 To prevent submitting redundant updates during blockchain propagation:
 
 1. After broadcasting a transaction, store its ID and the expected digest as `pending_tx`
-2. On each subsequent cycle, check if the transaction is confirmed via `/blockchain/transaction/byId`
+2. On each subsequent cycle, look the transaction up in the mempool first
+   (`/transactions/unconfirmed/byTransactionId`: the broadcast node, then the scanner node if it
+   is another one), then on chain (`/blockchain/transaction/byId`)
 3. Only update `last_submitted_digest` after the transaction is confirmed on-chain
-4. If the transaction is not yet found (404), continue waiting
-5. If checking the transaction status fails, keep it pending and retry next cycle
+4. A transaction in the mempool is pending, not dropped: keep waiting, and never rebuild or
+   resubmit it
+5. Only a transaction found in neither the mempool nor the chain for 3 consecutive cycles
+   (`MAX_PENDING_MISSING_CYCLES`) is treated as dropped: its pending notes are reverted and the
+   next cycle builds a fresh update
+6. If checking the transaction status fails (any answer but 200 or 404), keep it pending and retry
+   next cycle; the failure does not count as a missing cycle
 
 ### State Update Process
 
@@ -324,13 +333,14 @@ impl TrackerBoxUpdater {
         // Returns transaction ID
     }
 
-    /// Check if a transaction has been confirmed on-chain
+    /// Where a submitted transaction is: OnChain, InMempool or Missing
     pub async fn check_transaction_confirmation(
         config: &TrackerBoxUpdateConfig,
         tx_id: &str,
-    ) -> Result<bool, TrackerBoxUpdaterError> {
-        // Query /blockchain/transaction/byId/{tx_id}
-        // Returns true if found (200), false if not yet confirmed (404)
+    ) -> Result<TxStatus, TrackerBoxUpdaterError> {
+        // GET /transactions/unconfirmed/byTransactionId/{tx_id} (broadcast node, then scanner
+        // node): 200 = InMempool
+        // GET /blockchain/transaction/byId/{tx_id} (scanner node): 200 = OnChain, 404 = Missing
     }
 }
 ```

@@ -335,6 +335,19 @@ pub struct TrackerBoxUpdater;
 /// 600s update interval this bounds the stall to roughly 30 minutes.
 const MAX_PENDING_MISSING_CYCLES: u32 = 3;
 
+/// Where a submitted transaction is, as the nodes report it
+/// ([`TrackerBoxUpdater::check_transaction_confirmation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxStatus {
+    /// In a block.
+    OnChain,
+    /// In a node's mempool, waiting for a block: pending, not dropped. Never resubmitted.
+    InMempool,
+    /// Neither in a mempool nor in a block. Only a transaction missing for
+    /// `MAX_PENDING_MISSING_CYCLES` consecutive cycles is treated as dropped and rebuilt.
+    Missing,
+}
+
 /// Whether a pending update transaction that the node has not seen for
 /// `missing_cycles` consecutive cycles should be treated as dropped/rejected
 /// (and the pending notes reverted so a fresh update can be submitted).
@@ -403,7 +416,7 @@ impl TrackerBoxUpdater {
 
             if let Some((tx_id, expected_digest)) = pending_tx.clone() {
                 match Self::check_transaction_confirmation(&config, &tx_id).await {
-                    Ok(true) => {
+                    Ok(TxStatus::OnChain) => {
                         // Look up the confirming box to record its height/id.
                         let (box_id, height) =
                             match Self::fetch_tracker_box_summary(&config, &tx_id).await {
@@ -468,7 +481,17 @@ impl TrackerBoxUpdater {
                         // to-edge increase or cancel if the reserve changed).
                         Self::process_pending_exchanges(&config, &cmd_tx).await;
                     }
-                    Ok(false) => {
+                    Ok(TxStatus::InMempool) => {
+                        // Waiting for a block: still pending, never rebuilt or resubmitted.
+                        // Only consecutive missing cycles count towards a drop.
+                        pending_missing_cycles = 0;
+                        info!(
+                            "Transaction {} is in the mempool, waiting for a block...",
+                            tx_id
+                        );
+                        continue;
+                    }
+                    Ok(TxStatus::Missing) => {
                         pending_missing_cycles += 1;
                         if pending_tx_is_dropped(pending_missing_cycles) {
                             // The tx has been missing from both mempool and
@@ -497,8 +520,8 @@ impl TrackerBoxUpdater {
                             }
                         } else {
                             info!(
-                                "Transaction {} still pending, waiting for next cycle...",
-                                tx_id
+                                "Transaction {} is neither in the mempool nor on chain ({}/{} cycles), waiting for next cycle...",
+                                tx_id, pending_missing_cycles, MAX_PENDING_MISSING_CYCLES
                             );
                         }
                         continue;
@@ -1206,36 +1229,66 @@ impl TrackerBoxUpdater {
             .map_err(TrackerBoxUpdaterError::BroadcastFailed)
     }
 
-    /// Check if a transaction has been confirmed on-chain by querying the blockchain API
+    /// Where `tx_id` is. Mempools are read first (public
+    /// `GET /transactions/unconfirmed/byTransactionId/{id}`): the node the transaction was
+    /// broadcast to and, when that is another node, the scanner node. Then the chain
+    /// (`GET /blockchain/transaction/byId/{id}` on the scanner node). In this order a
+    /// transaction that moves from the mempool into a block between two reads is still found.
+    /// Any answer other than 200 or 404 is an error: the status is unknown, not `Missing`.
     pub async fn check_transaction_confirmation(
         config: &TrackerBoxUpdateConfig,
         tx_id: &str,
-    ) -> Result<bool, TrackerBoxUpdaterError> {
-        let client = basis_store::http::bounded_client();
-        let url = format!(
-            "{}/blockchain/transaction/byId/{}",
+    ) -> Result<TxStatus, TrackerBoxUpdaterError> {
+        let scanner = (
             config.scanner_node_url.trim_end_matches('/'),
-            tx_id
+            config.scanner_api_key.as_deref(),
         );
-
-        let mut request = client.get(&url);
-        if let Some(ref api_key) = config.scanner_api_key {
-            request = request.header("api_key", api_key);
+        let broadcast = (
+            config.wallet_node_url.trim_end_matches('/'),
+            config.wallet_api_key.as_deref(),
+        );
+        let mut mempools = vec![scanner];
+        if !broadcast.0.is_empty() && broadcast.0 != scanner.0 {
+            mempools.insert(0, broadcast);
         }
 
+        let in_mempool = format!("/transactions/unconfirmed/byTransactionId/{tx_id}");
+        for (node, api_key) in mempools {
+            if Self::node_knows(node, api_key, &in_mempool).await? {
+                return Ok(TxStatus::InMempool);
+            }
+        }
+        let on_chain = format!("/blockchain/transaction/byId/{tx_id}");
+        if Self::node_knows(scanner.0, scanner.1, &on_chain).await? {
+            return Ok(TxStatus::OnChain);
+        }
+        Ok(TxStatus::Missing)
+    }
+
+    /// `GET {node}{path}`: true on 200, false on 404, an error on anything else.
+    async fn node_knows(
+        node: &str,
+        api_key: Option<&str>,
+        path: &str,
+    ) -> Result<bool, TrackerBoxUpdaterError> {
+        let client = basis_store::http::bounded_client();
+        let mut request = client.get(format!("{node}{path}"));
+        if let Some(api_key) = api_key {
+            request = request.header("api_key", api_key);
+        }
         let response = request
             .send()
             .await
             .map_err(|e| TrackerBoxUpdaterError::HttpError(e.to_string()))?;
-
         match response.status().as_u16() {
             200 => Ok(true),
             404 => Ok(false),
             status => {
-                let body = response.text().await.unwrap_or_default();
+                let body = basis_store::http::read_body_capped(response)
+                    .await
+                    .unwrap_or_default();
                 Err(TrackerBoxUpdaterError::HttpError(format!(
-                    "HTTP {} checking transaction: {}",
-                    status, body
+                    "HTTP {status} from {path}: {body}"
                 )))
             }
         }
@@ -2209,5 +2262,255 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("would be burned"), "{err}");
+    }
+
+    const MEMPOOL_LOOKUP: &str = "/transactions/unconfirmed/byTransactionId/";
+    const CHAIN_LOOKUP: &str = "/blockchain/transaction/byId/";
+
+    /// Two nodes that know a transaction id by name: `pool-<node>` (or `pool-both`) is in that
+    /// node's mempool, `chain` is in a block, `broken` makes the mempool lookup fail.
+    #[tokio::test]
+    async fn transaction_status_reads_the_mempools_before_the_chain() {
+        use crate::local_wallet::tests::mock_node;
+
+        let node = |name: &'static str| {
+            mock_node(move |_, target, _| {
+                let id = target.rsplit('/').next().unwrap_or_default();
+                if target.starts_with(MEMPOOL_LOOKUP) {
+                    match id {
+                        "broken" => (503, "busy".to_string()),
+                        _ if id == format!("pool-{name}") || id == "pool-both" => {
+                            (200, "{}".to_string())
+                        }
+                        _ => (404, "{}".to_string()),
+                    }
+                } else if target.starts_with(CHAIN_LOOKUP) && id == "chain" {
+                    (200, "{}".to_string())
+                } else if target.starts_with(CHAIN_LOOKUP) {
+                    (404, "{}".to_string())
+                } else {
+                    (500, format!("unexpected {target}"))
+                }
+            })
+        };
+        let (scanner_url, scanner_seen) = node("scanner").await;
+        let (broadcast_url, broadcast_seen) = node("broadcast").await;
+        let config = TrackerBoxUpdateConfig {
+            scanner_node_url: scanner_url.clone(),
+            wallet_node_url: broadcast_url,
+            ..Default::default()
+        };
+        let status = |id: &'static str| {
+            let config = config.clone();
+            async move { TrackerBoxUpdater::check_transaction_confirmation(&config, id).await }
+        };
+
+        assert_eq!(status("pool-broadcast").await.unwrap(), TxStatus::InMempool);
+        assert_eq!(status("pool-scanner").await.unwrap(), TxStatus::InMempool);
+        assert_eq!(status("chain").await.unwrap(), TxStatus::OnChain);
+        assert_eq!(status("gone").await.unwrap(), TxStatus::Missing);
+        // An unknown status is an error, so it never counts as a missing cycle.
+        assert!(status("broken").await.is_err());
+
+        let targets = |seen: &Arc<std::sync::Mutex<Vec<crate::local_wallet::tests::Seen>>>| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.target.clone())
+                .collect::<Vec<_>>()
+        };
+        let mempool = |id: &str| format!("{MEMPOOL_LOOKUP}{id}");
+        let chain = |id: &str| format!("{CHAIN_LOOKUP}{id}");
+        // The broadcast node's mempool is asked first, about everything; nothing else.
+        assert_eq!(
+            targets(&broadcast_seen),
+            ["pool-broadcast", "pool-scanner", "chain", "gone", "broken"].map(mempool)
+        );
+        // The scanner node: its mempool once the broadcast node said no, then the chain.
+        assert_eq!(
+            targets(&scanner_seen),
+            [
+                mempool("pool-scanner"),
+                mempool("chain"),
+                chain("chain"),
+                mempool("gone"),
+                chain("gone"),
+            ]
+        );
+
+        // One node for both roles: one mempool lookup, then the chain.
+        let config = TrackerBoxUpdateConfig {
+            scanner_node_url: scanner_url.clone(),
+            wallet_node_url: format!("{scanner_url}/"),
+            ..Default::default()
+        };
+        scanner_seen.lock().unwrap().clear();
+        let found = TrackerBoxUpdater::check_transaction_confirmation(&config, "gone").await;
+        assert_eq!(found.unwrap(), TxStatus::Missing);
+        assert_eq!(targets(&scanner_seen), [mempool("gone"), chain("gone")]);
+    }
+
+    /// The updater loop against a mock node: it commits, and from then on the node reports the
+    /// transaction in its mempool (`in_mempool`) or nowhere. Runs until `done` holds for the
+    /// requests seen so far, then stops the loop and returns them.
+    async fn run_updater_until(
+        in_mempool: bool,
+        done: impl Fn(&[crate::local_wallet::tests::Seen]) -> bool,
+    ) -> Vec<crate::local_wallet::tests::Seen> {
+        use crate::local_wallet::tests::{mock_node, tree_of, utxo_box, LAST_HEADERS_JSON};
+        use ergo_lib::ergotree_ir::serialization::SigmaSerializable;
+
+        let fx = commit_fixture(&[]);
+        let fee_box = utxo_box(&tree_of(&fx.pubkey), 5_000_000, &[], &[], 123_100, 1);
+        let fee_box_id = String::from(fee_box.box_id());
+        let binaries: std::collections::HashMap<String, String> = [
+            (
+                fx.tracker_api.box_id.clone(),
+                hex::encode(fx.tracker_box.sigma_serialize_bytes().unwrap()),
+            ),
+            (
+                fee_box_id.clone(),
+                hex::encode(fee_box.sigma_serialize_bytes().unwrap()),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let tree_hex = crate::local_wallet::p2pk_tree_hex(&fx.pubkey);
+        let fee_page = serde_json::json!([{
+            "boxId": fee_box_id,
+            "value": 5_000_000u64,
+            "ergoTree": tree_hex,
+            "assets": [],
+            "additionalRegisters": {},
+            "creationHeight": 123_100
+        }])
+        .to_string();
+        let tracker_boxes = serde_json::to_string(&[&fx.tracker_api]).unwrap();
+        let by_token = format!("/blockchain/box/unspent/byTokenId/{}", hex::encode(fx.nft));
+
+        let (url, seen) = mock_node(move |method, target, body| {
+            let path = target.split('?').next().unwrap_or_default();
+            match (method, path) {
+                ("GET", "/info") => (
+                    200,
+                    serde_json::json!({ "fullHeight": 123_500 }).to_string(),
+                ),
+                ("GET", p) if p == by_token => (200, tracker_boxes.clone()),
+                ("GET", "/blocks/lastHeaders/10") => (200, LAST_HEADERS_JSON.to_string()),
+                ("POST", "/blockchain/box/unspent/byAddress") if target.contains("offset=0&") => {
+                    (200, fee_page.clone())
+                }
+                ("POST", "/blockchain/box/unspent/byAddress") => (200, "[]".to_string()),
+                ("GET", p) if p.starts_with("/utxo/byIdBinary/") => {
+                    let id = p.trim_start_matches("/utxo/byIdBinary/");
+                    let bytes = &binaries[id];
+                    (
+                        200,
+                        serde_json::json!({ "boxId": id, "bytes": bytes }).to_string(),
+                    )
+                }
+                ("POST", "/transactions") => {
+                    let tx: serde_json::Value = serde_json::from_str(body).unwrap();
+                    (200, tx["id"].to_string())
+                }
+                ("GET", p) if p.starts_with(MEMPOOL_LOOKUP) && in_mempool => {
+                    (200, "{}".to_string())
+                }
+                ("GET", p) if p.starts_with(MEMPOOL_LOOKUP) || p.starts_with(CHAIN_LOOKUP) => {
+                    (404, "{}".to_string())
+                }
+                _ => (500, format!("unexpected {method} {target}")),
+            }
+        })
+        .await;
+
+        let config = TrackerBoxUpdateConfig {
+            wallet_node_url: url.clone(),
+            scanner_node_url: url,
+            tracker_secret_key: Some(fx.secret),
+            update_interval_seconds: 1,
+            ..Default::default()
+        };
+        let shared = SharedTrackerState::new_with_tracker_key(fx.pubkey);
+        shared.set_tracker_nft_id(hex::encode(fx.nft));
+        // Not the digest in the tracker box's R5 (the empty tree), so there is a commit to make.
+        shared.set_avl_root_digest([0x42; 33]);
+        let (stop_tx, stop_rx) = tokio::sync::broadcast::channel(1);
+        let updater = tokio::spawn(TrackerBoxUpdater::start(config, shared, stop_rx, None));
+
+        let started = std::time::Instant::now();
+        loop {
+            let snapshot = seen.lock().unwrap().clone();
+            if done(&snapshot) {
+                break;
+            }
+            let lines: Vec<String> = snapshot
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.target))
+                .collect();
+            assert!(started.elapsed() < Duration::from_secs(30), "{lines:#?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), updater)
+            .await
+            .expect("the updater stops")
+            .unwrap()
+            .unwrap();
+        let requests = seen.lock().unwrap().clone();
+        requests
+    }
+
+    fn count(seen: &[crate::local_wallet::tests::Seen], prefix: &str) -> usize {
+        seen.iter().filter(|r| r.target.starts_with(prefix)).count()
+    }
+
+    fn is_broadcast(request: &crate::local_wallet::tests::Seen) -> bool {
+        request.method == "POST" && request.target == "/transactions"
+    }
+
+    fn broadcasts(seen: &[crate::local_wallet::tests::Seen]) -> usize {
+        seen.iter().filter(|r| is_broadcast(r)).count()
+    }
+
+    /// A commit that waits in the mempool stays pending however many cycles it takes: it is
+    /// never rebuilt or broadcast again, and the chain is not even asked.
+    #[tokio::test]
+    async fn a_commit_in_the_mempool_is_never_resubmitted() {
+        let cycles = MAX_PENDING_MISSING_CYCLES as usize + 2;
+        let seen = run_updater_until(true, |seen| count(seen, MEMPOOL_LOOKUP) >= cycles).await;
+        assert_eq!(broadcasts(&seen), 1, "broadcast once");
+        assert_eq!(count(&seen, CHAIN_LOOKUP), 0);
+    }
+
+    /// A commit that is in neither the mempool nor a block for MAX_PENDING_MISSING_CYCLES
+    /// consecutive cycles is dropped and rebuilt, and not one cycle earlier.
+    #[tokio::test]
+    async fn a_commit_missing_for_the_limit_of_cycles_is_rebuilt() {
+        let seen = run_updater_until(false, |seen| broadcasts(seen) >= 2).await;
+        let posts: Vec<usize> = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| is_broadcast(r))
+            .map(|(i, _)| i)
+            .collect();
+        let between = &seen[posts[0]..posts[1]];
+        let missing = MAX_PENDING_MISSING_CYCLES as usize;
+        assert_eq!(count(between, MEMPOOL_LOOKUP), missing);
+        assert_eq!(count(between, CHAIN_LOOKUP), missing);
+        // In every cycle the mempool is asked before the chain.
+        let lookups: Vec<&str> = between
+            .iter()
+            .filter_map(|r| {
+                if r.target.starts_with(MEMPOOL_LOOKUP) {
+                    Some("mempool")
+                } else if r.target.starts_with(CHAIN_LOOKUP) {
+                    Some("chain")
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(lookups, ["mempool", "chain"].repeat(missing));
     }
 }
