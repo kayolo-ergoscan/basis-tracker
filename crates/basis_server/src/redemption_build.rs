@@ -634,12 +634,14 @@ pub const BUILD_REQUEST_MAX_SKEW_MS: u64 = 120_000;
 
 /// Rolling one-hour limits for `/redemption/build`, plus the recipients' request timestamps.
 ///
-/// Every limit counts only requests the recipient signed (`receiver_signature`) that passed the
-/// cheap local checks (the note is committed and covers the amount), so nobody else can use up
-/// a pair's or a recipient's budget, and junk never costs a node request:
+/// Every limit counts only requests the recipient signed (`receiver_signature`) for a note the
+/// tracker holds, so nobody else can use up a pair's or a recipient's budget, and junk never
+/// costs a node request:
 /// - every such build counts against its (issuer, recipient) pair
 ///   (`server.redemption_build_max_per_pair_per_hour`) and its recipient
-///   (`server.redemption_build_max_per_recipient_per_hour`), [`Self::check_and_record`];
+///   (`server.redemption_build_max_per_recipient_per_hour`), [`Self::check_and_record`]. Round 5:
+///   counted right after the note lookup, before the committed proof and the cheap checks, so a
+///   signed request that fails a later check still uses one unit of its own budget;
 /// - a build about to sign tracker fee inputs (token reserves; ERG redemptions pay the fee out
 ///   of the payout and sign nothing) also counts against its issuer
 ///   (`server.redemption_build_max_per_issuer_per_hour`) and against all such builds together
@@ -668,6 +670,32 @@ fn keep_recent(attempts: &mut Vec<Instant>, now: Instant) {
 }
 
 impl BuildWindows {
+    /// Why `request_timestamp` cannot be the newest build request of `recipient` (409), if it
+    /// cannot: it is not greater than the recipient's last accepted one, still remembered.
+    fn timestamp_refusal(
+        &self,
+        recipient: &str,
+        request_timestamp: u64,
+        now: Instant,
+    ) -> Option<(StatusCode, String)> {
+        match self.request_timestamps.get(recipient) {
+            Some((previous, accepted_at))
+                if now.duration_since(*accepted_at) < BUILD_REQUEST_TIMESTAMP_RETENTION
+                    && request_timestamp <= *previous =>
+            {
+                Some((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "request_timestamp {request_timestamp} is not greater than this \
+                         recipient's previous build request ({previous}): sign every build \
+                         request with a new, later timestamp"
+                    ),
+                ))
+            }
+            _ => None,
+        }
+    }
+
     /// Drop every attempt that left the window, and every key left without one.
     fn sweep(&mut self, now: Instant) {
         self.pairs.retain(|_, attempts| {
@@ -735,10 +763,29 @@ impl BuildRateLimiter {
         self.windows.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Err (409) when `request_timestamp` is not greater than the previous accepted build
+    /// request of `recipient`; records nothing. Round 5 (item 2): a replay stops here, before
+    /// the note lookup, while the timestamp is only recorded
+    /// ([`Self::check_and_record_request_timestamp`]) once the lookup found a note, so keys
+    /// without a note cannot fill the timestamp table.
+    pub fn check_request_timestamp(
+        &self,
+        recipient: &str,
+        request_timestamp: u64,
+    ) -> Result<(), (StatusCode, String)> {
+        let mut windows = self.lock();
+        let now = Instant::now();
+        windows.sweep_when_due(now);
+        windows
+            .timestamp_refusal(recipient, request_timestamp, now)
+            .map_or(Ok(()), Err)
+    }
+
     /// Accept `request_timestamp` as the newest build request of `recipient`: Err (409) when it
     /// is not greater than the recipient's previous accepted one, so a captured request cannot
     /// be replayed, or (429) when the table is full of recipients seen in the last
-    /// [`BUILD_REQUEST_TIMESTAMP_RETENTION`]. Call it only after the signature verified.
+    /// [`BUILD_REQUEST_TIMESTAMP_RETENTION`]. Call it only after the signature verified and
+    /// the note lookup found the note.
     pub fn check_and_record_request_timestamp(
         &self,
         recipient: &str,
@@ -747,41 +794,33 @@ impl BuildRateLimiter {
         let mut windows = self.lock();
         let now = Instant::now();
         windows.sweep_when_due(now);
-        let fresh = |accepted_at: &Instant| {
-            now.duration_since(*accepted_at) < BUILD_REQUEST_TIMESTAMP_RETENTION
-        };
-        match windows.request_timestamps.get(recipient) {
-            Some((previous, accepted_at)) if fresh(accepted_at) => {
-                if request_timestamp <= *previous {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!(
-                            "request_timestamp {request_timestamp} is not greater than this \
-                             recipient's previous build request ({previous}): sign every build \
-                             request with a new, later timestamp"
-                        ),
-                    ));
-                }
-            }
-            Some(_) => {}
-            None => {
-                if windows.request_timestamps.len() >= MAX_TRACKED_BUILD_RECIPIENTS {
-                    windows.sweep(now);
-                    if windows.request_timestamps.len() >= MAX_TRACKED_BUILD_RECIPIENTS {
-                        return Err((
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "too many recipients asked for redemption builds in the last \
-                             minutes; try again shortly"
-                                .to_string(),
-                        ));
-                    }
-                }
+        if let Some(refusal) = windows.timestamp_refusal(recipient, request_timestamp, now) {
+            return Err(refusal);
+        }
+        // A recipient already in the table overwrites its entry; a new one needs room.
+        if !windows.request_timestamps.contains_key(recipient)
+            && windows.request_timestamps.len() >= MAX_TRACKED_BUILD_RECIPIENTS
+        {
+            windows.sweep(now);
+            if windows.request_timestamps.len() >= MAX_TRACKED_BUILD_RECIPIENTS {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many recipients asked for redemption builds in the last minutes; try \
+                     again shortly"
+                        .to_string(),
+                ));
             }
         }
         windows
             .request_timestamps
             .insert(recipient.to_string(), (request_timestamp, now));
         Ok(())
+    }
+
+    /// Number of recipients whose last request timestamp is kept. Used by tests.
+    #[cfg(test)]
+    pub fn tracked_request_timestamps(&self) -> usize {
+        self.lock().request_timestamps.len()
     }
 
     /// Record a verified build for `(issuer, recipient)`; returns Err, recording nothing, when
@@ -1350,9 +1389,13 @@ async fn build_redemption_inner(
     ) {
         return api_err(status, msg);
     }
+    // A replay stops here; the timestamp is recorded only after the note lookup (round 5,
+    // item 2), so keys without a note cannot fill the timestamp table.
+    let recipient_hex = hex::encode(recipient_pk);
+    let issuer_hex = hex::encode(issuer_pk);
     if let Err((status, msg)) = state
         .redemption_build_rate
-        .check_and_record_request_timestamp(&hex::encode(recipient_pk), payload.request_timestamp)
+        .check_request_timestamp(&recipient_hex, payload.request_timestamp)
     {
         return api_err(status, msg);
     }
@@ -1406,6 +1449,25 @@ async fn build_redemption_inner(
             Err(_) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, "tracker unavailable"),
         }
     };
+
+    // Round 5 (items 1, 2): the request is the recipient's and the tracker holds its note, so
+    // the timestamp is recorded and the budgets are counted now, before the committed proof and
+    // the cheap checks. Only the recipient can spend their own budget; a signed request that
+    // fails a later check still uses one unit of it.
+    if let Err((status, msg)) = state
+        .redemption_build_rate
+        .check_and_record_request_timestamp(&recipient_hex, payload.request_timestamp)
+    {
+        return api_err(status, msg);
+    }
+    if let Err(msg) = state.redemption_build_rate.check_and_record(
+        &issuer_hex,
+        &recipient_hex,
+        state.config.server.redemption_build_max_per_pair_per_hour,
+        state.config.server.redemption_build_max_per_recipient_per_hour,
+    ) {
+        return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
+    }
 
     // SECURITY (PR #16 H2): fail closed when the issuer has more than one tracked reserve.
     // A note is bound to `hash(owner || receiver)`, not to a reserve box, so with two reserves
@@ -1531,8 +1593,8 @@ async fn build_redemption_inner(
         }
     };
 
-    // Cheap checks (round 4, C2), before any budget or node request: a build that cannot
-    // succeed on-chain stops here.
+    // Cheap checks (round 4, C2), before any node request: a build that cannot succeed
+    // on-chain stops here.
     // 1. The contract releases at most `totalDebt - redeemedDebt` (basis.es `debtDelta`).
     let outstanding = total_debt.saturating_sub(already_redeemed);
     if payload.amount > outstanding {
@@ -1613,20 +1675,11 @@ async fn build_redemption_inner(
         );
     }
 
-    // Budgets (round 4, C2): counted per verified recipient, only for requests that passed every
-    // check above. Builds that sign tracker fee inputs (token reserves) also have a per-issuer and
-    // a total budget, recorded right before signing; once one is used up, stop before the node.
-    if let Err(msg) = state.redemption_build_rate.check_and_record(
-        &hex::encode(issuer_pk),
-        &hex::encode(recipient_pk),
-        state.config.server.redemption_build_max_per_pair_per_hour,
-        state.config.server.redemption_build_max_per_recipient_per_hour,
-    ) {
-        return api_err(StatusCode::TOO_MANY_REQUESTS, msg);
-    }
+    // Builds that sign tracker fee inputs (token reserves) also have a per-issuer and a total
+    // budget, recorded right before signing; once one is used up, stop before the node.
     if token_denomination {
         if let Err(msg) = state.redemption_build_rate.check_fee_signing(
-            &hex::encode(issuer_pk),
+            &issuer_hex,
             state.config.server.redemption_build_max_per_issuer_per_hour,
             state.config.server.redemption_build_max_per_hour,
         ) {
@@ -3199,6 +3252,25 @@ mod tests {
             windows.request_timestamps.insert("r".to_string(), (101, old));
         }
         limiter.check_and_record_request_timestamp("r", 50).unwrap();
+    }
+
+    /// Round 5, item 2: the early check refuses a replay but records nothing; only the record
+    /// after the note lookup moves the recipient's timestamp on.
+    #[test]
+    fn the_early_timestamp_check_records_nothing() {
+        let limiter = BuildRateLimiter::new();
+        limiter.check_request_timestamp("r", 100).unwrap();
+        limiter.check_request_timestamp("r", 100).unwrap();
+        assert_eq!(limiter.tracked_request_timestamps(), 0);
+        limiter.check_and_record_request_timestamp("r", 100).unwrap();
+        assert_eq!(limiter.tracked_request_timestamps(), 1);
+        let (status, msg) = limiter.check_request_timestamp("r", 100).unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(msg.contains("not greater"), "{msg}");
+        limiter.check_request_timestamp("r", 101).unwrap();
+        // Two requests that both passed the early check: the record still refuses the older.
+        limiter.check_and_record_request_timestamp("r", 102).unwrap();
+        assert!(limiter.check_and_record_request_timestamp("r", 101).is_err());
     }
 
     /// A full table of fresh recipients refuses new ones (429) instead of evicting an entry.

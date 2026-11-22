@@ -347,8 +347,9 @@ Key configuration includes:
 - **`server.redemption_build_max_per_pair_per_hour`** / **`server.redemption_build_max_per_recipient_per_hour`**:
   per-(issuer, recipient) and per-recipient rate limits on `POST /redemption/build` (defaults 60
   and 30 per hour, rolling window); excess requests get HTTP 429. Only requests whose
-  `receiver_signature` verifies and that pass the cheap checks (committed outstanding debt,
-  issuer signature, minimum payout) are counted, so nobody but the recipient can spend them.
+  `receiver_signature` verifies and whose note the tracker holds are counted, so nobody but the
+  recipient can spend them; they are counted before the committed proof and the cheap checks
+  (round 5), so a signed request that fails those still uses one unit.
 - **`server.redemption_build_max_per_issuer_per_hour`** / **`server.redemption_build_max_per_hour`**:
   per-issuer and total caps on the builds that get as far as signing tracker fee inputs (token
   reserves only; defaults 6 and 30 per hour, rolling window); excess requests get HTTP 429.

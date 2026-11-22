@@ -473,12 +473,17 @@ recipient's 65-byte Basis Schnorr signature over
 
 (131 bytes for ERG, 198 for a token; `basis_core::types::build_request_message`). The
 timestamp must lie within 120 s of the tracker's clock and rise strictly per recipient (kept
-in memory for 10 minutes; 409 on a replay). Request order: signature, timestamp record, note
-lookup, single-reserve check (409), committed tracker proof and reserve-tree lookup, then the
-**cheap checks** — `amount` ≤ committed total minus already redeemed (400), the issuer
+in memory for 10 minutes; 409 on a replay). Request order (round 5): signature, timestamp
+check (409 on a replay; nothing recorded), note lookup (a key without a note stops here and
+leaves no trace), then the timestamp record and the build budgets (per pair, per recipient;
+429), then the single-reserve check (409), the committed tracker proof and reserve-tree lookup,
+then the **cheap checks** — `amount` ≤ committed total minus already redeemed (400), the issuer
 signature over the committed note (400), and for an ERG reserve `amount - fee` ≥ the minimum
-box value (400) — and only then the build budgets (per pair, per recipient; 429). No node
-request happens before all of these pass.
+box value (400). A signed request for a note the tracker holds uses one unit of its own budgets
+even when a later check refuses it, so the work behind the proof is bounded per recipient. No
+node request happens before all of these pass. The committed tree the proof comes from is built
+once per confirmed digest and kept until the confirmed digest or a confirmed value changes
+(`TrackerStateManager::committed_tree_rebuild_count`).
 
 **Fee out of the payout (ERG reserves).** The reserve contract checks only the reserve's own
 output and the receiver's signature for the released value (`contract/basis.es`: `redeemed =
@@ -548,7 +553,8 @@ ignored for signing. The endpoint returns `404 Not Found` when there is no store
 recipient) rate limit (`server.redemption_build_max_per_pair_per_hour`, default 60) or the
 per-recipient limit (`server.redemption_build_max_per_recipient_per_hour`, default 30) is
 exceeded, per hour over a rolling window. Only requests whose `receiver_signature` verifies and
-that pass the cheap checks are counted. Token-reserve builds that get as far as signing fee
+whose note the tracker holds are counted (round 5: before the proof and the cheap checks).
+Token-reserve builds that get as far as signing fee
 inputs also count against their issuer (`server.redemption_build_max_per_issuer_per_hour`,
 default 6) and against all such builds together (`server.redemption_build_max_per_hour`, default
 30), both per rolling hour and answered with `429` when reached; requests that fail before that,

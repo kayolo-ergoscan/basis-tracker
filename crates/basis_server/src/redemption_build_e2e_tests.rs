@@ -55,6 +55,8 @@ const LEAKY_BODY: &str = "node-internal-detail-7f3a";
 
 struct Harness {
     state: AppState,
+    /// How many times the tracker built its committed tree (see [`TrackerSetup`]).
+    committed_tree_builds: Arc<std::sync::atomic::AtomicU64>,
     issuer_pk: PubKey,
     recipient_secret: [u8; 32],
     recipient_pk: PubKey,
@@ -100,6 +102,8 @@ struct TrackerSetup {
     committed_digest: [u8; 33],
     /// The issuer's (empty) reserve tree digest: the reserve box's R5.
     reserve_digest: Vec<u8>,
+    /// How many times the tracker built its committed tree, after each committed proof.
+    committed_tree_builds: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A tracker thread holding `note` of `issuer`, committed, that serves the commands
@@ -111,6 +115,8 @@ fn spawn_tracker_thread(
 ) -> (tokio::sync::mpsc::Sender<TrackerCommand>, TrackerSetup) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<TrackerCommand>(100);
     let (setup_tx, setup_rx) = std::sync::mpsc::channel();
+    let committed_tree_builds = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let builds = committed_tree_builds.clone();
     std::thread::spawn(move || {
         let mut tracker = TrackerStateManager::new_with_temp_storage();
         tracker.add_note(&issuer, &note).unwrap();
@@ -123,6 +129,7 @@ fn spawn_tracker_thread(
             .send(TrackerSetup {
                 committed_digest,
                 reserve_digest,
+                committed_tree_builds,
             })
             .unwrap();
         while let Some(cmd) = rx.blocking_recv() {
@@ -151,11 +158,16 @@ fn spawn_tracker_thread(
                     denomination,
                     response_tx,
                 } => {
-                    let _ = response_tx.send(tracker.generate_committed_tracker_lookup_proof(
+                    let proof = tracker.generate_committed_tracker_lookup_proof(
                         &issuer_pubkey,
                         &recipient_pubkey,
                         &denomination,
-                    ));
+                    );
+                    builds.store(
+                        tracker.committed_tree_rebuild_count(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    let _ = response_tx.send(proof);
                 }
                 TrackerCommand::GetReserveLookupProof {
                     issuer_pubkey,
@@ -222,6 +234,7 @@ async fn harness(node: Node, max_builds_per_pair: u32) -> Harness {
     let TrackerSetup {
         committed_digest,
         reserve_digest,
+        committed_tree_builds,
     } = setup;
 
     // The issuer's reserve under the real ERG reserve contract, and the tracker box.
@@ -415,6 +428,7 @@ async fn harness(node: Node, max_builds_per_pair: u32) -> Harness {
 
     Harness {
         state,
+        committed_tree_builds,
         issuer_pk,
         recipient_secret,
         recipient_pk,
@@ -573,11 +587,14 @@ async fn erg_redemption_pays_the_fee_from_the_payout_and_validates_against_the_c
         .is_err());
 }
 
-/// Requests that fail the signature, replay or cheap checks never reach the node and never use
-/// a build budget.
+/// Requests that fail the signature or clock checks never reach the node and never use a build
+/// budget. A signed request for a note the tracker holds uses one unit of its own budget (round
+/// 5: counted before the committed proof), also when a cheap check refuses it; it still never
+/// reaches the node.
 #[tokio::test]
-async fn invalid_requests_cost_no_node_request_and_no_budget() {
-    let h = harness(Node::Healthy, 1).await;
+async fn invalid_requests_cost_no_node_request_and_only_signed_ones_use_the_budget() {
+    // Three refused signed requests and one build fit; the next is over the budget.
+    let h = harness(Node::Healthy, 4).await;
     let amount = 20_000_000;
 
     // No signature at all.
@@ -619,7 +636,13 @@ async fn invalid_requests_cost_no_node_request_and_no_budget() {
     let (status, body) = h.build(stale).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.error.unwrap().contains("tracker's clock"));
+    assert_eq!(
+        h.committed_tree_builds.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing before the signature verifies reaches the committed tree"
+    );
 
+    // Signed requests the cheap checks refuse: each uses one unit of the pair's budget.
     // More than the committed outstanding debt.
     let (status, body) = h.build(h.request(NOTE_DEBT + 1)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -643,14 +666,67 @@ async fn invalid_requests_cost_no_node_request_and_no_budget() {
         h.node_requests()
     );
 
-    // The pair's budget (1 per hour here) is still whole: a valid request builds.
+    // One unit is left (4 per hour here): a valid request builds.
     let (status, body) = h.build(h.request(amount)).await;
     assert_eq!(status, StatusCode::OK, "{:?}", body.error);
-    // And the next one is over budget, before any node request.
+    // And the next one is over budget, before the committed proof and any node request.
     let before = h.node_requests().len();
     let (status, body) = h.build(h.request(amount)).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{:?}", body.error);
     assert_eq!(h.node_requests().len(), before);
+}
+
+/// Round 5, item 1: N builds of a committed note make the tracker build its committed tree
+/// once, not once per build.
+#[tokio::test]
+async fn many_builds_make_one_committed_tree() {
+    let h = harness(Node::Healthy, 12).await;
+    for _ in 0..10 {
+        let (status, body) = h.build(h.request(20_000_000)).await;
+        assert_eq!(status, StatusCode::OK, "{:?}", body.error);
+    }
+    assert_eq!(
+        h.committed_tree_builds
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+/// Round 5, item 2: a request signed by a key that holds no note is refused at the note lookup
+/// and leaves nothing in the request-timestamp table, so throwaway keys cannot fill it. A
+/// replay is still refused before the note lookup.
+#[tokio::test]
+async fn keys_without_a_note_leave_no_request_timestamp() {
+    let h = harness(Node::Healthy, 12).await;
+    for _ in 0..20 {
+        let (secret, pk) = basis_store::schnorr::generate_keypair();
+        let request_timestamp = crate::redemption_build::now_unix_ms();
+        let message = basis_store::schnorr::build_request_message(
+            &TRACKER_NFT,
+            &h.issuer_pk,
+            &pk,
+            &DenomKey::Erg,
+            20_000_000,
+            request_timestamp,
+        );
+        let mut request = h.request_at(20_000_000, request_timestamp);
+        request.recipient_pubkey = hex::encode(pk);
+        request.receiver_signature =
+            hex::encode(basis_store::schnorr::schnorr_sign(&message, &secret, &pk).unwrap());
+        let (status, body) = h.build(request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{:?}", body.error);
+        assert!(body.error.unwrap().contains("note not found"));
+    }
+    assert_eq!(h.state.redemption_build_rate.tracked_request_timestamps(), 0);
+
+    // The recipient of the note is recorded, and its replay stops at the timestamp check.
+    let request_timestamp = crate::redemption_build::now_unix_ms();
+    let (status, body) = h.build(h.request_at(20_000_000, request_timestamp)).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.error);
+    assert_eq!(h.state.redemption_build_rate.tracked_request_timestamps(), 1);
+    let (status, body) = h.build(h.request_at(20_000_000, request_timestamp)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.error.unwrap().contains("not greater"));
 }
 
 /// A captured request cannot be replayed: request timestamps must rise per recipient.
@@ -715,8 +791,8 @@ async fn node_errors_reach_the_client_without_url_or_body() {
 
 /// A build that is never submitted (the canary's dry run, a lost response) does not block the
 /// next build of the same note: builds only read tracker state, and the newer build replaces the
-/// older pending entry, so only the newer one can be submitted. Each build that passes the
-/// cheap checks still uses one unit of the pair's hourly budget.
+/// older pending entry, so only the newer one can be submitted. Each signed build of the note
+/// still uses one unit of the pair's hourly budget.
 #[tokio::test]
 async fn a_build_that_is_never_submitted_does_not_block_the_next_one() {
     let h = harness(Node::Healthy, 2).await;

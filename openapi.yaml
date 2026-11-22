@@ -1169,7 +1169,10 @@ paths:
           description: >-
             A build budget is used up (per pair, per recipient, or the tracker's
             fee-signing budgets for token reserves), or too many recipients are
-            being tracked at once
+            being tracked at once. The pair and recipient budgets count every
+            request whose `receiver_signature` verifies and whose note the
+            tracker holds, also when a later check (committed proof, amount,
+            issuer signature, payout) refuses it
           content:
             application/json:
               schema:

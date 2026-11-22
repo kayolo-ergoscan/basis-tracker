@@ -17,7 +17,8 @@ database_url = "sqlite:data/basis.db"
 # reserve_creation_max_token_amount = 1000000000
 # Maximum /redemption/build calls per (issuer, recipient) pair per hour (default 60) and per
 # recipient across issuers (default 30). Only requests the recipient signed
-# (receiver_signature) that pass the cheap checks count, so nobody else can use them up.
+# (receiver_signature) for a note the tracker holds count, so nobody else can use them up;
+# they count before the proof and the cheap checks, so a refused signed request uses one.
 # redemption_build_max_per_pair_per_hour = 60
 # redemption_build_max_per_recipient_per_hour = 30
 # Maximum /redemption/build calls per issuer, and in total, per hour that get as far as

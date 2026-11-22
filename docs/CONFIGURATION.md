@@ -46,8 +46,10 @@ notes_max_new_edges_per_hour = 1000               # new (issuer, recipient, deno
 
 All windows roll over one hour and answer `429` when reached. `/redemption/build` counts a
 request against the pair and recipient budgets only after the recipient's
-`receiver_signature` verifies and the cheap checks pass (committed outstanding debt, issuer
-signature, minimum payout), so nobody but the recipient can use them up. ERG-reserve builds pay
+`receiver_signature` verifies and the note lookup finds the note, so nobody but the recipient
+can use them up. They are counted before the committed proof and the cheap checks (committed
+outstanding debt, issuer signature, minimum payout), so a signed request that fails those
+still uses one unit of its own budget. ERG-reserve builds pay
 the miner fee out of the payout and sign no tracker input, so only token-reserve builds use the
 two fee-signing budgets.
 
