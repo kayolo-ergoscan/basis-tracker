@@ -22,6 +22,7 @@ struct Caps {
     recipients: u32,
     updates: u32,
     new_edges: u32,
+    new_edges_per_issuer: u32,
 }
 
 const DEFAULT_CAPS: Caps = Caps {
@@ -29,6 +30,7 @@ const DEFAULT_CAPS: Caps = Caps {
     recipients: 50,
     updates: 120,
     new_edges: 1000,
+    new_edges_per_issuer: 10,
 };
 
 /// A tracker thread holding a real `TrackerStateManager`, answering what `POST /notes` sends.
@@ -102,6 +104,7 @@ fn state(caps: Caps) -> AppState {
             notes_max_recipients_per_issuer: caps.recipients,
             notes_max_updates_per_issuer_per_hour: caps.updates,
             notes_max_new_edges_per_hour: caps.new_edges,
+            notes_max_new_edges_per_issuer_per_hour: caps.new_edges_per_issuer,
         },
         ergo: crate::config::ErgoConfig {
             scanner: basis_store::ergo_scanner::NodeConfig::default(),
@@ -404,6 +407,35 @@ async fn new_edges_per_hour_are_capped_for_all_issuers() {
     assert!(error.contains("notes_max_new_edges_per_hour"), "{error}");
     let (status, error) = post(&state, note_request(&a, &r1, 2_000, ts + 1, DenomKey::Erg)).await;
     assert_eq!(status, StatusCode::CREATED, "{error}");
+}
+
+/// Round 5, item 6: new edges of one issuer per hour are capped (429) below the total, so one
+/// issuer cannot use up the total; other issuers and raised edges are not affected.
+#[tokio::test]
+async fn new_edges_per_issuer_and_hour_are_capped() {
+    let state = state(Caps {
+        new_edges_per_issuer: 2,
+        ..DEFAULT_CAPS
+    });
+    let (a, b) = (issuer(), issuer());
+    add_reserve(&state, &a.key, "box-a", None, TRACKER_NFT, 0).await;
+    add_reserve(&state, &b.key, "box-b", None, TRACKER_NFT, 0).await;
+    let ts = now_ms() - 10_000;
+    let (r1, r2, r3) = (recipient(), recipient(), recipient());
+
+    for to in [&r1, &r2] {
+        let (status, error) = post(&state, note_request(&a, to, 1_000, ts, DenomKey::Erg)).await;
+        assert_eq!(status, StatusCode::CREATED, "{error}");
+    }
+    let (status, error) = post(&state, note_request(&a, &r3, 1_000, ts, DenomKey::Erg)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{error}");
+    assert!(error.contains("notes_max_new_edges_per_issuer_per_hour"), "{error}");
+    // Raising an edge of A is not a new edge; B has its own budget.
+    let (status, error) = post(&state, note_request(&a, &r1, 2_000, ts + 1, DenomKey::Erg)).await;
+    assert_eq!(status, StatusCode::CREATED, "{error}");
+    let (status, error) = post(&state, note_request(&b, &r3, 1_000, ts, DenomKey::Erg)).await;
+    assert_eq!(status, StatusCode::CREATED, "{error}");
+    assert_eq!(stored_notes(&state, &a).await, 2);
 }
 
 /// Concurrent notes cannot overshoot a cap: admission is serialized.

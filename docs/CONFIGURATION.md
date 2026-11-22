@@ -41,6 +41,7 @@ redemption_build_max_per_hour = 30                # the same, all issuers togeth
 notes_require_reserve = true                      # POST /notes needs the issuer's active reserve here
 notes_max_recipients_per_issuer = 50              # distinct recipients of one issuer
 notes_max_updates_per_issuer_per_hour = 120       # accepted notes (new or raised) of one issuer
+notes_max_new_edges_per_issuer_per_hour = 10     # new edges of one issuer
 notes_max_new_edges_per_hour = 1000               # new (issuer, recipient, denomination) edges, all issuers
 ```
 
@@ -56,10 +57,13 @@ two fee-signing budgets.
 `POST /notes` accepts a note only when its issuer has exactly one active reserve under this
 tracker in the note's denomination: tracked by the scanner, bound to this tracker's NFT in R6
 and not in refund (`409` otherwise). `notes_require_reserve = false` lifts this and allows
-credit without a reserve. The three `notes_max_*` caps answer `429`: a note to a new recipient
+credit without a reserve. The four `notes_max_*` caps answer `429`: a note to a new recipient
 beyond `notes_max_recipients_per_issuer`, more than `notes_max_updates_per_issuer_per_hour`
-accepted notes of one issuer in the last hour, or more than `notes_max_new_edges_per_hour` new
-edges in the last hour (all issuers together; raising an existing edge is not a new edge). Only
+accepted notes of one issuer in the last hour, more than
+`notes_max_new_edges_per_issuer_per_hour` new edges of one issuer in the last hour, or more than
+`notes_max_new_edges_per_hour` new edges in the last hour (all issuers together; raising an
+existing edge is not a new edge). With 10 per issuer against 1000 in total, it takes a hundred
+issuers, each with an active reserve, to use up the total. Only
 accepted notes count: a note the tracker refuses (bad signature, old timestamp, lower debt)
 gives its slot back. The hourly windows live in memory and start empty after a restart.
 

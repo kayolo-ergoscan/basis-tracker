@@ -31,10 +31,12 @@ This document describes the complete algorithm executed when a new or updated IO
 3. A note to a new recipient when the issuer already has `server.notes_max_recipients_per_issuer`
    (default 50) distinct recipients: 429 TOO MANY REQUESTS.
 4. More than `server.notes_max_updates_per_issuer_per_hour` (default 120) accepted notes of the
-   issuer in the last hour, or a new (issuer, recipient, denomination) edge when
-   `server.notes_max_new_edges_per_hour` (default 1000) new edges were created in the last hour
-   by all issuers together: 429 TOO MANY REQUESTS. A note the tracker refuses in Step 5 gives
-   its slot back.
+   issuer in the last hour, or a new (issuer, recipient, denomination) edge when the issuer
+   created `server.notes_max_new_edges_per_issuer_per_hour` (default 10, round 5) new edges in
+   the last hour, or when `server.notes_max_new_edges_per_hour` (default 1000) new edges were
+   created in the last hour by all issuers together: 429 TOO MANY REQUESTS, checked in this
+   order. With the per-issuer cap far below the total, it takes many issuers, each with an
+   active reserve, to use up the total. A note the tracker refuses in Step 5 gives its slot back.
 
 ### Step 3: IOU Note Creation
 1. Create a new `IouNote` struct with:

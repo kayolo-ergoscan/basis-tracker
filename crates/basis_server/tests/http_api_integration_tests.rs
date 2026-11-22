@@ -319,6 +319,7 @@ mod http_api_tests {
                 notes_max_recipients_per_issuer: 50,
                 notes_max_updates_per_issuer_per_hour: 120,
                 notes_max_new_edges_per_hour: 1000,
+                notes_max_new_edges_per_issuer_per_hour: 10,
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },

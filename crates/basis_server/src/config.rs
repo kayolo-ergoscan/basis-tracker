@@ -93,6 +93,11 @@ pub struct ServerConfig {
     /// together; 429 beyond. Default: 1000.
     #[serde(default = "default_notes_max_new_edges_per_hour")]
     pub notes_max_new_edges_per_hour: u32,
+    /// Maximum new (issuer, recipient, denomination) edges of one issuer per rolling hour; 429
+    /// beyond. Default: 10, so it takes many issuers (each with an active reserve) to use up
+    /// `notes_max_new_edges_per_hour` (round 5).
+    #[serde(default = "default_notes_max_new_edges_per_issuer_per_hour")]
+    pub notes_max_new_edges_per_issuer_per_hour: u32,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -116,6 +121,7 @@ impl std::fmt::Debug for ServerConfig {
             notes_max_recipients_per_issuer,
             notes_max_updates_per_issuer_per_hour,
             notes_max_new_edges_per_hour,
+            notes_max_new_edges_per_issuer_per_hour,
         } = self;
         f.debug_struct("ServerConfig")
             .field("host", host)
@@ -161,6 +167,10 @@ impl std::fmt::Debug for ServerConfig {
                 notes_max_updates_per_issuer_per_hour,
             )
             .field("notes_max_new_edges_per_hour", notes_max_new_edges_per_hour)
+            .field(
+                "notes_max_new_edges_per_issuer_per_hour",
+                notes_max_new_edges_per_issuer_per_hour,
+            )
             .finish()
     }
 }
@@ -196,6 +206,10 @@ pub fn default_notes_max_updates_per_issuer_per_hour() -> u32 {
 
 pub fn default_notes_max_new_edges_per_hour() -> u32 {
     1000
+}
+
+pub fn default_notes_max_new_edges_per_issuer_per_hour() -> u32 {
+    10
 }
 
 /// Default `[server] redemption_build_max_per_issuer_per_hour`.
@@ -1276,6 +1290,8 @@ mod tests {
                 notes_max_recipients_per_issuer: default_notes_max_recipients_per_issuer(),
                 notes_max_updates_per_issuer_per_hour: default_notes_max_updates_per_issuer_per_hour(),
                 notes_max_new_edges_per_hour: default_notes_max_new_edges_per_hour(),
+                notes_max_new_edges_per_issuer_per_hour:
+                    default_notes_max_new_edges_per_issuer_per_hour(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1376,6 +1392,8 @@ mod tests {
                 notes_max_recipients_per_issuer: default_notes_max_recipients_per_issuer(),
                 notes_max_updates_per_issuer_per_hour: default_notes_max_updates_per_issuer_per_hour(),
                 notes_max_new_edges_per_hour: default_notes_max_new_edges_per_hour(),
+                notes_max_new_edges_per_issuer_per_hour:
+                    default_notes_max_new_edges_per_issuer_per_hour(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1532,6 +1550,8 @@ mod tests {
                 notes_max_recipients_per_issuer: default_notes_max_recipients_per_issuer(),
                 notes_max_updates_per_issuer_per_hour: default_notes_max_updates_per_issuer_per_hour(),
                 notes_max_new_edges_per_hour: default_notes_max_new_edges_per_hour(),
+                notes_max_new_edges_per_issuer_per_hour:
+                    default_notes_max_new_edges_per_issuer_per_hour(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1905,6 +1925,34 @@ mod tests {
         ] {
             assert!(with_nft(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// Round 5, item 6: a config without the note caps (as in production) gets the defaults,
+    /// the new per-issuer new-edge cap included, and an explicit value is read.
+    #[test]
+    fn note_caps_default_when_absent() {
+        let load = |toml: &str| {
+            config::Config::builder()
+                .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+                .build()
+                .unwrap()
+                .try_deserialize::<AppConfig>()
+                .unwrap()
+                .server
+        };
+        let server = load(VALID_TOML);
+        assert!(server.notes_require_reserve);
+        assert_eq!(server.notes_max_recipients_per_issuer, 50);
+        assert_eq!(server.notes_max_updates_per_issuer_per_hour, 120);
+        assert_eq!(server.notes_max_new_edges_per_issuer_per_hour, 10);
+        assert_eq!(server.notes_max_new_edges_per_hour, 1000);
+
+        let server = load(&VALID_TOML.replace(
+            "port = 3048",
+            "port = 3048\n        notes_max_new_edges_per_issuer_per_hour = 3",
+        ));
+        assert_eq!(server.notes_max_new_edges_per_issuer_per_hour, 3);
+        assert_eq!(server.notes_max_new_edges_per_hour, 1000);
     }
 
     #[test]

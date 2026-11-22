@@ -301,8 +301,7 @@ pub async fn create_note(
     let slot = match state.note_limits.try_record(
         &issuer_pubkey,
         is_new_edge,
-        state.config.server.notes_max_updates_per_issuer_per_hour,
-        state.config.server.notes_max_new_edges_per_hour,
+        crate::note_limits::NoteCaps::of(&state.config.server),
     ) {
         Ok(slot) => slot,
         Err(message) => {
