@@ -224,8 +224,8 @@ pub struct TaggedScanBox {
     pub contract_address: String,
 }
 
-/// Configuration for scanner
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Configuration for scanner. `Debug` hides `api_key` and any credentials in `node_url`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Starting block height for scanning
     pub start_height: Option<u64>,
@@ -244,6 +244,29 @@ pub struct NodeConfig {
     pub scan_name: Option<String>,
     /// API key for Ergo node authentication
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for NodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let NodeConfig {
+            start_height,
+            reserve_contract_p2s,
+            token_reserve_contract_p2s,
+            tracker_nft_id,
+            node_url,
+            scan_name,
+            api_key,
+        } = self;
+        f.debug_struct("NodeConfig")
+            .field("start_height", start_height)
+            .field("reserve_contract_p2s", reserve_contract_p2s)
+            .field("token_reserve_contract_p2s", token_reserve_contract_p2s)
+            .field("tracker_nft_id", tracker_nft_id)
+            .field("node_url", &crate::redact::Url(node_url))
+            .field("scan_name", scan_name)
+            .field("api_key", &crate::redact::Secret(api_key))
+            .finish()
+    }
 }
 
 /// Inner state for scanner that requires synchronization

@@ -302,6 +302,15 @@ The Tracker Public Key is used by the tracker server to:
    `tracker_public_key`, and it commits only to a tracker box locked by
    `P2PK(tracker_public_key)`.
 
+### Secrets in debug output
+
+No secret from the configuration appears in a `{:?}` (Debug) print of a config struct, for
+example in a panic message or a debug log: `ergo.tracker_secret_key`, `server.auth.api_key`,
+`server.auth.admin_api_key`, `ergo.scanner.api_key`, `ergo.wallet.api_key` and
+`server.database_url` print as `<redacted>` (`None` when unset), and the `user:password@` part
+of a node URL as `<redacted>@`. A startup error that would quote a value from the config file
+prints `<redacted>` in its place too.
+
 ### Bootstrapping the tracker
 
 `basis_bootstrap` creates the tracker's on-chain state once, before the first start of

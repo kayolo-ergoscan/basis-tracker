@@ -351,6 +351,7 @@ Key configuration includes:
 1. `ergo.scanner.node_url` defaults to `http://127.0.0.1:9053` (local node); point it at your Ergo node (with `extraIndex = true`) for real deployments. `ergo.wallet.node_url` optionally points at a separate node for the `POST /transactions` broadcast; it falls back to the scanner node when unset.
 2. `ergo.tracker_secret_key` must be configured: the tracker signs notes' redemption messages and its own transactions locally. No node wallet and no node API key are needed.
 3. The tracker public key must be provided in the configuration, and it must equal `tracker_secret_key·G` (checked at startup).
+4. Secrets never reach `Debug` output: every config struct that holds one (`ServerConfig`, `AuthConfig`, `ErgoConfig`, `WalletNodeConfig`, `TrackerBoxUpdateConfig`, and in `basis_store` `NodeConfig` and `TrackerNodeConfig`) implements `Debug` by hand with `basis_store::redact`: a set secret prints as `<redacted>`, an unset one as `None`, and URL credentials as `<redacted>@`.
 5. When `server.auth.mode` is not `none`, configure TLS (`server.tls_cert_path` and `server.tls_key_path`) for production deployments so credentials and signatures are not sent in plaintext.
 
 ## Blockchain Integration

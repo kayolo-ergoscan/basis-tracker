@@ -46,8 +46,9 @@ pub enum TrackerScannerError {
     MissingTrackerNft,
 }
 
-/// Configuration for tracker scanner
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Configuration for tracker scanner. `Debug` hides `api_key` and any credentials in
+/// `node_url`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TrackerNodeConfig {
     /// Starting block height for scanning
     pub start_height: Option<u64>,
@@ -59,6 +60,25 @@ pub struct TrackerNodeConfig {
     pub scan_name: Option<String>,
     /// API key for Ergo node authentication
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for TrackerNodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let TrackerNodeConfig {
+            start_height,
+            tracker_nft_id,
+            node_url,
+            scan_name,
+            api_key,
+        } = self;
+        f.debug_struct("TrackerNodeConfig")
+            .field("start_height", start_height)
+            .field("tracker_nft_id", tracker_nft_id)
+            .field("node_url", &crate::redact::Url(node_url))
+            .field("scan_name", scan_name)
+            .field("api_key", &crate::redact::Secret(api_key))
+            .finish()
+    }
 }
 
 /// Inner state for tracker scanner that requires synchronization

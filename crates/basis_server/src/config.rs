@@ -2,6 +2,7 @@
 
 use crate::acceptance::config::AcceptanceConfig;
 use basis_store::ergo_scanner::NodeConfig;
+use basis_store::redact;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -28,8 +29,8 @@ pub struct AppConfig {
     pub confirmation: ConfirmationConfig,
 }
 
-/// Server-specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Server-specific configuration. `Debug` hides `database_url` and the keys in `auth`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Host address to bind to
     pub host: String,
@@ -72,6 +73,57 @@ pub struct ServerConfig {
     pub redemption_build_max_per_hour: u32,
 }
 
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every field is named, so a new one cannot reach `Debug` without a decision here.
+        let ServerConfig {
+            host,
+            port,
+            data_dir,
+            database_url,
+            tls_cert_path,
+            tls_key_path,
+            auth,
+            reserve_creation_max_erg_nano,
+            reserve_creation_max_token_amount,
+            redemption_build_max_per_pair_per_hour,
+            redemption_build_max_per_issuer_per_hour,
+            redemption_build_max_per_hour,
+        } = self;
+        f.debug_struct("ServerConfig")
+            .field("host", host)
+            .field("port", port)
+            .field("data_dir", data_dir)
+            // A database URL can carry a password (`postgres://user:password@...`,
+            // `password=...`), so none of it is shown.
+            .field("database_url", &redact::Secret(database_url))
+            .field("tls_cert_path", tls_cert_path)
+            .field("tls_key_path", tls_key_path)
+            .field("auth", auth)
+            .field(
+                "reserve_creation_max_erg_nano",
+                reserve_creation_max_erg_nano,
+            )
+            .field(
+                "reserve_creation_max_token_amount",
+                reserve_creation_max_token_amount,
+            )
+            .field(
+                "redemption_build_max_per_pair_per_hour",
+                redemption_build_max_per_pair_per_hour,
+            )
+            .field(
+                "redemption_build_max_per_issuer_per_hour",
+                redemption_build_max_per_issuer_per_hour,
+            )
+            .field(
+                "redemption_build_max_per_hour",
+                redemption_build_max_per_hour,
+            )
+            .finish()
+    }
+}
+
 fn default_reserve_creation_max_erg_nano() -> u64 {
     10_000_000_000 // 10 ERG
 }
@@ -94,8 +146,8 @@ pub fn default_redemption_build_max_per_hour() -> u32 {
     30
 }
 
-/// Authentication configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Authentication configuration. `Debug` hides `api_key` and `admin_api_key`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     /// Authentication scheme.
     #[serde(default)]
@@ -137,6 +189,37 @@ pub struct AuthConfig {
     /// combination unless this flag is set explicitly.
     #[serde(default)]
     pub allow_insecure_http_non_loopback: bool,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let AuthConfig {
+            mode,
+            api_key,
+            authorized_clients,
+            allowed_origins,
+            signature_timestamp_tolerance_ms,
+            allow_anonymous_non_loopback,
+            admin_api_key,
+            allow_insecure_http_non_loopback,
+        } = self;
+        f.debug_struct("AuthConfig")
+            .field("mode", mode)
+            .field("api_key", &redact::Secret(api_key))
+            .field("authorized_clients", authorized_clients)
+            .field("allowed_origins", allowed_origins)
+            .field(
+                "signature_timestamp_tolerance_ms",
+                signature_timestamp_tolerance_ms,
+            )
+            .field("allow_anonymous_non_loopback", allow_anonymous_non_loopback)
+            .field("admin_api_key", &redact::Secret(admin_api_key))
+            .field(
+                "allow_insecure_http_non_loopback",
+                allow_insecure_http_non_loopback,
+            )
+            .finish()
+    }
 }
 
 impl Default for AuthConfig {
@@ -267,8 +350,9 @@ pub struct ReserveTokenConfig {
 ///
 /// The tracker sends its locally signed transactions here through `POST /transactions` and
 /// uses no other endpoint of this node: no node wallet and no API key are needed, and no
-/// extra indices. When `node_url` is empty, the scanner node is used.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// extra indices. When `node_url` is empty, the scanner node is used. `Debug` hides `api_key`
+/// and any credentials in `node_url`.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct WalletNodeConfig {
     /// Ergo node URL for broadcasts; empty means "use the scanner node".
     #[serde(default)]
@@ -279,8 +363,18 @@ pub struct WalletNodeConfig {
     pub api_key: Option<String>,
 }
 
-/// Ergo blockchain configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::fmt::Debug for WalletNodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let WalletNodeConfig { node_url, api_key } = self;
+        f.debug_struct("WalletNodeConfig")
+            .field("node_url", &redact::Url(node_url))
+            .field("api_key", &redact::Secret(api_key))
+            .finish()
+    }
+}
+
+/// Ergo blockchain configuration. `Debug` hides `tracker_secret_key` and the node secrets.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErgoConfig {
     /// Scanner node configuration: chain reads and box scanning
@@ -306,6 +400,34 @@ pub struct ErgoConfig {
     /// transactions, redemption fee inputs and tracker signatures in-process with it. It is
     /// never sent to a node or anywhere else; the server refuses to start without it.
     pub tracker_secret_key: Option<String>,
+}
+
+impl std::fmt::Debug for ErgoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ErgoConfig {
+            scanner,
+            wallet,
+            basis_reserve_contract_p2s,
+            basis_token_reserve_contract_p2s,
+            tracker_nft_id,
+            reserve_tokens,
+            tracker_public_key,
+            tracker_secret_key,
+        } = self;
+        f.debug_struct("ErgoConfig")
+            .field("scanner", scanner)
+            .field("wallet", wallet)
+            .field("basis_reserve_contract_p2s", basis_reserve_contract_p2s)
+            .field(
+                "basis_token_reserve_contract_p2s",
+                basis_token_reserve_contract_p2s,
+            )
+            .field("tracker_nft_id", tracker_nft_id)
+            .field("reserve_tokens", reserve_tokens)
+            .field("tracker_public_key", tracker_public_key)
+            .field("tracker_secret_key", &redact::Secret(tracker_secret_key))
+            .finish()
+    }
 }
 
 /// Transaction configuration
@@ -1354,6 +1476,78 @@ mod tests {
             acceptance: AcceptanceConfig::empty(),
             redemption: RedemptionConfig::default(),
             confirmation: ConfirmationConfig::default(),
+        }
+    }
+
+    /// `{:?}` and `{:#?}` of a whole `AppConfig` never show a secret: the auth keys, the node
+    /// keys, the tracker signing key, the database URL and a password in a node URL print as
+    /// `<redacted>`, and unset ones as `None`. Everything else stays readable.
+    #[test]
+    fn debug_of_the_config_never_shows_a_secret() {
+        let tracker_secret_hex = "fa4e".repeat(16);
+        let secrets = [
+            "FAKE-SHARED-API-KEY",
+            "FAKE-ADMIN-API-KEY",
+            "FAKE-SCANNER-NODE-KEY",
+            "FAKE-WALLET-NODE-KEY",
+            "FAKE-SCANNER-URL-PASSWORD",
+            "FAKE-WALLET-URL-PASSWORD",
+            "FAKE-DB-PASSWORD",
+            tracker_secret_hex.as_str(),
+        ];
+        let mut config = minimal_config();
+        config.server.database_url =
+            Some("postgres://tracker:FAKE-DB-PASSWORD@db.example/basis".to_string());
+        config.server.auth = AuthConfig {
+            mode: AuthMode::ApiKey,
+            api_key: Some("FAKE-SHARED-API-KEY".to_string()),
+            admin_api_key: Some("FAKE-ADMIN-API-KEY".to_string()),
+            ..Default::default()
+        };
+        config.ergo.scanner.node_url =
+            "https://scan:FAKE-SCANNER-URL-PASSWORD@scanner.example:9053".to_string();
+        config.ergo.scanner.api_key = Some("FAKE-SCANNER-NODE-KEY".to_string());
+        config.ergo.wallet = WalletNodeConfig {
+            node_url: "http://wallet:FAKE-WALLET-URL-PASSWORD@wallet.example:9053/".to_string(),
+            api_key: Some("FAKE-WALLET-NODE-KEY".to_string()),
+        };
+        config.ergo.tracker_secret_key = Some(tracker_secret_hex.clone());
+
+        for printed in [format!("{config:?}"), format!("{config:#?}")] {
+            for secret in secrets {
+                assert!(!printed.contains(secret), "{secret} in {printed}");
+            }
+            // Each of the eight is there, as `<redacted>`.
+            assert_eq!(printed.matches("<redacted>").count(), 8, "{printed}");
+            for shown in [
+                "database_url: <redacted>",
+                "api_key: <redacted>",
+                "admin_api_key: <redacted>",
+                "tracker_secret_key: <redacted>",
+                "https://<redacted>@scanner.example:9053",
+                "http://<redacted>@wallet.example:9053/",
+                // Not secret, and still useful in a debug print.
+                "02dada811a888cd0dc7a0a41739a3ad9b0f427741fe6ca19700cf1a51200c96bf7",
+                "127.0.0.1",
+                "ApiKey",
+            ] {
+                assert!(printed.contains(shown), "{shown} missing in {printed}");
+            }
+        }
+
+        // Unset secrets print as `None`.
+        let mut unset = minimal_config();
+        unset.ergo.scanner.api_key = None;
+        unset.server.database_url = None;
+        let printed = format!("{unset:?}");
+        assert!(!printed.contains("<redacted>"), "{printed}");
+        for none in [
+            "database_url: None",
+            "api_key: None",
+            "admin_api_key: None",
+            "tracker_secret_key: None",
+        ] {
+            assert!(printed.contains(none), "{none} missing in {printed}");
         }
     }
 

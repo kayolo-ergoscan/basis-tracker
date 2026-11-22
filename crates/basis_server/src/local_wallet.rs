@@ -41,8 +41,8 @@ pub struct NodeEndpoint {
 impl std::fmt::Debug for NodeEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeEndpoint")
-            .field("url", &self.url)
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("url", &basis_store::redact::Url(&self.url))
+            .field("api_key", &basis_store::redact::Secret(&self.api_key))
             .finish()
     }
 }

@@ -5,6 +5,7 @@
 //! with `ergo.tracker_secret_key` and submitted through the node's public `POST /transactions`;
 //! no node wallet endpoint is used.
 
+use basis_store::redact;
 use std::sync::{Arc, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
@@ -205,30 +206,31 @@ pub struct TrackerBoxUpdateConfig {
 
 impl std::fmt::Debug for TrackerBoxUpdateConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let TrackerBoxUpdateConfig {
+            wallet_node_url,
+            wallet_api_key,
+            scanner_node_url,
+            scanner_api_key,
+            update_interval_seconds,
+            fee,
+            change_address,
+            tracker_secret_key,
+            min_confirmation_depth,
+            reserve_contract_addresses,
+            heartbeat_blocks,
+        } = self;
         f.debug_struct("TrackerBoxUpdateConfig")
-            .field("wallet_node_url", &self.wallet_node_url)
-            .field(
-                "wallet_api_key",
-                &self.wallet_api_key.as_ref().map(|_| "<redacted>"),
-            )
-            .field("scanner_node_url", &self.scanner_node_url)
-            .field(
-                "scanner_api_key",
-                &self.scanner_api_key.as_ref().map(|_| "<redacted>"),
-            )
-            .field("update_interval_seconds", &self.update_interval_seconds)
-            .field("fee", &self.fee)
-            .field("change_address", &self.change_address)
-            .field(
-                "tracker_secret_key",
-                &self.tracker_secret_key.as_ref().map(|_| "<redacted>"),
-            )
-            .field("min_confirmation_depth", &self.min_confirmation_depth)
-            .field(
-                "reserve_contract_addresses",
-                &self.reserve_contract_addresses,
-            )
-            .field("heartbeat_blocks", &self.heartbeat_blocks)
+            .field("wallet_node_url", &redact::Url(wallet_node_url))
+            .field("wallet_api_key", &redact::Secret(wallet_api_key))
+            .field("scanner_node_url", &redact::Url(scanner_node_url))
+            .field("scanner_api_key", &redact::Secret(scanner_api_key))
+            .field("update_interval_seconds", update_interval_seconds)
+            .field("fee", fee)
+            .field("change_address", change_address)
+            .field("tracker_secret_key", &redact::Secret(tracker_secret_key))
+            .field("min_confirmation_depth", min_confirmation_depth)
+            .field("reserve_contract_addresses", reserve_contract_addresses)
+            .field("heartbeat_blocks", heartbeat_blocks)
             .finish()
     }
 }
@@ -2012,13 +2014,24 @@ mod tests {
         let config = TrackerBoxUpdateConfig {
             tracker_secret_key: Some(secret),
             wallet_api_key: Some("wallet-key".to_string()),
+            scanner_node_url: "http://op:url-password@scanner.example:9053".to_string(),
             ..Default::default()
         };
         let printed = format!("{config:?}");
         assert!(!printed.contains(&hex::encode(secret)));
         assert!(!printed.contains("92, 92, 92"), "{printed}");
         assert!(!printed.contains("wallet-key"));
-        assert!(printed.contains("<redacted>"));
+        assert!(!printed.contains("url-password"), "{printed}");
+        assert!(
+            printed.contains("tracker_secret_key: <redacted>"),
+            "{printed}"
+        );
+        assert!(printed.contains("wallet_api_key: <redacted>"), "{printed}");
+        assert!(printed.contains("scanner_api_key: None"), "{printed}");
+        assert!(
+            printed.contains("<redacted>@scanner.example:9053"),
+            "{printed}"
+        );
     }
 
     #[test]

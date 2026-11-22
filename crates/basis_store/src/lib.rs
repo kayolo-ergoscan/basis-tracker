@@ -11,6 +11,7 @@ pub mod cross_verification;
 pub mod ergo_scanner;
 pub mod http;
 pub mod persistence;
+pub mod redact;
 pub mod redemption;
 #[cfg(test)]
 pub mod redemption_blockchain_tests;
