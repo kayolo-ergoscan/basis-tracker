@@ -477,6 +477,48 @@ struct CommittedTree {
     tree: basis_trees::BasisAvlTree,
 }
 
+/// One edge's value in a reserve tree: `timestamp ‖ already_redeemed`, as the contract stores it
+/// (16 bytes, both big-endian).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReserveTreeValue {
+    /// The timestamp of the note the last redemption of the edge proved.
+    pub timestamp: u64,
+    /// The edge's cumulative redeemed amount.
+    pub already_redeemed: u64,
+}
+
+/// What a reserve tree repair did ([`TrackerStateManager::repair_reserve_tree_value`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReserveTreeRepairOutcome {
+    /// The tree and the note now hold the value.
+    Repaired,
+    /// They held it already; nothing was written.
+    Unchanged,
+    /// A dry run: the repair would be made; nothing was written.
+    WouldRepair,
+    /// The tree with the value would not hash to the chain's digest; nothing was written.
+    Refused,
+}
+
+/// The result of a reserve tree repair (round 6, risk 1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReserveTreeRepair {
+    pub outcome: ReserveTreeRepairOutcome,
+    /// The edge's value before (`None`: the tree had no value for the edge).
+    pub before: Option<ReserveTreeValue>,
+    /// The value the repair writes.
+    pub after: ReserveTreeValue,
+    /// The note's cumulative redeemed amount before; afterwards it is `after.already_redeemed`.
+    pub note_redeemed_before: u64,
+    /// The tracker's reserve tree digest before (hex, 33 bytes).
+    pub digest_before: String,
+    /// The tracker's reserve tree digest with the value (hex).
+    pub digest_after: String,
+    /// The digest it was checked against: R5 of the reserve box on chain (hex).
+    pub chain_digest: String,
+}
+
 pub struct TrackerStateManager {
     avl_state: basis_trees::BasisAvlTree,
     current_state: TrackerState,
@@ -2679,6 +2721,98 @@ impl TrackerStateManager {
         self.reserve_avl_states
             .insert((*issuer_pubkey, *denomination), next_tree);
         Ok(())
+    }
+
+    /// Round 6 (risk 1): bring one edge of a reserve tree back in step with the chain. The edge's
+    /// reserve tree value becomes `value` (`timestamp ‖ already_redeemed`) and the note's
+    /// cumulative redeemed amount `value.already_redeemed`, but only when the reserve tree then
+    /// hashes to `chain_digest`, the R5 digest of the reserve box on chain: the repair can only
+    /// put the tracker where the chain is, never anywhere else.
+    ///
+    /// * The tree with `value` does not hash to `chain_digest`: nothing changes, `Refused`.
+    /// * The tree and the note hold `value` already: nothing changes, `Unchanged` (idempotent).
+    /// * `dry_run`: nothing changes, `WouldRepair`.
+    /// * Otherwise the note and the reserve AVL journal record are written in one batch (the
+    ///   journal is replayed at startup, so the repair survives a restart), then the in-memory
+    ///   tree is swapped: `Repaired`.
+    ///
+    /// Unlike [`Self::apply_redemption`], the note's cumulative amount may go down: the chain's
+    /// reserve tree, which the contract reads, is the authority here, and the digest check binds
+    /// the value to it. It never exceeds the note's `amount_collected`.
+    pub fn repair_reserve_tree_value(
+        &mut self,
+        issuer_pubkey: &PubKey,
+        recipient_pubkey: &PubKey,
+        denomination: &DenomKey,
+        value: ReserveTreeValue,
+        chain_digest: &[u8; 33],
+        dry_run: bool,
+    ) -> Result<ReserveTreeRepair, NoteError> {
+        let mut note = self.lookup_note(issuer_pubkey, recipient_pubkey, denomination)?;
+        let before = self
+            .reserve_tree_value(issuer_pubkey, recipient_pubkey, denomination)?
+            .map(|(timestamp, already_redeemed)| ReserveTreeValue {
+                timestamp,
+                already_redeemed,
+            });
+        let digest_before = self.reserve_state_digest(issuer_pubkey, denomination);
+
+        let key = NoteKey::from_keys(issuer_pubkey, recipient_pubkey);
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&value.timestamp.to_be_bytes());
+        bytes.extend_from_slice(&value.already_redeemed.to_be_bytes());
+        let mut next_tree = match self
+            .reserve_avl_states
+            .get(&(*issuer_pubkey, *denomination))
+        {
+            Some(tree) => tree.try_clone(),
+            None => basis_trees::BasisAvlTree::new(),
+        }
+        .map_err(|e| NoteError::StorageError(format!("Reserve AVL tree copy failed: {:?}", e)))?;
+        next_tree
+            .update(key.to_bytes(), bytes)
+            .map_err(|e| NoteError::StorageError(format!("Reserve AVL tree update failed: {}", e)))?;
+        let digest_after = next_tree.root_digest();
+
+        let mut repair = ReserveTreeRepair {
+            outcome: ReserveTreeRepairOutcome::Refused,
+            before,
+            after: value,
+            note_redeemed_before: note.amount_redeemed,
+            digest_before: hex::encode(digest_before),
+            digest_after: hex::encode(digest_after),
+            chain_digest: hex::encode(chain_digest),
+        };
+        if &digest_after != chain_digest {
+            return Ok(repair);
+        }
+        if before == Some(value) && note.amount_redeemed == value.already_redeemed {
+            repair.outcome = ReserveTreeRepairOutcome::Unchanged;
+            return Ok(repair);
+        }
+        if value.already_redeemed > note.amount_collected {
+            return Err(NoteError::StorageError(format!(
+                "the chain's cumulative redeemed amount {} exceeds the note's total {}: the \
+                 tracker's note is behind the chain, which a reserve tree repair cannot fix",
+                value.already_redeemed, note.amount_collected
+            )));
+        }
+        if dry_run {
+            repair.outcome = ReserveTreeRepairOutcome::WouldRepair;
+            return Ok(repair);
+        }
+
+        note.amount_redeemed = value.already_redeemed;
+        self.storage.store_redemption(
+            issuer_pubkey,
+            &note,
+            value.timestamp,
+            value.already_redeemed,
+        )?;
+        self.reserve_avl_states
+            .insert((*issuer_pubkey, *denomination), next_tree);
+        repair.outcome = ReserveTreeRepairOutcome::Repaired;
+        Ok(repair)
     }
 
     /// Generate proof for a specific note

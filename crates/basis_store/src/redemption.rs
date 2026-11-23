@@ -1687,6 +1687,178 @@ mod tests {
         );
     }
 
+    /// Round 6 (risk 1): the reserve tree holds the right cumulative amount with another
+    /// timestamp (the legacy apply took the note's current timestamp after a re-sign), so it
+    /// does not hash to the chain's R5 and the confirmer's apply is refused. The repair sets the
+    /// value the chain holds, but only when the tree then hashes to the chain's digest: a wrong
+    /// value is refused and changes nothing, a dry run changes nothing, the repair is written to
+    /// the reserve journal (a restart keeps it), and repeating it changes nothing.
+    #[test]
+    fn test_a_tree_value_with_another_timestamp_is_repaired_to_the_chain() {
+        use crate::{ReserveTreeRepairOutcome, ReserveTreeValue};
+        let secp = secp256k1::Secp256k1::new();
+        let issuer_secret = secp256k1::SecretKey::from_slice(&[0x25u8; 32]).unwrap();
+        let issuer = secp256k1::PublicKey::from_secret_key(&secp, &issuer_secret).serialize();
+        let recipient = [0x03u8; 33];
+        let erg = crate::DenomKey::Erg;
+        let (built_at, re_signed_at) = (1_700_000_000_000u64, 1_700_000_060_000u64);
+        let signed_at = |timestamp: u64| {
+            IouNote::create_and_sign(
+                recipient,
+                1_000,
+                timestamp,
+                &issuer_secret.secret_bytes(),
+                &[0x42; 32],
+                erg,
+            )
+            .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = RedemptionManager::new(crate::TrackerStateManager::new(dir.path()));
+        m.tracker.add_note(&issuer, &signed_at(built_at)).unwrap();
+        let (_, chain_r5) = m
+            .tracker
+            .generate_reserve_insert_proof(&issuer, &recipient, &erg, built_at, 300)
+            .unwrap();
+        let chain: [u8; 33] = chain_r5.as_slice().try_into().unwrap();
+        m.tracker.add_note(&issuer, &signed_at(re_signed_at)).unwrap();
+        // The legacy apply: the note's current timestamp, not the build's.
+        m.complete_redemption(&issuer, &recipient, &erg, 300, Some(300))
+            .unwrap();
+        let out_of_step = m.tracker.reserve_state_digest(&issuer, &erg);
+        assert_ne!(out_of_step, chain_r5);
+        assert!(m
+            .complete_redemption_at(&issuer, &recipient, &erg, 300, Some(300), Some(built_at))
+            .is_err());
+
+        let repair = |m: &mut RedemptionManager, timestamp: u64, dry_run: bool| {
+            m.tracker
+                .repair_reserve_tree_value(
+                    &issuer,
+                    &recipient,
+                    &erg,
+                    ReserveTreeValue {
+                        timestamp,
+                        already_redeemed: 300,
+                    },
+                    &chain,
+                    dry_run,
+                )
+                .unwrap()
+        };
+        let journal = |m: &RedemptionManager| m.tracker.storage.iter_reserve_avl_updates().unwrap();
+        let records = journal(&m).len();
+
+        let wrong = repair(&mut m, re_signed_at + 1, false);
+        assert_eq!(wrong.outcome, ReserveTreeRepairOutcome::Refused);
+        assert_eq!(wrong.chain_digest, hex::encode(chain));
+        assert_ne!(wrong.digest_after, wrong.chain_digest);
+        let dry = repair(&mut m, built_at, true);
+        assert_eq!(dry.outcome, ReserveTreeRepairOutcome::WouldRepair);
+        assert_eq!(
+            dry.before,
+            Some(ReserveTreeValue {
+                timestamp: re_signed_at,
+                already_redeemed: 300
+            })
+        );
+        assert_eq!(dry.digest_before, hex::encode(&out_of_step));
+        assert_eq!(dry.digest_after, hex::encode(chain));
+        assert_eq!(m.tracker.reserve_state_digest(&issuer, &erg), out_of_step);
+        assert_eq!(journal(&m).len(), records, "refused and dry runs write nothing");
+
+        assert_eq!(
+            repair(&mut m, built_at, false).outcome,
+            ReserveTreeRepairOutcome::Repaired
+        );
+        assert_eq!(m.tracker.reserve_state_digest(&issuer, &erg), chain_r5);
+        assert_eq!(journal(&m).len(), records + 1);
+        assert_eq!(
+            repair(&mut m, built_at, false).outcome,
+            ReserveTreeRepairOutcome::Unchanged
+        );
+        assert_eq!(journal(&m).len(), records + 1, "idempotent");
+        m.complete_redemption_at(&issuer, &recipient, &erg, 300, Some(300), Some(built_at))
+            .expect("the confirmer's apply now finds it applied");
+        let note = m.tracker.lookup_note(&issuer, &recipient, &erg).unwrap();
+        assert_eq!((note.timestamp, note.amount_redeemed), (re_signed_at, 300));
+
+        drop(m);
+        let restarted = crate::TrackerStateManager::new(dir.path());
+        assert_eq!(restarted.reserve_state_digest(&issuer, &erg), chain_r5);
+    }
+
+    /// Round 6 (risk 1): a redemption the tracker never applied (the tree has no value for the
+    /// edge, the note shows nothing redeemed) is brought in step from the chain's value: the
+    /// tree takes it and the note's cumulative amount follows. A value above the note's total
+    /// is refused; a note the tracker does not hold is an error.
+    #[test]
+    fn test_a_tree_behind_the_chain_is_repaired_with_the_note() {
+        use crate::{ReserveTreeRepairOutcome, ReserveTreeValue};
+        let secp = secp256k1::Secp256k1::new();
+        let issuer_secret = secp256k1::SecretKey::from_slice(&[0x26u8; 32]).unwrap();
+        let issuer = secp256k1::PublicKey::from_secret_key(&secp, &issuer_secret).serialize();
+        let recipient = [0x03u8; 33];
+        let erg = crate::DenomKey::Erg;
+        let timestamp = 1_700_000_000_000u64;
+        let note = IouNote::create_and_sign(
+            recipient,
+            1_000,
+            timestamp,
+            &issuer_secret.secret_bytes(),
+            &[0x42; 32],
+            erg,
+        )
+        .unwrap();
+        let mut m = RedemptionManager::new(crate::TrackerStateManager::new_with_temp_storage());
+        m.tracker.add_note(&issuer, &note).unwrap();
+        let digest = |m: &RedemptionManager, already: u64| -> [u8; 33] {
+            m.tracker
+                .generate_reserve_insert_proof(&issuer, &recipient, &erg, timestamp, already)
+                .unwrap()
+                .1
+                .as_slice()
+                .try_into()
+                .unwrap()
+        };
+        let value = |already_redeemed| ReserveTreeValue {
+            timestamp,
+            already_redeemed,
+        };
+
+        let too_much = digest(&m, 1_001);
+        assert!(m
+            .tracker
+            .repair_reserve_tree_value(&issuer, &recipient, &erg, value(1_001), &too_much, false)
+            .is_err());
+        let chain = digest(&m, 400);
+        let repaired = m
+            .tracker
+            .repair_reserve_tree_value(&issuer, &recipient, &erg, value(400), &chain, false)
+            .unwrap();
+        assert_eq!(repaired.outcome, ReserveTreeRepairOutcome::Repaired);
+        assert_eq!((repaired.before, repaired.note_redeemed_before), (None, 0));
+        assert_eq!(m.tracker.reserve_state_digest(&issuer, &erg), chain.to_vec());
+        assert_eq!(
+            m.tracker
+                .lookup_note(&issuer, &recipient, &erg)
+                .unwrap()
+                .amount_redeemed,
+            400
+        );
+        assert!(matches!(
+            m.tracker.repair_reserve_tree_value(
+                &issuer,
+                &[0x02u8; 33],
+                &erg,
+                value(400),
+                &chain,
+                false
+            ),
+            Err(crate::NoteError::NotFound)
+        ));
+    }
+
     /// The reserve AVL journal must survive a TrackerStateManager restart so that
     /// a third redemption can generate lookup/insert proofs without manual repair.
     #[test]

@@ -131,6 +131,9 @@ pub struct TrackerStorage {
     /// Redemptions submitted through `/redemption/submit` that the chain has not confirmed yet
     /// (round 5, C8; see [`JournaledRedemption`]).
     redemption_journal: fjall::Partition,
+    /// The operator's reserve tree repairs, oldest first (round 6, risk 1; see
+    /// [`ReserveTreeRepairRecord`]).
+    tree_repairs: fjall::Partition,
     /// Serializes the journal writes, so a write-back of an entry read earlier
     /// ([`Self::update_journaled_redemption`]) never brings back an entry removed meanwhile
     /// (round 5b, F8). Shared by the clones of this storage.
@@ -141,6 +144,38 @@ pub struct TrackerStorage {
 /// first open; a data dir without it (written before round 5) opens unchanged, and an older
 /// binary leaves it alone.
 pub const REDEMPTION_JOURNAL_PARTITION: &str = "redemption_journal";
+
+/// The partition of [`TrackerStorage`] that records the operator's reserve tree repairs (round
+/// 6, risk 1). It is created on first open; a data dir without it opens unchanged, and an older
+/// binary leaves it alone.
+pub const RESERVE_TREE_REPAIRS_PARTITION: &str = "reserve_tree_repairs";
+
+/// One reserve tree repair (`POST /redemption/tree/repair`, round 6, risk 1), kept as the record
+/// of what an operator changed: the edge, the reserve box whose R5 it was checked against, the
+/// value before and after, and the marked journal entries it cleared. Stored as JSON under the
+/// nanosecond it was written, so the partition lists the repairs in order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReserveTreeRepairRecord {
+    /// Unix milliseconds of the repair.
+    pub repaired_at_ms: u64,
+    /// Issuer (reserve owner) key, lower-case hex.
+    pub issuer_pubkey: String,
+    /// Recipient key, lower-case hex.
+    pub recipient_pubkey: String,
+    /// The note's denomination (`DenomKey::denomination_id`).
+    pub denomination: String,
+    /// The reserve box on chain whose R5 digest the repaired reserve tree equals.
+    pub reserve_box_id: String,
+    /// The journaled redemption the value was taken from, when the request named one.
+    #[serde(default)]
+    pub tx_id: Option<String>,
+    /// What the repair did.
+    pub repair: crate::ReserveTreeRepair,
+    /// Journal entries of the reserve that were marked (`digest_mismatch`) and were removed
+    /// because the reserve tree now equals the chain's.
+    #[serde(default)]
+    pub cleared_marked: Vec<String>,
+}
 
 /// A redemption `/redemption/submit` broadcast (or is about to) that the chain has not
 /// confirmed yet (round 5, C8). It is written before the broadcast and removed once the
@@ -1602,13 +1637,54 @@ impl TrackerStorage {
                     e
                 ))
             })?;
+        let tree_repairs = keyspace
+            .open_partition(RESERVE_TREE_REPAIRS_PARTITION, PartitionCreateOptions::default())
+            .map_err(|e| {
+                NoteError::StorageError(format!(
+                    "Failed to open the reserve tree repairs partition: {}",
+                    e
+                ))
+            })?;
 
         Ok(Self {
             keyspace,
             partition,
             redemption_journal,
+            tree_repairs,
             journal_writes: Default::default(),
         })
+    }
+
+    /// Record a reserve tree repair (round 6, risk 1) and sync it to disk: the record of an
+    /// operator's change must survive a power loss like the change itself.
+    pub fn record_tree_repair(&self, record: &ReserveTreeRepairRecord) -> Result<(), NoteError> {
+        let value = serde_json::to_vec(record).map_err(|e| {
+            NoteError::StorageError(format!("Failed to serialize a tree repair: {}", e))
+        })?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| NoteError::StorageError(format!("Failed to get system time: {}", e)))?
+            .as_nanos();
+        self.tree_repairs
+            .insert(nanos.to_be_bytes(), value)
+            .map_err(|e| NoteError::StorageError(format!("Failed to record a tree repair: {}", e)))?;
+        self.persist_journal()
+    }
+
+    /// Every recorded reserve tree repair, oldest first. A record that cannot be read is skipped
+    /// with a warning.
+    pub fn tree_repairs(&self) -> Result<Vec<ReserveTreeRepairRecord>, NoteError> {
+        let mut records = Vec::new();
+        for item in self.tree_repairs.iter() {
+            let (_, value) = item.map_err(|e| {
+                NoteError::StorageError(format!("Failed to read the tree repairs: {}", e))
+            })?;
+            match serde_json::from_slice::<ReserveTreeRepairRecord>(&value) {
+                Ok(record) => records.push(record),
+                Err(e) => tracing::warn!("Skipping an unreadable tree repair record: {}", e),
+            }
+        }
+        Ok(records)
     }
 
     /// Write (or replace) the journal entry of `entry.tx_id`, which must be a transaction id
@@ -2140,6 +2216,57 @@ mod redemption_journal_tests {
         assert_eq!(read[1].reserve_r5_digest, None);
         assert_eq!(read[1].digest_mismatch, None);
         assert_eq!(read[1].next_check_at_ms, 0);
+    }
+
+    /// Round 6 (risk 1): a tracker_boxes dir written before round 6 opens with no tree repairs;
+    /// repairs are recorded in order and survive a reopen; a record without the optional
+    /// fields reads with their defaults.
+    #[test]
+    fn tree_repairs_are_recorded_in_order_and_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let keyspace = Config::new(dir.path()).open().unwrap();
+            let partition = keyspace
+                .open_partition("tracker_metadata", PartitionCreateOptions::default())
+                .unwrap();
+            partition.insert(b"some-box", b"{}").unwrap();
+            keyspace.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+        let storage = TrackerStorage::open(dir.path()).unwrap();
+        assert!(storage.tree_repairs().unwrap().is_empty());
+        let record = |at: u64, tx_id: Option<String>| ReserveTreeRepairRecord {
+            repaired_at_ms: at,
+            issuer_pubkey: "02".repeat(33),
+            recipient_pubkey: "03".repeat(33),
+            denomination: "erg".to_string(),
+            reserve_box_id: "ab".repeat(32),
+            tx_id,
+            repair: crate::ReserveTreeRepair {
+                outcome: crate::ReserveTreeRepairOutcome::Repaired,
+                before: None,
+                after: crate::ReserveTreeValue {
+                    timestamp: 5,
+                    already_redeemed: 7,
+                },
+                note_redeemed_before: 0,
+                digest_before: "x".to_string(),
+                digest_after: "y".to_string(),
+                chain_digest: "y".to_string(),
+            },
+            cleared_marked: vec![],
+        };
+        let (first, second) = (record(1, Some("cd".repeat(32))), record(2, None));
+        storage.record_tree_repair(&first).unwrap();
+        storage.record_tree_repair(&second).unwrap();
+        drop(storage);
+        let storage = TrackerStorage::open(dir.path()).unwrap();
+        assert_eq!(storage.tree_repairs().unwrap(), vec![first, second.clone()]);
+
+        let mut bare = serde_json::to_value(&second).unwrap();
+        bare.as_object_mut().unwrap().remove("tx_id");
+        bare.as_object_mut().unwrap().remove("cleared_marked");
+        let read: ReserveTreeRepairRecord = serde_json::from_value(bare).unwrap();
+        assert_eq!(read, second);
     }
 
     /// Round 5b, F8 and F9: a write-back of an entry read earlier lands only while the entry
