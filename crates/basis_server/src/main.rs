@@ -1016,6 +1016,15 @@ async fn main() {
         .route("/reserves/{box_id}", get(get_reserve_by_box_id))
         .route("/reserves/issuer/{pubkey}", get(get_reserves_by_issuer))
         .route("/reserves/quarantined", get(get_quarantined_reserves))
+        // Round 6c, Admin: release a quarantined reserve box after an operator check.
+        .route(
+            "/reserves/quarantined/release",
+            post(release_quarantined_reserve),
+        )
+        .route(
+            "/reserves/quarantined/releases",
+            get(list_quarantine_releases),
+        )
         .route("/key-status/{pubkey}", get(get_key_status))
         .route("/tracker/latest-box-id", get(get_latest_tracker_box_id))
         .route(
@@ -1072,6 +1081,8 @@ async fn main() {
     tracing::debug!("  GET /reserves/{{box_id}}");
     tracing::debug!("  GET /reserves/issuer/{{pubkey}}");
     tracing::debug!("  GET /reserves/quarantined");
+    tracing::debug!("  POST /reserves/quarantined/release (Admin)");
+    tracing::debug!("  GET /reserves/quarantined/releases (Admin)");
     tracing::debug!("  POST /reserves/create");
     tracing::debug!("  GET /events");
     tracing::debug!("  GET /events/paginated");

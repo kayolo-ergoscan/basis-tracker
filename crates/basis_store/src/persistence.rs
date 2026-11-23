@@ -112,13 +112,31 @@ pub struct QuarantinedReserve {
     pub quarantined_at: u64,
 }
 
+/// An operator's release of a quarantined reserve box (round 6c): the
+/// quarantine record leaves `quarantined_reserves`, so the scanner judges the
+/// box again by the admission rules of the day at its next cycle (it is not
+/// tracked by the release itself), and this journal keeps the record and the
+/// operator's note.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QuarantineRelease {
+    /// The quarantine record as it was.
+    pub record: QuarantinedReserve,
+    /// What the operator checked.
+    pub note: String,
+    /// Unix timestamp (millis) of the release.
+    pub released_at: u64,
+}
+
 /// Database storage for reserve information
 #[derive(Clone)]
 pub struct ReserveStorage {
-    /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]).
-    _keyspace: fjall::Keyspace,
+    /// Keeps the keyspace and its background threads alive (see [`JOURNAL_FSYNC_MS`]);
+    /// also commits the quarantine release batch.
+    keyspace: fjall::Keyspace,
     partition: fjall::Partition,
     quarantine_partition: fjall::Partition,
+    /// Round 6c: journal of quarantine releases, keyed `released_at (20 digits) : box id`.
+    release_partition: fjall::Partition,
 }
 
 /// Database storage for tracker information
@@ -324,7 +342,10 @@ impl ScannerMetadataStorage {
     pub fn store_scan_id(&self, scan_name: &str, scan_id: i32) -> Result<(), NoteError> {
         let value_bytes = scan_id.to_be_bytes().to_vec();
         self.partition
-            .insert(storable_key("scan name", scan_name.as_bytes())?, &value_bytes)
+            .insert(
+                storable_key("scan name", scan_name.as_bytes())?,
+                &value_bytes,
+            )
             .map_err(|e| NoteError::StorageError(format!("Failed to store scan ID: {}", e)))?;
         Ok(())
     }
@@ -1511,10 +1532,20 @@ impl ReserveStorage {
                 NoteError::StorageError(format!("Failed to open quarantine partition: {}", e))
             })?;
 
+        let release_partition = keyspace
+            .open_partition("quarantine_releases", PartitionCreateOptions::default())
+            .map_err(|e| {
+                NoteError::StorageError(format!(
+                    "Failed to open quarantine release partition: {}",
+                    e
+                ))
+            })?;
+
         Ok(Self {
-            _keyspace: keyspace,
+            keyspace,
             partition,
             quarantine_partition,
+            release_partition,
         })
     }
 
@@ -1642,6 +1673,58 @@ impl ReserveStorage {
         }
 
         Ok(records)
+    }
+
+    /// Release the quarantined box `box_id` (round 6c): in one batch, journal
+    /// the record with the operator's `note` and remove it from quarantine.
+    /// `None` when the box is not quarantined.
+    pub fn release_quarantined(
+        &self,
+        box_id: &str,
+        note: &str,
+        released_at: u64,
+    ) -> Result<Option<QuarantineRelease>, NoteError> {
+        let Some(record) = self.get_quarantined(box_id)? else {
+            return Ok(None);
+        };
+        let release = QuarantineRelease {
+            record,
+            note: note.to_string(),
+            released_at,
+        };
+        let value = serde_json::to_vec(&release).map_err(|e| {
+            NoteError::StorageError(format!("Failed to serialize quarantine release: {}", e))
+        })?;
+        let key = format!("{:020}:{}", released_at, box_id);
+        let mut batch = self.keyspace.batch();
+        batch.insert(
+            &self.release_partition,
+            storable_key("quarantine release key", key.as_bytes())?,
+            value,
+        );
+        batch.remove(&self.quarantine_partition, box_id.as_bytes());
+        batch.commit().map_err(|e| {
+            NoteError::StorageError(format!("Failed to release quarantined reserve: {}", e))
+        })?;
+        Ok(Some(release))
+    }
+
+    /// The quarantine releases, oldest first.
+    pub fn quarantine_releases(&self) -> Result<Vec<QuarantineRelease>, NoteError> {
+        self.release_partition
+            .iter()
+            .map(|item| {
+                let (_key, value) = item.map_err(|e| {
+                    NoteError::StorageError(format!("Failed to iterate quarantine releases: {}", e))
+                })?;
+                serde_json::from_slice(&value).map_err(|e| {
+                    NoteError::StorageError(format!(
+                        "Failed to deserialize quarantine release: {}",
+                        e
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
@@ -2535,5 +2618,67 @@ mod policy_quarantine_tests {
         let storage = AcceptancePolicyStorage::open(dir.path()).unwrap();
         assert_eq!(storage.list_quarantined_policies().unwrap().len(), 2);
         assert_eq!(storage.list_policies().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod quarantine_release_tests {
+    use super::*;
+
+    fn record(box_id: &str) -> QuarantinedReserve {
+        QuarantinedReserve {
+            box_id: box_id.to_string(),
+            owner_pubkey: "02".repeat(33),
+            denomination: "ERG".to_string(),
+            reason: "duplicate reserve box".to_string(),
+            quarantined_at: 1_700_000_000_000,
+        }
+    }
+
+    /// Round 6c (c): a release journals the record with the operator's note and
+    /// takes it out of quarantine in one batch; the journal survives a reopen,
+    /// oldest first; a box not quarantined (or released already) gives `None`.
+    /// A reserve dir without the release partition (round 6b) opens unchanged.
+    #[test]
+    fn a_release_journals_the_record_and_lifts_the_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let storage = ReserveStorage::open(dir.path()).unwrap();
+            storage
+                .store_quarantined(&record(&"aa".repeat(32)))
+                .unwrap();
+            storage
+                .store_quarantined(&record(&"bb".repeat(32)))
+                .unwrap();
+            let release = storage
+                .release_quarantined(&"bb".repeat(32), "checked on chain: owner's top-up", 2_000)
+                .unwrap()
+                .unwrap();
+            assert_eq!(release.record.reason, "duplicate reserve box");
+            assert!(storage.get_quarantined(&"bb".repeat(32)).unwrap().is_none());
+            assert!(storage.get_quarantined(&"aa".repeat(32)).unwrap().is_some());
+            assert!(storage
+                .release_quarantined(&"bb".repeat(32), "again", 3_000)
+                .unwrap()
+                .is_none());
+            storage
+                .release_quarantined(&"aa".repeat(32), "second", 1_000)
+                .unwrap()
+                .unwrap();
+        }
+        let storage = ReserveStorage::open(dir.path()).unwrap();
+        let releases = storage.quarantine_releases().unwrap();
+        let order: Vec<(&str, u64)> = releases
+            .iter()
+            .map(|r| (r.note.as_str(), r.released_at))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("second", 1_000),
+                ("checked on chain: owner's top-up", 2_000)
+            ]
+        );
+        assert!(storage.get_all_quarantined().unwrap().is_empty());
     }
 }

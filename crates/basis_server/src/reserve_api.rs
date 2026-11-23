@@ -393,6 +393,118 @@ pub async fn get_quarantined_reserves(
     }
 }
 
+/// Body of `POST /reserves/quarantined/release` (round 6c, Admin).
+#[derive(Debug, serde::Deserialize)]
+pub struct ReleaseQuarantinedRequest {
+    /// The quarantined reserve box (hex).
+    pub box_id: String,
+    /// What the operator checked before releasing it (kept in the journal).
+    pub note: String,
+}
+
+/// Longest operator note a release keeps.
+const MAX_RELEASE_NOTE_LEN: usize = 2_000;
+
+/// Round 6c, Admin: release a quarantined reserve box after an operator check.
+///
+/// The quarantine record moves to the release journal with the operator's note (one batch),
+/// so at its next cycle the scanner judges the box again by the admission rules of the day:
+/// the release does not track it, and a box that still fails them is quarantined again. For
+/// a box quarantined by an older rule (a reserve topped up more than 8 times between two
+/// scans, say), or a new reserve that appeared while the owner's withdrawn one was still
+/// tracked. Not for the front: the route is Admin.
+pub async fn release_quarantined_reserve(
+    State(state): State<AppState>,
+    Json(request): Json<ReleaseQuarantinedRequest>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<basis_store::persistence::QuarantineRelease>>,
+) {
+    let bad = |message: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(crate::models::error_response(message)),
+        )
+    };
+    let box_id = match hex::decode(request.box_id.trim()) {
+        Ok(bytes) if bytes.len() == 32 => hex::encode(bytes),
+        _ => return bad("box_id must be a 32-byte box id in hex".to_string()),
+    };
+    let note = request.note.trim();
+    if note.is_empty() {
+        return bad("note must say what the operator checked".to_string());
+    }
+    if note.len() > MAX_RELEASE_NOTE_LEN {
+        return bad(format!("note is longer than {MAX_RELEASE_NOTE_LEN} bytes"));
+    }
+    let released_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let scanner = state.ergo_scanner.lock().await;
+    match scanner
+        .reserve_storage()
+        .release_quarantined(&box_id, note, released_at)
+    {
+        Ok(Some(mut release)) => {
+            tracing::warn!(
+                "Operator released quarantined reserve box {} of {} in {} (quarantined for: {}). Note: {}. The scanner judges it again at its next cycle.",
+                release.record.box_id,
+                release.record.owner_pubkey,
+                release.record.denomination,
+                release.record.reason,
+                release.note
+            );
+            release.record.owner_pubkey =
+                decode_potentially_double_hex_encoded(&release.record.owner_pubkey);
+            (StatusCode::OK, Json(success_response(release)))
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(crate::models::error_response(format!(
+                "reserve box {box_id} is not quarantined"
+            ))),
+        ),
+        Err(e) => {
+            tracing::error!("Failed to release quarantined reserve {}: {:?}", box_id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::models::error_response(
+                    "Failed to release the quarantined reserve".to_string(),
+                )),
+            )
+        }
+    }
+}
+
+/// Round 6c, Admin: the journal of quarantine releases, oldest first.
+pub async fn list_quarantine_releases(
+    State(state): State<AppState>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<Vec<basis_store::persistence::QuarantineRelease>>>,
+) {
+    let scanner = state.ergo_scanner.lock().await;
+    match scanner.reserve_storage().quarantine_releases() {
+        Ok(mut releases) => {
+            for release in &mut releases {
+                release.record.owner_pubkey =
+                    decode_potentially_double_hex_encoded(&release.record.owner_pubkey);
+            }
+            (StatusCode::OK, Json(success_response(releases)))
+        }
+        Err(e) => {
+            tracing::error!("Failed to read the quarantine releases: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::models::error_response(
+                    "Failed to read the quarantine releases".to_string(),
+                )),
+            )
+        }
+    }
+}
+
 /// Serializable version of ExtendedReserveInfo for API responses
 #[derive(Debug, Serialize)]
 pub struct SerializableReserveInfo {

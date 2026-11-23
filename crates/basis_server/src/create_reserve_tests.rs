@@ -651,4 +651,81 @@ mod create_reserve_tests {
             basis_offchain::ergo_tx::pubkey_to_address(&owner_pubkey).unwrap()
         );
     }
+
+    /// Round 6c (c): the Admin release of a quarantined reserve box. It needs a 32-byte box
+    /// id and a note; the record moves to the journal (listed with the note) and the box is
+    /// no longer quarantined, so the scanner judges it again; a box not quarantined is 404.
+    #[tokio::test]
+    async fn a_quarantined_reserve_is_released_with_a_note_and_journaled() {
+        use crate::reserve_api::{
+            list_quarantine_releases, release_quarantined_reserve, ReleaseQuarantinedRequest,
+        };
+        let state = create_test_app_state();
+        let box_id = "ab".repeat(32);
+        state
+            .ergo_scanner
+            .lock()
+            .await
+            .reserve_storage()
+            .store_quarantined(&basis_store::persistence::QuarantinedReserve {
+                box_id: box_id.clone(),
+                owner_pubkey: "02".repeat(33),
+                denomination: "ERG".to_string(),
+                reason: "duplicate reserve box".to_string(),
+                quarantined_at: 1,
+            })
+            .unwrap();
+        let release = |box_id: &str, note: &str| {
+            release_quarantined_reserve(
+                State(state.clone()),
+                Json(ReleaseQuarantinedRequest {
+                    box_id: box_id.to_string(),
+                    note: note.to_string(),
+                }),
+            )
+        };
+
+        assert_eq!(release("abcd", "checked").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(release(&box_id, "  ").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            release(&box_id, &"x".repeat(2_001)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(state
+            .ergo_scanner
+            .lock()
+            .await
+            .reserve_storage()
+            .get_quarantined(&box_id)
+            .unwrap()
+            .is_some());
+
+        let (status, Json(response)) = release(
+            &box_id.to_uppercase(),
+            "owner's top-up chain checked on the explorer",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let released = response.data.unwrap();
+        assert_eq!(released.record.box_id, box_id);
+        assert_eq!(
+            released.note,
+            "owner's top-up chain checked on the explorer"
+        );
+        assert!(state
+            .ergo_scanner
+            .lock()
+            .await
+            .reserve_storage()
+            .get_quarantined(&box_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(release(&box_id, "again").await.0, StatusCode::NOT_FOUND);
+
+        let (status, Json(response)) = list_quarantine_releases(State(state.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let journal = response.data.unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].record.reason, "duplicate reserve box");
+    }
 }

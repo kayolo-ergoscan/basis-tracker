@@ -64,6 +64,8 @@ fn required_role(path: &str, method: &str) -> ClientRole {
             "/redemption/journal/drop" | "/redemption/journal/apply" => ClientRole::Admin,
             // Admin-only (round 6, risk 1): set a reserve tree value to the chain's.
             "/redemption/tree/repair" => ClientRole::Admin,
+            // Admin-only (round 6c): release a quarantined reserve box.
+            "/reserves/quarantined/release" => ClientRole::Admin,
             // Write: state-changing redemption and note operations. `/reserves/create` only
             // builds a payload the owner submits to their own node (PR #16 B4), and an
             // `/acceptance/policy` upload is signed by the recipient it applies to, so both are
@@ -93,6 +95,8 @@ fn required_role(path: &str, method: &str) -> ClientRole {
             "/redemption/journal" => ClientRole::Admin,
             // The operator's reserve tree repairs, with keys and amounts (round 6, risk 1).
             "/redemption/tree/repairs" => ClientRole::Admin,
+            // The operator's quarantine releases, with their notes (round 6c).
+            "/reserves/quarantined/releases" => ClientRole::Admin,
             // All other GET endpoints expose tracker state and are readable.
             _ => ClientRole::Read,
         },
@@ -202,6 +206,19 @@ mod tests {
         assert_eq!(
             required_role("/redemption/tree/repairs", "GET"),
             ClientRole::Admin
+        );
+        // Round 6c: so are the quarantine releases.
+        assert_eq!(
+            required_role("/reserves/quarantined/release", "POST"),
+            ClientRole::Admin
+        );
+        assert_eq!(
+            required_role("/reserves/quarantined/releases", "GET"),
+            ClientRole::Admin
+        );
+        assert_eq!(
+            required_role("/reserves/quarantined", "GET"),
+            ClientRole::Read
         );
         assert_eq!(
             required_role("/redemption/submit", "POST"),
