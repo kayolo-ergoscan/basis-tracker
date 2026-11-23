@@ -753,8 +753,10 @@ with the tracker's reserve tree:
   the tracker's digest in R5 is in step. A reserve whose box and tracker digest were compared
   already is not asked again until either changes (no node request for unchanged reserves);
 - otherwise its lineage is walked back on the blockchain index (`/blockchain/box/byId`,
-  `/blockchain/transaction/byId`: the box's creating transaction and its input with the same
-  contract and owner R4), at most 8 boxes, to the oldest reserve box whose R5 is the tracker's
+  `/blockchain/transaction/byId`: the box's creating transaction and its input that holds the box's
+  reserve NFT at `tokens(0)` with amount 1, with the same contract, owner R4 and tracker R6; round
+  6b: a sibling box at the contract with the owner's R4 but another NFT has no predecessor), at
+  most 8 boxes, to the oldest reserve box whose R5 is the tracker's
   reserve tree. The transaction that spent it is reproduced: its context extension (from the
   indexed input's `spendingProof`, or else `/blocks/{blockId}/transactions`) must be a redemption
   (variable 0: action 0, and the reserve output it names is the next box; an empty indexed

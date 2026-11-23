@@ -36,20 +36,39 @@ token slot shape for token reserves) and then admitted only when one of the foll
 holds:
 
 1. **Refresh** — the box is the currently tracked box itself.
-2. **Root** — no reserve is tracked for its `(owner, denomination)`, the C4 setup
+2. **Root** — no reserve is tracked for its `(owner, denomination)`, the box holds a
+   reserve NFT (a 32-byte token with amount 1 at `tokens(0)`; round 6b), the C4 setup
    checks pass (`R7 == 0`, R5 is the empty AVL+ tree), **and the box's creating
    transaction (fetched via `GET /blockchain/transaction/byId/{txId}`) spends at least
    one input locked by the P2PK script of the R4 owner key** (ErgoTree
    `0008cd || owner_pubkey`, checked at any input position). Spending such an input
    requires the owner's signature, so only the owner (or someone they co-signed with)
    can open a root reserve for that key.
-3. **Successor** — the box's creating transaction spends the tracked box, possibly
-   across missed generations: the walk follows reserve-contract inputs backwards up to
-   `LINEAGE_WALK_DEPTH = 8` generations, so tracker downtime spanning several reserve
-   actions still resolves. The reserve contract enforces successor register continuity
-   (`contract/basis.es`: `selfOut.R4 == SELF.R4`, per-action R5/R7 rules), so a
-   verified successor needs no further validation — and no P2PK proof, since reserve
-   actions (redemption, permissionless top-up) legitimately have no owner P2PK input.
+3. **Successor** — the box holds the tracked box's reserve NFT: the walk goes back from
+   the box through its creating transaction to the one input that brings the NFT in,
+   possibly across missed generations (up to `LINEAGE_WALK_DEPTH = 8`, so tracker
+   downtime spanning several reserve actions still resolves), until that input is the
+   tracked box. Every box on the way holds the NFT at `tokens(0)` with amount 1, the same
+   R4 and R6 as the new box, and (before the tracked box) sits at the reserve contract.
+   The reserve contract keeps the token list, R4 and R6 of the output each reserve input
+   names (`selfPreserved` in `contract/basis.es`: `selfOut.tokens == SELF.tokens`; in
+   `basis-token.es` the NFT at `tokens(0)` and the token id at `tokens(1)`), so the NFT
+   moves with the reserve and a verified successor needs no further validation — and no
+   P2PK proof, since reserve actions (redemption, permissionless top-up) legitimately
+   have no owner P2PK input. A box without a reserve NFT has no lineage, and a
+   transaction whose inputs come without their assets gives no verdict (pending).
+
+   **Round 6b: why the NFT and not "spends the tracked box".** A top-up needs no owner
+   signature and the contract only constrains the output the reserve input names
+   (`OUTPUTS(index)`). So anyone can spend their own box A and the victim's reserve G
+   into G + 0.1 ERG and a box P at the reserve contract with R4 = victim, R6 = this
+   tracker's NFT, an empty R5, R7 = 0 and a fresh NFT (A's id). P's creating
+   transaction spends G; under the old rule P was a successor, and depending on the
+   scan order (box ids, which the attacker can grind) the tracker followed {G + 0.1, P}
+   (two reserves: the victim's notes refused) or only P (the genuine reserve quarantined
+   for good). Now only the box holding G's NFT continues G; P is quarantined. When one
+   spending transaction creates several reserve-contract outputs, only the one holding
+   the NFT is the successor.
 
 Anything else is **quarantined**: it never enters the tracker (so
 `resolve_issuer_reserve` never sees a duplicate) and a record (`box_id`, `owner`,
@@ -69,6 +88,11 @@ scanner loop) and the server's background scanner task (which delegates to
 
 `resolve_issuer_reserve` keeps its fail-closed `MultipleReservesForDenomination`
 error as defense in depth; with admission control it should be unreachable.
+
+A newcomer never displaces a tracked reserve: while the owner has one tracked in a
+denomination, every other box of that owner and denomination goes through the successor
+rule, and the tracked box leaves the tracker only when the scan no longer lists it (spent)
+and no successor check is pending.
 
 ## Why the P2PK proof closes the front-run
 
@@ -119,7 +143,8 @@ backing up.
   - `admit_reserve_box` — admission decision (C4 checks + P2PK proof for roots,
     lineage for successors, quarantine stickiness).
   - `p2pk_ergo_tree` / `has_owner_p2pk_input` — the `0008cd || pubkey` proof check.
-  - `is_lineage_successor` — bounded backwards walk over `/blockchain/transaction/byId`.
+  - `is_lineage_successor` — bounded backwards walk over `/blockchain/transaction/byId`,
+    following the reserve NFT (round 6b).
   - `decide_admission` — pure verdict function (unit-tested).
   - `ingest_scan_box` — parse + admit + track/persist + quarantine persistence.
   - `process_scan_boxes` — removal loop keeps boxes whose proof/lineage check is pending.
