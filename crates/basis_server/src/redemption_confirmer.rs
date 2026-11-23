@@ -1712,6 +1712,8 @@ mod tests {
         use basis_offchain::ergo_tx::{serialize_ergo_byte, serialize_ergo_long};
 
         pub(super) const RESERVE_TREE: &str = "10a5";
+        /// The issuer's reserve NFT, held by every box of the reserve.
+        const RESERVE_NFT: &str = "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e";
         const VALUE: u64 = 1_000_000_000;
 
         fn box_id(n: u8) -> String {
@@ -1730,7 +1732,7 @@ mod tests {
                     "transactionId": created_by,
                     "value": value,
                     "ergoTree": RESERVE_TREE,
-                    "assets": [],
+                    "assets": [{ "tokenId": RESERVE_NFT, "amount": 1 }],
                     "additionalRegisters": {
                         "R4": format!("07{}", hex::encode(self.issuer)),
                         "R5": format!("64{digest}072000"),
@@ -1957,6 +1959,44 @@ mod tests {
             let requests = fx.requests();
             assert_eq!(fx.reconcile(&reserves, &mut fresh).await, ReconcileOutcome::default());
             assert_eq!(fx.requests(), requests);
+        }
+
+        /// Round 6b: the redemption transaction also creates a sibling box P at the reserve
+        /// contract with the issuer's R4 and R6, the tree the redemption gives and a fresh NFT
+        /// (a top-up needs no signature, so anyone may add such outputs). The reserve is the
+        /// box holding its NFT: followed from there the redemption is journaled, while P has no
+        /// predecessor (no input holds its NFT) and is reported, nothing journaled. P is even
+        /// put at the output the redemption names, so only the NFT tells them apart.
+        #[tokio::test]
+        async fn a_sibling_box_without_the_reserve_nft_has_no_lineage() {
+            let fx = fixture(true).await;
+            let empty = fx.tracker_reserve_digest().await;
+            let origin = fx.reserve_box(&box_id(1), &tx_id(0), VALUE, &empty);
+            let genuine = fx.redeem_out_of_band(&tx_id(1), &"b1".repeat(32), &origin, &box_id(2), 300, BUILT_AT, &fx.built_r5, false);
+            let mut sibling = fx.reserve_box(&box_id(9), &tx_id(1), VALUE - 300, &fx.built_r5);
+            sibling["assets"] = serde_json::json!([{ "tokenId": "5a".repeat(32), "amount": 1 }]);
+            {
+                let mut node = fx.node.lock().unwrap();
+                node.unspent.insert(box_id(9));
+                node.boxes.insert(box_id(9), sibling.clone());
+                let tx = node.indexed_txs.get_mut(&tx_id(1)).unwrap();
+                tx["outputs"] = serde_json::json!([genuine, sibling]);
+            }
+            let mut cache = ReconcileCache::default();
+            let outcome = fx.reconcile(&fx.reserves(&box_id(9)), &mut cache).await;
+            assert_eq!(outcome.unexplained, vec![box_id(9)]);
+            assert!(outcome.journaled.is_empty());
+            assert!(fx.journaled().is_empty());
+
+            // The genuine reserve, its output put back where the redemption names it.
+            fx.node.lock().unwrap().indexed_txs.get_mut(&tx_id(1)).unwrap()["outputs"] =
+                serde_json::json!([sibling, genuine]);
+            let outcome = fx.reconcile(&fx.reserves(&box_id(2)), &mut cache).await;
+            assert_eq!(outcome.journaled, vec![tx_id(1)]);
+            assert_eq!(
+                fx.storage.journaled_redemption(&tx_id(1)).unwrap().unwrap().reserve_box_id,
+                box_id(1)
+            );
         }
 
         /// Review P2-1: a redemption the confirmer could not apply is not journaled (it would

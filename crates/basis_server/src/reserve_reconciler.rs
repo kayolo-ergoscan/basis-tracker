@@ -411,15 +411,23 @@ async fn reproduce(
     Ok(Step::Journaled(tx_id))
 }
 
-/// The input of `tx` that is `successor`'s reserve before it: same contract and owner (R4);
-/// the contract allows one per owner. With the full box when the index gives only its id.
+/// The input of `tx` that is `successor`'s reserve before it: the one that holds `successor`'s
+/// reserve NFT (`tokens(0)`, amount 1) at `tokens(0)` too, with the same contract, owner (R4)
+/// and tracker NFT (R6). A top-up needs no owner signature, so a transaction spending the
+/// reserve may create other boxes at the contract with the owner's R4 (round 6b); only the one
+/// holding the NFT continues the reserve, and a box without one has no predecessor. With the
+/// full box when the index gives only its id.
 async fn reserve_input(
     config: &TrackerBoxUpdateConfig,
     tx: &Value,
     successor: &Value,
 ) -> Result<Option<(usize, Value)>, String> {
-    let (Some(tree), Some(owner)) = (str_field(successor, "ergoTree"), register(successor, "R4"))
-    else {
+    let (Some(tree), Some(owner), Some(tracker), Some(nft)) = (
+        str_field(successor, "ergoTree"),
+        register(successor, "R4"),
+        register(successor, "R6"),
+        reserve_nft(successor),
+    ) else {
         return Ok(None);
     };
     let inputs = tx
@@ -428,7 +436,7 @@ async fn reserve_input(
         .cloned()
         .unwrap_or_default();
     for (index, input) in inputs.into_iter().enumerate() {
-        let input = if input.get("ergoTree").is_some() {
+        let input = if input.get("ergoTree").is_some() && input.get("assets").is_some() {
             input
         } else {
             let Some(id) = str_field(&input, "boxId") else {
@@ -439,13 +447,23 @@ async fn reserve_input(
                 None => return Err(format!("input box {id} is not in the blockchain index yet")),
             }
         };
-        if str_field(&input, "ergoTree").is_some_and(|t| t.eq_ignore_ascii_case(&tree))
+        if reserve_nft(&input).as_deref() == Some(nft.as_str())
+            && str_field(&input, "ergoTree").is_some_and(|t| t.eq_ignore_ascii_case(&tree))
             && register(&input, "R4").is_some_and(|r4| r4.eq_ignore_ascii_case(&owner))
+            && register(&input, "R6").is_some_and(|r6| r6.eq_ignore_ascii_case(&tracker))
         {
             return Ok(Some((index, input)));
         }
     }
     Ok(None)
+}
+
+/// The reserve NFT of a box (hex, lower case): its first token when held once.
+fn reserve_nft(reserve_box: &Value) -> Option<String> {
+    let first = reserve_box.get("assets")?.as_array()?.first()?;
+    let id = str_field(first, "tokenId")?;
+    (first.get("amount").and_then(Value::as_u64) == Some(1) && id.len() == 64)
+        .then(|| id.to_ascii_lowercase())
 }
 
 /// The context extension of input `input_index` of `tx`: from the indexed input's
@@ -707,5 +725,91 @@ mod tests {
             Some(key)
         );
         assert_eq!(parse_group_element_constant(&hex::encode(key)), None);
+    }
+
+    /// A box at the reserve contract with the owner's R4 and the tracker's R6.
+    fn reserve(id: &str, value: u64, assets: Value) -> Value {
+        serde_json::json!({
+            "boxId": id,
+            "value": value,
+            "ergoTree": "10a5",
+            "assets": assets,
+            "additionalRegisters": {
+                "R4": format!("07{}", "02".repeat(33)),
+                "R6": format!("0e20{}", "42".repeat(32))
+            }
+        })
+    }
+
+    /// Round 6b: a top-up needs no owner signature, so the attacker's transaction spends its
+    /// own box A and the reserve G (NFT N) into G + 0.1 ERG and a box P at the contract with
+    /// the owner's R4 and R6 and a fresh NFT (A's id). Only the box holding N has G before
+    /// it, whatever the input order; a box without N, or with N but another R6, has none.
+    /// A token reserve (N, then the collateral token) is followed the same way.
+    #[tokio::test]
+    async fn the_predecessor_holds_the_reserve_nft() {
+        // Every input is a full box: no node request (nothing listens on port 1).
+        let config = TrackerBoxUpdateConfig {
+            scanner_node_url: "http://127.0.0.1:1".to_string(),
+            ..Default::default()
+        };
+        let nft = "4e".repeat(32);
+        let attacker = serde_json::json!({
+            "boxId": "aa".repeat(32),
+            "value": 5_000_000_000u64,
+            "ergoTree": format!("0008cd{}", "03".repeat(33)),
+            "assets": [],
+            "additionalRegisters": {}
+        });
+        let g = reserve(
+            &"11".repeat(32),
+            1_000_000_000,
+            serde_json::json!([{ "tokenId": nft, "amount": 1 }]),
+        );
+        let topped_up = reserve(
+            &"22".repeat(32),
+            1_100_000_000,
+            serde_json::json!([{ "tokenId": nft, "amount": 1 }]),
+        );
+        let fresh = serde_json::json!([{ "tokenId": "aa".repeat(32), "amount": 1 }]);
+        let sibling = reserve(&"33".repeat(32), 1_000_000, fresh);
+        let no_nft = reserve(&"44".repeat(32), 1_000_000, serde_json::json!([]));
+        let mut other_tracker = topped_up.clone();
+        other_tracker["additionalRegisters"]["R6"] =
+            Value::from(format!("0e20{}", "43".repeat(32)));
+
+        for (inputs, g_index) in [
+            (vec![attacker.clone(), g.clone()], 1),
+            (vec![g.clone(), attacker.clone()], 0),
+        ] {
+            let tx = serde_json::json!({ "id": "bb".repeat(32), "inputs": inputs });
+            assert_eq!(
+                reserve_input(&config, &tx, &topped_up).await.unwrap(),
+                Some((g_index, g.clone()))
+            );
+            for not_the_reserve in [&sibling, &no_nft, &other_tracker] {
+                assert_eq!(
+                    reserve_input(&config, &tx, not_the_reserve).await.unwrap(),
+                    None
+                );
+            }
+        }
+
+        let token = "54".repeat(32);
+        let g = reserve(
+            &"11".repeat(32),
+            1_000_000,
+            serde_json::json!([{ "tokenId": nft, "amount": 1 }, { "tokenId": token, "amount": 500 }]),
+        );
+        let redeemed = reserve(
+            &"22".repeat(32),
+            1_000_000,
+            serde_json::json!([{ "tokenId": nft, "amount": 1 }, { "tokenId": token, "amount": 400 }]),
+        );
+        let tx = serde_json::json!({ "id": "bb".repeat(32), "inputs": [attacker, g.clone()] });
+        assert_eq!(
+            reserve_input(&config, &tx, &redeemed).await.unwrap(),
+            Some((1, g))
+        );
     }
 }
