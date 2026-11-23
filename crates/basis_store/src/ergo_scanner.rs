@@ -89,6 +89,80 @@ fn p2pk_ergo_tree(pubkey_hex: &str) -> String {
 /// several reserve actions (top-up of a top-up, etc.).
 const LINEAGE_WALK_DEPTH: usize = 8;
 
+/// The reserve NFT id (hex, lower case) when `(token_id, amount)` can be one: a
+/// 32-byte token held once.
+fn reserve_nft(token_id: &str, amount: u64) -> Option<String> {
+    (amount == 1 && token_id.len() == 64 && hex::decode(token_id).is_ok())
+        .then(|| token_id.to_ascii_lowercase())
+}
+
+/// One input of a transaction, as `GET /blockchain/transaction/byId` gives it.
+#[derive(Debug, Clone)]
+struct TxInput {
+    box_id: String,
+    address: String,
+    creating_tx: String,
+    ergo_tree: String,
+    /// `(token id, amount)` in box order; `None` when the index gave no `assets`.
+    assets: Option<Vec<(String, u64)>>,
+    /// Serialized registers (hex) by name.
+    registers: std::collections::HashMap<String, String>,
+}
+
+impl TxInput {
+    fn from_json(input: &serde_json::Value) -> Option<Self> {
+        let text = |field: &str| {
+            input
+                .get(field)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let assets = input
+            .get("assets")
+            .and_then(|a| a.as_array())
+            .map(|assets| {
+                assets
+                    .iter()
+                    .map(|asset| {
+                        (
+                            asset
+                                .get("tokenId")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            asset.get("amount").and_then(|a| a.as_u64()).unwrap_or(0),
+                        )
+                    })
+                    .collect()
+            });
+        // Registers come as hex strings, or as objects with `serializedValue`.
+        let registers = input
+            .get("additionalRegisters")
+            .and_then(|r| r.as_object())
+            .map(|registers| {
+                registers
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .as_str()
+                            .or_else(|| value.get("serializedValue").and_then(|v| v.as_str()))
+                            .map(|hex| (name.clone(), hex.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            box_id: input.get("boxId")?.as_str()?.to_string(),
+            address: text("address"),
+            creating_tx: text("transactionId"),
+            ergo_tree: text("ergoTree"),
+            assets,
+            registers,
+        })
+    }
+}
+
 /// Admission decision for a parsed reserve box (issue #19).
 ///
 /// Only one box per (owner, denomination) lineage is ever tracked: a
@@ -851,6 +925,19 @@ impl ServerState {
         scan_box: &ScanBox,
         reserve_info: &ExtendedReserveInfo,
     ) -> Option<String> {
+        // Round 6b: the lineage is followed by the reserve NFT, so a root without
+        // one could never be followed past its first action.
+        if scan_box
+            .assets
+            .first()
+            .and_then(|asset| reserve_nft(&asset.token_id, asset.amount))
+            .is_none()
+        {
+            return Some(format!(
+                "Reserve box {} created without a reserve NFT (a token held once at tokens(0))",
+                reserve_info.box_id
+            ));
+        }
         if reserve_info.base_info.refund_initiation_height != 0 {
             return Some(format!(
                 "Reserve box {} created with a pending refund (R7 = {})",
@@ -867,12 +954,10 @@ impl ServerState {
         }
     }
 
-    /// Fetch the inputs of a transaction as `(box_id, address, creating_tx_id,
-    /// ergo_tree)` tuples via `GET /blockchain/transaction/byId/{txId}`.
-    async fn fetch_tx_inputs(
-        &self,
-        tx_id: &str,
-    ) -> Result<Vec<(String, String, String, String)>, ScannerError> {
+    /// Fetch the inputs of a transaction via
+    /// `GET /blockchain/transaction/byId/{txId}` (the index gives each input as
+    /// a full box).
+    async fn fetch_tx_inputs(&self, tx_id: &str) -> Result<Vec<TxInput>, ScannerError> {
         let url = format!(
             "{}/blockchain/transaction/byId/{}",
             self.config.node_url, tx_id
@@ -902,60 +987,87 @@ impl ServerState {
             ScannerError::JsonError(format!("Transaction {} has no inputs array", tx_id))
         })?;
 
-        Ok(inputs
-            .iter()
-            .filter_map(|input| {
-                let box_id = input.get("boxId")?.as_str()?.to_string();
-                let address = input
-                    .get("address")
-                    .and_then(|a| a.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let creating_tx = input
-                    .get("transactionId")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let ergo_tree = input
-                    .get("ergoTree")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                Some((box_id, address, creating_tx, ergo_tree))
-            })
-            .collect())
+        Ok(inputs.iter().filter_map(TxInput::from_json).collect())
     }
 
-    /// Check whether `scan_box` descends from the tracked reserve box
-    /// `known_box_id`: walk creating transactions backwards until an input is
+    /// Check whether `scan_box` continues the tracked reserve box
+    /// `known_box_id`.
+    ///
+    /// A reserve is followed by its reserve NFT: the token both reserve
+    /// contracts keep at `tokens(0)` with amount 1 (`selfPreserved` keeps the
+    /// token list, the R4 owner and the R6 tracker NFT). Every transaction
+    /// spending the reserve has exactly one output holding it, while a top-up
+    /// needs no owner signature, so anyone may add more reserve-contract
+    /// outputs with the owner's R4 to it (round 6b). Only the box holding the
+    /// NFT continues the lineage.
+    ///
+    /// The walk goes back from `scan_box` through the creating transactions,
+    /// each time to the one input that brings the NFT in, until that input is
     /// the known box (possibly across generations missed while the tracker was
-    /// down), following only inputs at the reserve contract address. The
-    /// reserve contract enforces register continuity for successors
-    /// (`contract/basis.es`: selfOut.R4 == SELF.R4, per-action R5/R7 rules), so
-    /// a verified successor needs no further validation.
+    /// down). Every box on the way must hold the NFT at `tokens(0)` with
+    /// amount 1 and the same R4 and R6 as `scan_box`, and sit at the reserve
+    /// contract address. A box without a reserve NFT has no lineage.
     async fn is_lineage_successor(
         &self,
         scan_box: &ScanBox,
         known_box_id: &str,
         contract_address: &str,
     ) -> Result<bool, ScannerError> {
+        let Some(nft) = scan_box
+            .assets
+            .first()
+            .and_then(|asset| reserve_nft(&asset.token_id, asset.amount))
+        else {
+            return Ok(false);
+        };
+        let r4 = scan_box.additional_registers.get("R4");
+        let r6 = scan_box.additional_registers.get("R6");
+        let same_register = |ours: Option<&String>, theirs: Option<&String>| match (ours, theirs) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        };
+
         let mut tx_id = scan_box.transaction_id.clone();
         for _ in 0..LINEAGE_WALK_DEPTH {
             let inputs = self.fetch_tx_inputs(&tx_id).await?;
-            if inputs
+            if inputs.iter().any(|input| input.assets.is_none()) {
+                // Not a verdict: without the inputs' tokens the NFT cannot be
+                // followed, and a wrong "no" would quarantine the reserve.
+                return Err(ScannerError::JsonError(format!(
+                    "Transaction {} lists an input without its assets",
+                    tx_id
+                )));
+            }
+            let Some(carrier) = inputs.iter().find(|input| {
+                input
+                    .assets
+                    .iter()
+                    .flatten()
+                    .any(|(token_id, _)| token_id.eq_ignore_ascii_case(&nft))
+            }) else {
+                // The NFT is minted here (or never was): no reserve box before.
+                return Ok(false);
+            };
+            let holds_nft = carrier
+                .assets
                 .iter()
-                .any(|(box_id, _, _, _)| normalized_box_id(box_id) == known_box_id)
+                .flatten()
+                .next()
+                .and_then(|(token_id, amount)| reserve_nft(token_id, *amount))
+                .is_some_and(|id| id == nft);
+            if !holds_nft
+                || !same_register(r4, carrier.registers.get("R4"))
+                || !same_register(r6, carrier.registers.get("R6"))
             {
+                return Ok(false);
+            }
+            if normalized_box_id(&carrier.box_id) == known_box_id {
                 return Ok(true);
             }
-            // Follow the reserve-contract input (the previous generation), if any.
-            match inputs
-                .into_iter()
-                .find(|(_, address, _, _)| address == contract_address)
-            {
-                Some((_, _, parent_tx, _)) if !parent_tx.is_empty() => tx_id = parent_tx,
-                _ => return Ok(false),
+            if carrier.address != contract_address || carrier.creating_tx.is_empty() {
+                return Ok(false);
             }
+            tx_id = carrier.creating_tx.clone();
         }
         Ok(false)
     }
@@ -974,7 +1086,7 @@ impl ServerState {
         let inputs = self.fetch_tx_inputs(&scan_box.transaction_id).await?;
         Ok(inputs
             .iter()
-            .any(|(_, _, _, tree)| tree.eq_ignore_ascii_case(&expected)))
+            .any(|input| input.ergo_tree.eq_ignore_ascii_case(&expected)))
     }
 
     /// Admission control for a parsed reserve box (issue #19).
@@ -984,7 +1096,12 @@ impl ServerState {
     /// 2. a C4-clean root for an (owner, denomination) with no tracked reserve,
     ///    whose creating transaction spends a P2PK input of the R4 owner key
     ///    (authenticating the otherwise-unauthenticated R4 register), or
-    /// 3. a verified successor of the tracked box for its (owner, denomination).
+    /// 3. a verified successor of the tracked box for its (owner, denomination):
+    ///    it holds the tracked box's reserve NFT at `tokens(0)` with amount 1,
+    ///    and the same R4 and R6 (round 6b, see `is_lineage_successor`).
+    ///
+    /// A newcomer never displaces a tracked reserve: while the owner has one in
+    /// the denomination, only its successor is admitted.
     ///
     /// Anything else is quarantined, so a dust duplicate with the victim's key
     /// in R4 can never turn `resolve_issuer_reserve` ambiguous and block the
@@ -1074,8 +1191,9 @@ impl ServerState {
                     AdmissionVerdict::Admit => ReserveAdmission::Admitted,
                     AdmissionVerdict::Quarantine => ReserveAdmission::Quarantined {
                         reason: format!(
-                            "duplicate reserve box {} for owner {} in denomination {} does not spend the tracked box {}; \
-                             R4 is not authenticated on-chain, so this is likely a dust-box blocking attempt (issue #19)",
+                            "duplicate reserve box {} for owner {} in denomination {} does not spend the tracked box {} \
+                             or does not hold its reserve NFT at tokens(0); R4 is not authenticated on-chain and a top-up \
+                             needs no signature, so this is likely a blocking attempt (issue #19, round 6b)",
                             box_id,
                             reserve_info.owner_pubkey,
                             denomination
@@ -1528,6 +1646,10 @@ mod tests {
     const VALID_PREFIXED_PUBKEY: &str =
         "070279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
+    /// The reserve NFT (`tokens(0)`, amount 1) of the test reserve boxes.
+    const TEST_RESERVE_NFT: &str =
+        "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e";
+
     #[test]
     fn test_empty_reserve_tree_register_constant() {
         // The empty AVL+ tree register value is a protocol constant: reserves are
@@ -1810,10 +1932,11 @@ mod tests {
             concat!(
                 "[",
                 "{{\"boxId\":\"valid_box_1\",\"value\":1000,\"ergoTree\":\"00\",\"creationHeight\":100,",
-                "\"transactionId\":\"tx1\",\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
+                "\"transactionId\":\"tx1\",\"assets\":[{{\"tokenId\":\"{TEST_RESERVE_NFT}\",\"amount\":1}}],\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
                 "]"
             ),
-            prefixed_pubkey, empty_tree, tracker_nft_id
+            prefixed_pubkey, empty_tree, tracker_nft_id,
+            TEST_RESERVE_NFT = TEST_RESERVE_NFT
         );
 
         // The scanned box is a root: its creating tx must spend a P2PK input of
@@ -1994,13 +2117,14 @@ mod tests {
             concat!(
                 "[",
                 "{{\"boxId\":\"valid_box_1\",\"value\":1000,\"ergoTree\":\"00\",\"creationHeight\":100,",
-                "\"transactionId\":\"tx1\",\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
+                "\"transactionId\":\"tx1\",\"assets\":[{{\"tokenId\":\"{TEST_RESERVE_NFT}\",\"amount\":1}}],\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
                 ",",
                 "{{\"boxId\":\"bad_box_2\",\"value\":1000,\"ergoTree\":\"00\",\"creationHeight\":100,",
                 "\"transactionId\":\"tx2\",\"additionalRegisters\":{{}}}}",
                 "]"
             ),
-            prefixed_pubkey, empty_tree, tracker_nft_id
+            prefixed_pubkey, empty_tree, tracker_nft_id,
+            TEST_RESERVE_NFT = TEST_RESERVE_NFT
         );
 
         // The valid box is a root: its creating tx must spend a P2PK input of
@@ -2113,7 +2237,7 @@ mod tests {
                 "{{\"boxId\":\"{:064x}\",\"value\":1000,\"ergoTree\":\"00\",\"creationHeight\":100,",
                 i
             ) + &format!(
-                "\"transactionId\":\"{:064x}\",\"additionalRegisters\":{{\"R4\":\"07{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
+                "\"transactionId\":\"{:064x}\",\"assets\":[{{\"tokenId\":\"{TEST_RESERVE_NFT}\",\"amount\":1}}],\"additionalRegisters\":{{\"R4\":\"07{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
                 i, owners[i], empty_tree, tracker_nft_id
             )
         };
@@ -2380,7 +2504,10 @@ mod tests {
             ergo_tree: "test_ergo_tree".to_string(),
             transaction_id: "test_tx_id".to_string(),
             additional_registers: registers,
-            assets: vec![],
+            assets: vec![BoxAsset {
+                token_id: TEST_RESERVE_NFT.to_string(),
+                amount: 1,
+            }],
         }
     }
 
@@ -2716,22 +2843,63 @@ mod tests {
         state.reserve_storage.store_reserve(&info).unwrap();
     }
 
+    /// A transaction whose inputs are boxes without tokens.
     fn tx_json(tx_id: &str, inputs: &[(&str, &str, &str, &str)]) -> String {
-        let inputs_json = inputs
-            .iter()
-            .map(|(box_id, address, creating_tx, ergo_tree)| {
-                format!(
-                    "{{\"boxId\":\"{}\",\"address\":\"{}\",\"transactionId\":\"{}\",\"ergoTree\":\"{}\"}}",
-                    box_id, address, creating_tx, ergo_tree
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(
-            "{{\"id\":\"{}\",\"inputs\":[{}],\"outputs\":[]}}",
-            tx_id, inputs_json
+        tx_json_inputs(
+            tx_id,
+            inputs
+                .iter()
+                .map(|(box_id, address, creating_tx, ergo_tree)| {
+                    plain_input(box_id, address, creating_tx, ergo_tree)
+                })
+                .collect(),
         )
     }
+
+    fn tx_json_inputs(tx_id: &str, inputs: Vec<serde_json::Value>) -> String {
+        serde_json::json!({ "id": tx_id, "inputs": inputs, "outputs": [] }).to_string()
+    }
+
+    /// An input box without tokens (a wallet box, say).
+    fn plain_input(
+        box_id: &str,
+        address: &str,
+        creating_tx: &str,
+        ergo_tree: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "boxId": box_id,
+            "address": address,
+            "transactionId": creating_tx,
+            "ergoTree": ergo_tree,
+            "assets": [],
+            "additionalRegisters": {}
+        })
+    }
+
+    /// A reserve box of the `VALID_PREFIXED_PUBKEY` owner at `test_p2s` as an
+    /// input, holding `assets` (the reserve NFT first).
+    fn reserve_input(box_id: &str, creating_tx: &str, assets: &[(&str, u64)]) -> serde_json::Value {
+        serde_json::json!({
+            "boxId": box_id,
+            "address": "test_p2s",
+            "transactionId": creating_tx,
+            "ergoTree": "00",
+            "assets": assets
+                .iter()
+                .map(|(token_id, amount)| serde_json::json!({ "tokenId": token_id, "amount": amount }))
+                .collect::<Vec<_>>(),
+            "additionalRegisters": {
+                "R4": VALID_PREFIXED_PUBKEY,
+                "R5": empty_reserve_tree_register(),
+                "R6": format!("0e20{}", TEST_TRACKER_NFT)
+            }
+        })
+    }
+
+    /// The tracker NFT the test reserve boxes name in R6.
+    const TEST_TRACKER_NFT: &str =
+        "1af23d4e5f6a7b8c9daebfc0d1e2f30415263748596a7b8c9daebfc0d1e2f304";
 
     #[tokio::test]
     async fn test_admission_quarantines_duplicate_dust_box() {
@@ -2816,9 +2984,17 @@ mod tests {
 
         let txs = HashMap::from([(
             successor_tx.clone(),
-            tx_json(
+            tx_json_inputs(
                 &successor_tx,
-                &[(&tracked_box, "test_p2s", &"cc".repeat(32), "00")],
+                vec![
+                    plain_input(
+                        &"cd".repeat(32),
+                        "some_address",
+                        &"ce".repeat(32),
+                        "0008cd02",
+                    ),
+                    reserve_input(&tracked_box, &"cc".repeat(32), &[(TEST_RESERVE_NFT, 1)]),
+                ],
             ),
         )]);
         let state = mock_state(spawn_mock_node("[]".to_string(), std::sync::Arc::new(txs)).await);
@@ -2860,13 +3036,20 @@ mod tests {
         let txs = HashMap::from([
             (
                 tip_tx.clone(),
-                tx_json(&tip_tx, &[(&mid_box, "test_p2s", &mid_tx, "00")]),
+                tx_json_inputs(
+                    &tip_tx,
+                    vec![reserve_input(&mid_box, &mid_tx, &[(TEST_RESERVE_NFT, 1)])],
+                ),
             ),
             (
                 mid_tx.clone(),
-                tx_json(
+                tx_json_inputs(
                     &mid_tx,
-                    &[(&tracked_box, "test_p2s", &"ff".repeat(32), "00")],
+                    vec![reserve_input(
+                        &tracked_box,
+                        &"ff".repeat(32),
+                        &[(TEST_RESERVE_NFT, 1)],
+                    )],
                 ),
             ),
         ]);
@@ -2908,14 +3091,15 @@ mod tests {
             concat!(
                 "[",
                 "{{\"boxId\":\"{}\",\"value\":1000,\"ergoTree\":\"00\",\"creationHeight\":100,",
-                "\"transactionId\":\"{}\",\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
+                "\"transactionId\":\"{}\",\"assets\":[{{\"tokenId\":\"{TEST_RESERVE_NFT}\",\"amount\":1}}],\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
                 ",",
                 "{{\"boxId\":\"{}\",\"value\":1000,\"ergoTree\":\"00\",\"creationHeight\":100,",
-                "\"transactionId\":\"{}\",\"additionalRegisters\":{{\"R4\":\"07{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
+                "\"transactionId\":\"{}\",\"assets\":[{{\"tokenId\":\"{TEST_RESERVE_NFT}\",\"amount\":1}}],\"additionalRegisters\":{{\"R4\":\"07{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
                 "]"
             ),
             successor_box, successor_tx, VALID_PREFIXED_PUBKEY, empty_tree, nft_id,
-            other_box, other_tx, other_owner, empty_tree, nft_id
+            other_box, other_tx, other_owner, empty_tree, nft_id,
+            TEST_RESERVE_NFT = TEST_RESERVE_NFT
         );
 
         // The successor's creating tx is unknown (404 -> lineage Retry), while
@@ -2976,14 +3160,15 @@ mod tests {
             concat!(
                 "[",
                 "{{\"boxId\":\"{}\",\"value\":1000000000,\"ergoTree\":\"00\",\"creationHeight\":100,",
-                "\"transactionId\":\"{}\",\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
+                "\"transactionId\":\"{}\",\"assets\":[{{\"tokenId\":\"{TEST_RESERVE_NFT}\",\"amount\":1}}],\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
                 ",",
                 "{{\"boxId\":\"{}\",\"value\":1000000,\"ergoTree\":\"00\",\"creationHeight\":200,",
-                "\"transactionId\":\"{}\",\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
+                "\"transactionId\":\"{}\",\"assets\":[{{\"tokenId\":\"{TEST_RESERVE_NFT}\",\"amount\":1}}],\"additionalRegisters\":{{\"R4\":\"{}\",\"R5\":\"{}\",\"R6\":\"0e20{}\"}}}}",
                 "]"
             ),
             tracked_box, "00".repeat(32), VALID_PREFIXED_PUBKEY, empty_tree, nft_id,
-            attacker_box, attacker_tx, VALID_PREFIXED_PUBKEY, empty_tree, nft_id
+            attacker_box, attacker_tx, VALID_PREFIXED_PUBKEY, empty_tree, nft_id,
+            TEST_RESERVE_NFT = TEST_RESERVE_NFT
         );
         let txs = HashMap::from([(
             attacker_tx.clone(),
@@ -3015,6 +3200,350 @@ mod tests {
             .resolve_issuer_reserve(owner, &crate::DenomKey::Erg)
             .expect("issuer must keep working");
         assert_eq!(resolved.box_id, tracked_box);
+    }
+
+    #[tokio::test]
+    async fn test_admission_quarantines_root_without_reserve_nft() {
+        // Round 6b: the lineage is followed by the reserve NFT, so a root
+        // without one (or with a token held more than once at tokens(0)) is
+        // never tracked.
+        let state = c4_test_state(NodeConfig::default());
+        for assets in [
+            vec![],
+            vec![BoxAsset {
+                token_id: TEST_RESERVE_NFT.to_string(),
+                amount: 2,
+            }],
+        ] {
+            let mut scan_box = c4_test_box();
+            scan_box.assets = assets;
+            let info = state
+                .parse_reserve_box(&scan_box, ReserveContractKind::Erg, "test_p2s")
+                .expect("structurally valid box parses");
+            match state.admit_reserve_box(&scan_box, &info, "test_p2s").await {
+                ReserveAdmission::Quarantined { reason } => {
+                    assert!(
+                        reason.contains("reserve NFT"),
+                        "unexpected reason: {}",
+                        reason
+                    );
+                }
+                other => panic!("expected Quarantined, got {:?}", other),
+            }
+        }
+    }
+
+    /// A scanned reserve-contract box as the node lists it.
+    fn scanned_box_json(
+        box_id: &str,
+        tx_id: &str,
+        value: u64,
+        assets: &[(&str, u64)],
+        r7: Option<&str>,
+    ) -> serde_json::Value {
+        let mut registers = serde_json::json!({
+            "R4": VALID_PREFIXED_PUBKEY,
+            "R5": empty_reserve_tree_register(),
+            "R6": format!("0e20{}", TEST_TRACKER_NFT)
+        });
+        if let Some(r7) = r7 {
+            registers["R7"] = serde_json::Value::from(r7);
+        }
+        serde_json::json!({
+            "boxId": box_id,
+            "value": value,
+            "ergoTree": "00",
+            "creationHeight": 200,
+            "transactionId": tx_id,
+            "assets": assets
+                .iter()
+                .map(|(token_id, amount)| serde_json::json!({ "tokenId": token_id, "amount": amount }))
+                .collect::<Vec<_>>(),
+            "additionalRegisters": registers
+        })
+    }
+
+    /// Round 6b attack: a top-up needs no owner signature and the contract only
+    /// checks the output it names, so the attacker's transaction spends its own
+    /// box A and the victim's tracked reserve G (NFT N) into G + 0.1 ERG and a
+    /// box P at the reserve contract with R4 = victim, R6 = our tracker NFT,
+    /// an empty R5, R7 = 0 and a fresh NFT (A's id). Both are scanned in one
+    /// cycle. Whatever the input order, scan order and box-id order, the
+    /// tracker follows only the box holding N; P is quarantined and the victim
+    /// keeps exactly one reserve.
+    #[tokio::test]
+    async fn test_sibling_without_the_reserve_nft_never_continues_the_reserve() {
+        let tracked_box = "11".repeat(32);
+        let attacker_box = "a1".repeat(32);
+        let attack_tx = "bb".repeat(32);
+        let topped_up = "55".repeat(32);
+        for sibling in ["22".repeat(32), "88".repeat(32)] {
+            for attacker_input_first in [true, false] {
+                for sibling_scanned_first in [true, false] {
+                    let attacker = plain_input(
+                        &attacker_box,
+                        "attacker_address",
+                        &"a2".repeat(32),
+                        &p2pk_ergo_tree(&"03".repeat(33)),
+                    );
+                    let reserve =
+                        reserve_input(&tracked_box, &"c0".repeat(32), &[(TEST_RESERVE_NFT, 1)]);
+                    let inputs = if attacker_input_first {
+                        vec![attacker, reserve]
+                    } else {
+                        vec![reserve, attacker]
+                    };
+                    let txs =
+                        HashMap::from([(attack_tx.clone(), tx_json_inputs(&attack_tx, inputs))]);
+                    let genuine = scanned_box_json(
+                        &topped_up,
+                        &attack_tx,
+                        1_100_000_000,
+                        &[(TEST_RESERVE_NFT, 1)],
+                        None,
+                    );
+                    let fake = scanned_box_json(
+                        &sibling,
+                        &attack_tx,
+                        1_000_000,
+                        &[(attacker_box.as_str(), 1)],
+                        Some("0500"),
+                    );
+                    let scanned = if sibling_scanned_first {
+                        serde_json::json!([fake, genuine])
+                    } else {
+                        serde_json::json!([genuine, fake])
+                    };
+                    let state = mock_state(
+                        spawn_mock_node(scanned.to_string(), std::sync::Arc::new(txs)).await,
+                    );
+                    let owner = &VALID_PREFIXED_PUBKEY[2..];
+                    insert_tracked_reserve(&state, &tracked_box, owner);
+
+                    state.process_scan_boxes().await.unwrap();
+
+                    let case = format!(
+                        "sibling {}, attacker input first {}, sibling scanned first {}",
+                        &sibling[..2],
+                        attacker_input_first,
+                        sibling_scanned_first
+                    );
+                    let tracked: Vec<String> = state
+                        .reserve_tracker
+                        .get_reserves_by_owner(owner)
+                        .into_iter()
+                        .map(|r| r.box_id)
+                        .collect();
+                    assert_eq!(tracked, vec![topped_up.clone()], "{case}");
+                    assert!(
+                        state
+                            .reserve_storage
+                            .get_quarantined(&sibling)
+                            .unwrap()
+                            .is_some(),
+                        "{case}"
+                    );
+                    let resolved = state
+                        .reserve_tracker
+                        .resolve_issuer_reserve(owner, &crate::DenomKey::Erg)
+                        .unwrap_or_else(|e| panic!("{case}: {e:?}"));
+                    assert_eq!(resolved.box_id, topped_up, "{case}");
+                    assert_eq!(
+                        resolved.base_info.collateral_amount, 1_100_000_000,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Round 6b: a box holding the reserve NFT more than once, or at another
+    /// position than tokens(0), or with another R6, is no successor.
+    #[tokio::test]
+    async fn test_successor_needs_the_nft_at_tokens0_and_the_same_registers() {
+        let tracked_box = "11".repeat(32);
+        let tx = "bb".repeat(32);
+        let other_token = "6f".repeat(32);
+        let txs = HashMap::from([(
+            tx.clone(),
+            tx_json_inputs(
+                &tx,
+                vec![reserve_input(
+                    &tracked_box,
+                    &"c0".repeat(32),
+                    &[(TEST_RESERVE_NFT, 1)],
+                )],
+            ),
+        )]);
+        let state = mock_state(spawn_mock_node("[]".to_string(), std::sync::Arc::new(txs)).await);
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        insert_tracked_reserve(&state, &tracked_box, owner);
+
+        let other_r6 = {
+            let mut scan_box = c4_test_box();
+            scan_box
+                .additional_registers
+                .insert("R6".to_string(), format!("0e20{}", "1b".repeat(32)));
+            scan_box
+        };
+        let cases = [
+            ("6a", vec![(TEST_RESERVE_NFT, 2)], c4_test_box()),
+            (
+                "6b",
+                vec![(other_token.as_str(), 1), (TEST_RESERVE_NFT, 1)],
+                c4_test_box(),
+            ),
+            ("6c", vec![(TEST_RESERVE_NFT, 1)], other_r6),
+        ];
+        for (id, assets, mut scan_box) in cases {
+            let box_id = id.repeat(32);
+            scan_box.box_id = box_id.clone();
+            scan_box.transaction_id = tx.clone();
+            scan_box.assets = assets
+                .into_iter()
+                .map(|(token_id, amount)| BoxAsset {
+                    token_id: token_id.to_string(),
+                    amount,
+                })
+                .collect();
+            let tagged = TaggedScanBox {
+                scan_box,
+                kind: ReserveContractKind::Erg,
+                contract_address: "test_p2s".to_string(),
+            };
+            assert_eq!(
+                state.ingest_scan_box(&tagged).await,
+                ScanBoxIngest::Rejected(box_id),
+                "case {id}"
+            );
+        }
+        assert_eq!(
+            state
+                .reserve_tracker
+                .resolve_issuer_reserve(owner, &crate::DenomKey::Erg)
+                .unwrap()
+                .box_id,
+            tracked_box
+        );
+    }
+
+    /// Round 6b: a token reserve (reserve NFT at tokens(0), collateral token at
+    /// tokens(1)) is followed by its NFT through a redemption; a sibling with
+    /// the collateral token but a fresh NFT is not.
+    #[tokio::test]
+    async fn test_token_reserve_successor_is_followed_by_its_nft() {
+        let tracked_box = "11".repeat(32);
+        let tx = "bb".repeat(32);
+        let token = "54".repeat(32);
+        let txs = HashMap::from([(
+            tx.clone(),
+            tx_json_inputs(
+                &tx,
+                vec![
+                    plain_input(
+                        &"a1".repeat(32),
+                        "attacker_address",
+                        &"a2".repeat(32),
+                        "0008cd03",
+                    ),
+                    reserve_input(
+                        &tracked_box,
+                        &"c0".repeat(32),
+                        &[(TEST_RESERVE_NFT, 1), (token.as_str(), 500)],
+                    ),
+                ],
+            ),
+        )]);
+        let state = mock_state(spawn_mock_node("[]".to_string(), std::sync::Arc::new(txs)).await);
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let info = ExtendedReserveInfo {
+            base_info: crate::ReserveInfo {
+                collateral_amount: 500,
+                last_updated_height: 0,
+                contract_address: "test_p2s".to_string(),
+                tracker_nft_id: TEST_TRACKER_NFT.to_string(),
+                refund_initiation_height: 0,
+                reserve_token_id: token.clone(),
+            },
+            total_debt: 0,
+            box_id: tracked_box.clone(),
+            owner_pubkey: owner.to_string(),
+            last_updated_timestamp: 0,
+        };
+        state.reserve_tracker.update_reserve(info).unwrap();
+
+        let scan = |box_id: &str, assets: Vec<(&str, u64)>| {
+            let mut scan_box = c4_test_box();
+            scan_box.box_id = box_id.to_string();
+            scan_box.transaction_id = tx.clone();
+            // A redemption leaves a non-empty tree.
+            scan_box.additional_registers.insert(
+                "R5".to_string(),
+                "64aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa032000"
+                    .to_string(),
+            );
+            scan_box.assets = assets
+                .into_iter()
+                .map(|(token_id, amount)| BoxAsset {
+                    token_id: token_id.to_string(),
+                    amount,
+                })
+                .collect();
+            TaggedScanBox {
+                scan_box,
+                kind: ReserveContractKind::Token,
+                contract_address: "test_p2s".to_string(),
+            }
+        };
+        let sibling = "22".repeat(32);
+        let fresh_nft = "a1".repeat(32);
+        assert_eq!(
+            state
+                .ingest_scan_box(&scan(
+                    &sibling,
+                    vec![(fresh_nft.as_str(), 1), (token.as_str(), 1)]
+                ))
+                .await,
+            ScanBoxIngest::Rejected(sibling)
+        );
+        let redeemed = "55".repeat(32);
+        assert_eq!(
+            state
+                .ingest_scan_box(&scan(
+                    &redeemed,
+                    vec![(TEST_RESERVE_NFT, 1), (token.as_str(), 400)]
+                ))
+                .await,
+            ScanBoxIngest::Tracked(redeemed.clone())
+        );
+        let followed = state.reserve_tracker.get_reserve(&redeemed).unwrap();
+        assert_eq!(followed.base_info.collateral_amount, 400);
+    }
+
+    /// The node gave a transaction's inputs without their assets: no verdict
+    /// (a wrong "no" would quarantine the reserve for good), retried next cycle.
+    #[tokio::test]
+    async fn test_lineage_without_input_assets_is_retried() {
+        let tracked_box = "11".repeat(32);
+        let tx = "bb".repeat(32);
+        let mut input = reserve_input(&tracked_box, &"c0".repeat(32), &[(TEST_RESERVE_NFT, 1)]);
+        input.as_object_mut().unwrap().remove("assets");
+        let txs = HashMap::from([(tx.clone(), tx_json_inputs(&tx, vec![input]))]);
+        let state = mock_state(spawn_mock_node("[]".to_string(), std::sync::Arc::new(txs)).await);
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        insert_tracked_reserve(&state, &tracked_box, owner);
+        let mut scan_box = c4_test_box();
+        scan_box.box_id = "55".repeat(32);
+        scan_box.transaction_id = tx;
+        let tagged = TaggedScanBox {
+            scan_box,
+            kind: ReserveContractKind::Erg,
+            contract_address: "test_p2s".to_string(),
+        };
+        assert_eq!(
+            state.ingest_scan_box(&tagged).await,
+            ScanBoxIngest::Pending(owner.to_string(), crate::DenomKey::Erg)
+        );
     }
 
     #[tokio::test]
