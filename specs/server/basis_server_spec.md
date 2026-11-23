@@ -119,6 +119,8 @@ fjall keyspace waits up to one fsync interval to close.
   the same debt. `collateralization_ratio` is `collateral_amount / total_debt`, both in the
   reserve's unit (nanoERG or raw token units), and `null` when `total_debt` is 0.
 - `GET /reserves/quarantined` - List reserve boxes rejected by admission control (see `specs/ergo/reserve_admission.md`)
+- `POST /reserves/quarantined/release` - Admin (round 6c): take a box out of quarantine after an operator check (`box_id`, `note`); the record is journaled and the scanner judges the box again at its next cycle
+- `GET /reserves/quarantined/releases` - Admin (round 6c): the quarantine releases with their notes, oldest first
 - `GET /key-status/{pubkey}` - Get status information for a public key
 - `POST /reserves/create` - Create a reserve creation payload for Ergo node's `/wallet/payment/send` API (the tracker only tracks the reserve if the creating transaction spends a P2PK input of the R4 owner key — `basis-cli reserve create --submit` guarantees this)
 

@@ -512,6 +512,8 @@ paths:
         (issue #19): duplicates that do not descend from the tracked reserve
         for their (owner, denomination), or roots that failed setup validation.
         Quarantined boxes are never tracked, so they cannot block an issuer.
+        A quarantine lasts until an operator releases the box
+        (`POST /reserves/quarantined/release`).
       operationId: getQuarantinedReserves
       tags:
         - Reserves
@@ -524,6 +526,106 @@ paths:
                 $ref: '#/components/schemas/ApiResponseQuarantinedReserves'
         '500':
           description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+
+  /reserves/quarantined/release:
+    post:
+      summary: Release a quarantined reserve box (admin)
+      description: |
+        Round 6c. After an operator check, take a box out of quarantine: the
+        record moves to the release journal with the operator's note, in one
+        batch. The release does not track the box: at its next cycle the
+        scanner judges it again by the admission rules of the day, and a box
+        that still fails them is quarantined again. Meant for boxes an older
+        rule quarantined, or a new reserve that appeared while the owner's
+        withdrawn one was still tracked. Admin only; not for the front.
+      operationId: releaseQuarantinedReserve
+      tags:
+        - Reserves
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [box_id, note]
+              properties:
+                box_id:
+                  type: string
+                  description: The quarantined box (32 bytes, hex)
+                note:
+                  type: string
+                  description: What the operator checked (1 to 2000 bytes)
+      responses:
+        '200':
+          description: Released; the journal record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseQuarantineRelease'
+        '400':
+          description: The box id is not 32 bytes of hex, or the note is empty or too long
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '403':
+          description: The caller is not an admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '404':
+          description: The box is not quarantined
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '500':
+          description: The release cannot be stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+
+  /reserves/quarantined/releases:
+    get:
+      summary: List the quarantine releases (admin)
+      description: |
+        Every release made through `POST /reserves/quarantined/release`
+        (round 6c), oldest first, with the quarantine record and the
+        operator's note. Admin only.
+      operationId: listQuarantineReleases
+      tags:
+        - Reserves
+      responses:
+        '200':
+          description: The releases, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/QuarantineRelease'
+                  error:
+                    type: string
+                    nullable: true
+        '403':
+          description: The caller is not an admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '500':
+          description: The journal cannot be read
           content:
             application/json:
               schema:
@@ -3483,6 +3585,28 @@ components:
           format: int64
           description: Unix timestamp (milliseconds) when the box was quarantined
           example: 1762041600000
+
+    QuarantineRelease:
+      type: object
+      description: An operator's release of a quarantined reserve box (round 6c).
+      properties:
+        record:
+          $ref: '#/components/schemas/SerializableQuarantinedReserve'
+        note:
+          type: string
+          description: What the operator checked
+        released_at:
+          type: integer
+          format: int64
+          description: Unix timestamp (milliseconds) of the release
+
+    ApiResponseQuarantineRelease:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/QuarantineRelease'
 
     ApiResponseReserve:
       allOf:

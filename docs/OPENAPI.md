@@ -124,6 +124,8 @@ All endpoints return a standardized response envelope:
 - `GET /reserves/{box_id}` - Get a specific reserve by box ID
 - `GET /reserves/issuer/{pubkey}` - Get reserves for an issuer
 - `GET /reserves/quarantined` - List reserve boxes rejected by admission control (issue #19): duplicates that do not descend from the tracked reserve for their (owner, denomination), roots that failed setup validation, or roots whose creating transaction spends no P2PK input of the R4 owner key. Quarantined boxes are never tracked.
+- `POST /reserves/quarantined/release` (Admin, round 6c) - Take a box out of quarantine after an operator check: body `{box_id, note}`; the record moves to the release journal and the scanner judges the box again at its next cycle (the release does not track it).
+- `GET /reserves/quarantined/releases` (Admin, round 6c) - The quarantine releases with the operator's notes, oldest first.
 - `POST /reserves/create` - Build a reserve creation payment request
 
 `POST /reserves/create` only *builds* the payment request, and only once the tracker
