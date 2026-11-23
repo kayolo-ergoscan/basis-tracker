@@ -1050,6 +1050,8 @@ impl World {
         let public_paths = [
             "/blocks/lastHeaders/10",
             "/blockchain/box/unspent/byAddress",
+            // Round 6d: `/reserves/create` asks whether the reserve NFT is a singleton.
+            "/blockchain/token/byId",
             "/utxo/byId",
             "/transactions",
             "/wallet/transactions",

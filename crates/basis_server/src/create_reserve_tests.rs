@@ -79,7 +79,8 @@ mod create_reserve_tests {
             },
             ergo: crate::config::ErgoConfig {
                 scanner: NodeConfig {
-                    node_url: "http://example.com".to_string(),
+                    // Nothing listens: the node cannot tell (no outside call).
+                    node_url: "http://127.0.0.1:1".to_string(),
                     ..Default::default()
                 },
                 wallet: Default::default(),
@@ -727,5 +728,55 @@ mod create_reserve_tests {
         let journal = response.data.unwrap();
         assert_eq!(journal.len(), 1);
         assert_eq!(journal[0].record.reason, "duplicate reserve box");
+    }
+
+    /// Round 6d: a reserve NFT that the node knows with an emission other than 1 is refused
+    /// with a plain error; emission 1, or a token the node does not know yet, passes.
+    #[tokio::test]
+    async fn test_create_reserve_payload_refuses_an_nft_whose_emission_is_not_1() {
+        let nft = "ab".repeat(32);
+        for (status, body, accepted) in [
+            (200, r#"{"id":"x","emissionAmount":1000}"#, false),
+            (200, r#"{"id":"x","emissionAmount":1}"#, true),
+            (404, r#"{"error":404}"#, true),
+        ] {
+            let (url, seen) =
+                crate::local_wallet::tests::mock_node(move |_, _, _| (status, body.to_string()))
+                    .await;
+            let mut state = create_test_app_state();
+            let mut config = (*state.config).clone();
+            config.ergo.scanner.node_url = url;
+            state.config = std::sync::Arc::new(config);
+            let (code, response) = create_reserve_payload(
+                State(state),
+                Json(CreateReserveRequest {
+                    nft_id: nft.clone(),
+                    owner_pubkey:
+                        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                            .to_string(),
+                    erg_amount: 1_000_000_000,
+                    token_amount: 0,
+                    token_id: String::new(),
+                }),
+            )
+            .await;
+            let case = format!("{status} {body}");
+            assert_eq!(code == StatusCode::OK, accepted, "{case}: {response:?}");
+            if !accepted {
+                assert_eq!(code, StatusCode::BAD_REQUEST, "{case}");
+                let error = response.error.clone().unwrap();
+                assert!(error.contains("emission 1000"), "{error}");
+                assert!(error.contains("must have emission 1"), "{error}");
+            }
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{case}");
+            assert!(
+                seen[0]
+                    .target
+                    .ends_with(&format!("/blockchain/token/byId/{nft}")),
+                "{:?}",
+                seen[0].target
+            );
+        }
     }
 }

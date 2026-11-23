@@ -4661,6 +4661,32 @@ pub(crate) fn is_canonical_constant_hex(value_hex: &str) -> bool {
     }
 }
 
+/// The emission of token `nft_id` by the scanner node (`GET /blockchain/token/byId`), or
+/// `None` when the node cannot tell (unknown token, node error, not a 32-byte id).
+async fn nft_emission(config: &crate::config::AppConfig, nft_id: &str) -> Option<u64> {
+    if nft_id.len() != 64 || !nft_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let node = &config.ergo.scanner;
+    let mut request = basis_store::http::bounded_client().get(format!(
+        "{}/blockchain/token/byId/{}",
+        node.node_url.trim_end_matches('/'),
+        nft_id
+    ));
+    if let Some(key) = node.api_key.as_deref().filter(|k| !k.is_empty()) {
+        request = request.header("api_key", key);
+    }
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    basis_store::http::read_json_capped(response)
+        .await
+        .ok()?
+        .get("emissionAmount")
+        .and_then(|e| e.as_u64())
+}
+
 // Create a reserve creation payload shaped for the Ergo node's /wallet/payment/send API.
 //
 // The OWNER submits this payload to their own node, which signs it with the owner's wallet.
@@ -4861,6 +4887,22 @@ pub async fn create_reserve_payload(
                 config.ergo.tracker_nft_id.as_deref().unwrap_or("(not set)")
             ))),
         );
+    }
+
+    // Round 6d: the scanner admits a reserve only when its NFT is a singleton, so refuse an
+    // existing token with another emission now rather than after the owner pays for the box.
+    // A token the node does not know yet (minted by the creation transaction) passes.
+    if let Some(emission) = nft_emission(&config, &payload.nft_id).await {
+        if emission != 1 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(crate::models::error_response(format!(
+                    "nft_id {} is a token with emission {}; a reserve NFT must have emission 1 \
+                     (a single token), or the tracker cannot follow the reserve",
+                    payload.nft_id, emission
+                ))),
+            );
+        }
     }
 
     let reserve_contract_address = if token_reserve_mode {
