@@ -3638,6 +3638,12 @@ components:
           description: >-
             Unix ms before which the confirmer does not look at it again (a
             long-missing redemption that can still be mined; round 5b)
+        detected_on_chain:
+          type: boolean
+          description: >-
+            Found on chain by the reserve reconciler, not submitted through
+            this tracker (round 6): applied like the tracker's own once deep
+            enough, compared with `reserve_r5_digest`; never holds back a commit
 
     TreeRepairRequest:
       type: object

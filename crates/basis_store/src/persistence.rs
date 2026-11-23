@@ -230,6 +230,14 @@ pub struct JournaledRedemption {
     /// check.
     #[serde(default)]
     pub next_check_at_ms: u64,
+    /// Round 6 (risk 2): found on chain, not submitted through this tracker: a redemption of a
+    /// tracked reserve that was broadcast elsewhere (another node, the front's
+    /// `/node/transactions`) or that left the journal and was mined later. The reserve
+    /// reconciler journals it once the tracker's reserve tree reproduces the R5 it put on chain
+    /// (`reserve_r5_digest`); the confirmer then applies it like the tracker's own, compared with
+    /// that digest. It never holds back a commit.
+    #[serde(default)]
+    pub detected_on_chain: bool,
 }
 
 /// Database storage for per-recipient acceptance policies
@@ -2216,6 +2224,8 @@ mod redemption_journal_tests {
         assert_eq!(read[1].reserve_r5_digest, None);
         assert_eq!(read[1].digest_mismatch, None);
         assert_eq!(read[1].next_check_at_ms, 0);
+        // ...and without the round-6 field.
+        assert!(!read[1].detected_on_chain);
     }
 
     /// Round 6 (risk 1): a tracker_boxes dir written before round 6 opens with no tree repairs;

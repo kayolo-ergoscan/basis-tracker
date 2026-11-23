@@ -87,18 +87,23 @@ pub enum Applied {
     Mismatch,
 }
 
-/// Look at the journal every `interval` until `shutdown` fires.
+/// Look at the journal every `interval` until `shutdown` fires. Round 6 (risk 2): before each
+/// pass, the reserves `reserves` tracks are compared with the tracker's reserve trees, and
+/// redemptions found on chain that this tracker did not submit are journaled
+/// ([`crate::reserve_reconciler`]).
 pub async fn run(
     config: TrackerBoxUpdateConfig,
     storage: TrackerStorage,
     shared_state: SharedTrackerState,
     cmd_tx: tokio::sync::mpsc::Sender<TrackerCommand>,
+    reserves: basis_store::ReserveTracker,
     interval: Duration,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let mut ticks =
         tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut compared = crate::reserve_reconciler::ReconcileCache::default();
     loop {
         tokio::select! {
             _ = shutdown.recv() => {
@@ -106,6 +111,15 @@ pub async fn run(
                 return;
             }
             _ = ticks.tick() => {
+                crate::reserve_reconciler::reconcile_reserves(
+                    &config,
+                    &storage,
+                    &shared_state,
+                    &cmd_tx,
+                    &reserves,
+                    &mut compared,
+                )
+                .await;
                 check_journal(&config, &storage, &shared_state, &cmd_tx).await;
             }
         }
@@ -148,6 +162,13 @@ pub async fn check_journal(
                     // A failed apply stays journaled; `apply_journaled_against` recorded and
                     // logged it.
                     Ok(Some(chain_r5)) => {
+                        // Round 6 (risk 2): a redemption found on chain need not have its
+                        // reserve output first; its journaled digest is R5 of that output.
+                        let chain_r5 = if entry.detected_on_chain {
+                            None
+                        } else {
+                            chain_r5
+                        };
                         match apply_journaled_against(
                             storage,
                             shared_state,
@@ -519,6 +540,12 @@ pub fn waiting_reason(waiting: &JournaledRedemption) -> String {
              chain ({}); an operator has to look at it before the reserve is used again",
             waiting.tx_id, mismatch
         ),
+        None if waiting.detected_on_chain => format!(
+            "redemption {} was found on chain (it was not submitted through this tracker); the \
+             tracker applies it once it is deep enough, usually within a few minutes; try again \
+             then",
+            waiting.tx_id
+        ),
         None if waiting.missing_checks >= MAX_REDEMPTION_MISSING_CHECKS => format!(
             "redemption {} has not been seen in a mempool or on chain for {} checks; it is \
              released once it can no longer be mined (the tracker replaces the tracker box it \
@@ -546,9 +573,10 @@ pub fn restore_submitted_redemptions(storage: &TrackerStorage, shared_state: &Sh
         }
     };
     let now_ms = unix_ms();
+    // Round 6 (risk 2): one found on chain is mined already and holds nothing back either.
     let waiting: Vec<&JournaledRedemption> = entries
         .iter()
-        .filter(|entry| entry.digest_mismatch.is_none())
+        .filter(|entry| entry.digest_mismatch.is_none() && !entry.detected_on_chain)
         .collect();
     for entry in &waiting {
         let age = Duration::from_millis(now_ms.saturating_sub(entry.submitted_at_ms));
@@ -874,6 +902,14 @@ mod tests {
         remove_on_lookup: bool,
         /// Mempool lookups, by transaction id.
         lookups: HashMap<String, usize>,
+        /// Round 6 (risk 2): full boxes (`/utxo/byId` while unspent, `/blockchain/box/byId`),
+        /// indexed transactions (`/blockchain/transaction/byId`, before `txs`) and block
+        /// transactions (`/blocks/{id}/transactions`).
+        boxes: HashMap<String, serde_json::Value>,
+        indexed_txs: HashMap<String, serde_json::Value>,
+        blocks: HashMap<String, serde_json::Value>,
+        /// Requests by path prefix, counted.
+        requests: Vec<String>,
     }
 
     struct Fixture {
@@ -912,6 +948,22 @@ mod tests {
         let (url, _seen) = mock_node(move |method, target, _body| {
             let not_found = (404, r#"{"error":404,"reason":"not-found"}"#.to_string());
             let mut node = node_state.lock().unwrap();
+            node.requests.push(target.to_string());
+            if let Some(id) = target
+                .strip_prefix("/blocks/")
+                .and_then(|rest| rest.strip_suffix("/transactions"))
+            {
+                return match node.blocks.get(id) {
+                    Some(block) => (200, block.to_string()),
+                    None => not_found,
+                };
+            }
+            if let Some(tx) = target
+                .strip_prefix("/blockchain/transaction/byId/")
+                .and_then(|id| node.indexed_txs.get(id))
+            {
+                return (200, tx.to_string());
+            }
             if method == "GET" && target == "/info" {
                 return (
                     200,
@@ -956,17 +1008,24 @@ mod tests {
             }
             if let Some(id) = target.strip_prefix("/utxo/byId/") {
                 return if node.unspent.contains(id) {
-                    (200, serde_json::json!({ "boxId": id }).to_string())
+                    let full = node.boxes.get(id).cloned();
+                    (
+                        200,
+                        full.unwrap_or_else(|| serde_json::json!({ "boxId": id }))
+                            .to_string(),
+                    )
                 } else {
                     not_found
                 };
             }
             if let Some(id) = target.strip_prefix("/blockchain/box/byId/") {
-                return (
-                    200,
-                    serde_json::json!({ "boxId": id, "spentTransactionId": node.spent_by.get(id) })
-                        .to_string(),
-                );
+                let mut indexed = node
+                    .boxes
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({ "boxId": id }));
+                indexed["spentTransactionId"] = serde_json::json!(node.spent_by.get(id));
+                return (200, indexed.to_string());
             }
             not_found
         })
@@ -1045,6 +1104,34 @@ mod tests {
                     } => {
                         let _ = response_tx
                             .send(manager.tracker.reserve_state_digest(&issuer_pubkey, &denomination));
+                    }
+                    TrackerCommand::GetReserveLookupProof {
+                        issuer_pubkey,
+                        recipient_pubkey,
+                        denomination,
+                        response_tx,
+                    } => {
+                        let _ = response_tx.send(manager.tracker.generate_reserve_lookup_proof(
+                            &issuer_pubkey,
+                            &recipient_pubkey,
+                            &denomination,
+                        ));
+                    }
+                    TrackerCommand::GetReserveInsertProof {
+                        issuer_pubkey,
+                        recipient_pubkey,
+                        denomination,
+                        timestamp,
+                        new_already_redeemed,
+                        response_tx,
+                    } => {
+                        let _ = response_tx.send(manager.tracker.generate_reserve_insert_proof(
+                            &issuer_pubkey,
+                            &recipient_pubkey,
+                            &denomination,
+                            timestamp,
+                            new_already_redeemed,
+                        ));
                     }
                     TrackerCommand::Shutdown => break,
                     _ => {}
@@ -1590,6 +1677,261 @@ mod tests {
         assert!(old.submitted_at.elapsed() >= Duration::from_secs(5 * 60 - 1));
         let new = restored.iter().find(|r| r.tx_id == "8b".repeat(32)).unwrap();
         assert!(new.submitted_at.elapsed() < Duration::from_secs(60));
+    }
+
+    /// Round 6 (risk 2): an out-of-band reserve history on the mock node.
+    mod out_of_band {
+        use super::*;
+        use crate::reserve_reconciler::{reconcile_reserves, ReconcileCache, ReconcileOutcome};
+        use basis_offchain::ergo_tx::{serialize_ergo_byte, serialize_ergo_long};
+
+        pub(super) const RESERVE_TREE: &str = "10a5";
+        const VALUE: u64 = 1_000_000_000;
+
+        fn box_id(n: u8) -> String {
+            format!("{:02x}", n).repeat(32)
+        }
+
+        fn tx_id(n: u8) -> String {
+            format!("{:02x}", 0xa0 + n).repeat(32)
+        }
+
+        impl Fixture {
+            /// A reserve box of the issuer holding `value` and the tree `digest` (hex) in R5.
+            fn reserve_box(&self, id: &str, created_by: &str, value: u64, digest: &str) -> serde_json::Value {
+                serde_json::json!({
+                    "boxId": id,
+                    "transactionId": created_by,
+                    "value": value,
+                    "ergoTree": RESERVE_TREE,
+                    "assets": [],
+                    "additionalRegisters": {
+                        "R4": format!("07{}", hex::encode(self.issuer)),
+                        "R5": format!("64{digest}072000"),
+                        "R6": format!("0e20{}", "42".repeat(32))
+                    }
+                })
+            }
+
+            /// The tracker's reserve tree digest with the edge at `timestamp ‖ already`, as the
+            /// tracker stands now.
+            async fn digest_with(&self, timestamp: u64, already: u64) -> String {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                self.cmd_tx
+                    .send(TrackerCommand::GetReserveInsertProof {
+                        issuer_pubkey: self.issuer,
+                        recipient_pubkey: self.recipient,
+                        denomination: DenomKey::Erg,
+                        timestamp,
+                        new_already_redeemed: already,
+                        response_tx,
+                    })
+                    .await
+                    .unwrap();
+                hex::encode(response_rx.await.unwrap().unwrap().1)
+            }
+
+            /// On the node: `tx` (in a block at 990, block `block`) spends reserve box `from`
+            /// into `to` (its output 1; output 0 is another box), redeeming `amount` of the
+            /// note signed at `timestamp`; `to` holds `to_digest`. The extension is in the
+            /// indexed input unless `in_block_only`, then only in the block's transactions.
+            #[allow(clippy::too_many_arguments)]
+            fn redeem_out_of_band(
+                &self,
+                tx: &str,
+                block: &str,
+                from: &serde_json::Value,
+                to_id: &str,
+                amount: u64,
+                timestamp: u64,
+                to_digest: &str,
+                in_block_only: bool,
+            ) -> serde_json::Value {
+                let value = from["value"].as_u64().unwrap() - amount;
+                let to = self.reserve_box(to_id, tx, value, to_digest);
+                let extension = serde_json::json!({
+                    "0": serialize_ergo_byte(1),
+                    "1": format!("07{}", hex::encode(self.recipient)),
+                    "3": serialize_ergo_long(1_000),
+                    "4": serialize_ergo_long(timestamp as i64),
+                });
+                let mut input = from.clone();
+                input["spentTransactionId"] = serde_json::json!(tx);
+                if !in_block_only {
+                    input["spendingProof"] =
+                        serde_json::json!({ "proofBytes": "", "extension": extension });
+                }
+                let other_output = serde_json::json!({
+                    "boxId": "e0".repeat(32),
+                    "additionalRegisters": { "R5": format!("64{}072000", "99".repeat(33)) }
+                });
+                let indexed = serde_json::json!({
+                    "id": tx,
+                    "blockId": block,
+                    "inclusionHeight": 990,
+                    "inputs": [input],
+                    "dataInputs": [{ "boxId": tracker_box() }],
+                    "outputs": [other_output, to.clone()],
+                });
+                let mut node = self.node.lock().unwrap();
+                let from_id = from["boxId"].as_str().unwrap().to_string();
+                node.unspent.remove(&from_id);
+                node.spent_by.insert(from_id, tx.to_string());
+                node.unspent.insert(to_id.to_string());
+                node.boxes.insert(to_id.to_string(), to.clone());
+                node.indexed_txs.insert(tx.to_string(), indexed);
+                node.blocks.insert(
+                    block.to_string(),
+                    serde_json::json!({ "headerId": block, "transactions": [{
+                        "id": tx,
+                        "inputs": [{ "boxId": from["boxId"], "spendingProof": {
+                            "proofBytes": "", "extension": extension } }],
+                        "dataInputs": [],
+                        "outputs": []
+                    }] }),
+                );
+                to
+            }
+
+            /// The scanner follows the reserve: its box is `box_id` now.
+            fn reserves(&self, box_id: &str) -> basis_store::ReserveTracker {
+                let reserves = basis_store::ReserveTracker::new();
+                reserves
+                    .update_reserve(basis_store::ExtendedReserveInfo {
+                        base_info: basis_store::ReserveInfo {
+                            collateral_amount: VALUE,
+                            last_updated_height: 1,
+                            contract_address: String::new(),
+                            tracker_nft_id: "42".repeat(32),
+                            refund_initiation_height: 0,
+                            reserve_token_id: String::new(),
+                        },
+                        total_debt: 0,
+                        box_id: box_id.to_string(),
+                        owner_pubkey: hex::encode(self.issuer),
+                        last_updated_timestamp: 0,
+                    })
+                    .unwrap();
+                reserves
+            }
+
+            async fn reconcile(
+                &self,
+                reserves: &basis_store::ReserveTracker,
+                cache: &mut ReconcileCache,
+            ) -> ReconcileOutcome {
+                reconcile_reserves(&self.config, &self.storage, &self.shared, &self.cmd_tx, reserves, cache)
+                    .await
+            }
+
+            fn requests(&self) -> usize {
+                self.node.lock().unwrap().requests.len()
+            }
+        }
+
+        /// A redemption broadcast elsewhere: the reserve box the scanner follows holds another
+        /// R5 than the tracker's reserve tree, and no redemption is journaled. The reconciler
+        /// walks back to the reserve box the tracker is in step with, reproduces the
+        /// transaction from its extension (action 0, reserve output 1, receiver, timestamp)
+        /// and value delta, and journals it (`detected_on_chain`): its reserve answers 409, it
+        /// holds back no commit. The confirmer applies it once deep enough, compared with the
+        /// journaled R5 (output 0 of the transaction is another box). Then the reserve is in
+        /// step, and an unchanged reserve costs no node request.
+        #[tokio::test]
+        async fn a_redemption_broadcast_elsewhere_is_journaled_and_applied() {
+            let fx = fixture(true).await;
+            let empty = fx.tracker_reserve_digest().await;
+            let origin = fx.reserve_box(&box_id(1), &tx_id(0), VALUE, &empty);
+            fx.node.lock().unwrap().unspent.insert(box_id(1));
+            fx.node.lock().unwrap().boxes.insert(box_id(1), origin.clone());
+            let reserves = fx.reserves(&box_id(1));
+            let mut cache = ReconcileCache::default();
+            assert_eq!(fx.reconcile(&reserves, &mut cache).await, ReconcileOutcome::default());
+            let after_first = fx.requests();
+            fx.reconcile(&reserves, &mut cache).await;
+            assert_eq!(fx.requests(), after_first, "in step and unchanged: not asked again");
+
+            fx.redeem_out_of_band(&tx_id(1), &"b1".repeat(32), &origin, &box_id(2), 300, BUILT_AT, &fx.built_r5, false);
+            let reserves = fx.reserves(&box_id(2));
+            let outcome = fx.reconcile(&reserves, &mut cache).await;
+            assert_eq!(outcome.journaled, vec![tx_id(1)]);
+            let entry = fx.storage.journaled_redemption(&tx_id(1)).unwrap().unwrap();
+            assert!(entry.detected_on_chain);
+            assert_eq!(
+                (entry.reserve_box_id.as_str(), entry.redeemed_amount, entry.new_already_redeemed),
+                (box_id(1).as_str(), 300, 300)
+            );
+            assert_eq!(entry.recipient_pubkey, hex::encode(fx.recipient));
+            assert_eq!(entry.reserve_tree_timestamp, Some(BUILT_AT));
+            assert_eq!(entry.reserve_r5_digest.as_deref(), Some(fx.built_r5.as_str()));
+            assert_eq!(entry.data_input_ids, vec![tracker_box()]);
+            let waiting = waiting_redemption(&fx.storage, &hex::encode(fx.issuer), &DenomKey::Erg)
+                .unwrap()
+                .unwrap();
+            assert!(waiting_reason(&waiting).contains("found on chain"));
+            let restored = SharedTrackerState::new();
+            restore_submitted_redemptions(&fx.storage, &restored);
+            assert!(restored.get_submitted_redemptions().is_empty());
+            // Journaled: the next pass leaves it to the confirmer.
+            assert_eq!(fx.reconcile(&reserves, &mut cache).await, ReconcileOutcome::default());
+
+            assert_eq!(fx.check().await.applied, vec![tx_id(1)]);
+            assert_eq!(fx.applied.load(Ordering::SeqCst), 1);
+            assert_eq!(fx.tracker_reserve_digest().await, fx.built_r5);
+            assert_eq!(fx.reconcile(&reserves, &mut cache).await, ReconcileOutcome::default());
+            assert!(fx.journaled().is_empty());
+        }
+
+        /// Two redemptions in a row, the extension only in the block's transactions: the
+        /// oldest is journaled first, the next once the first is applied.
+        #[tokio::test]
+        async fn redemptions_in_a_row_are_taken_oldest_first() {
+            let fx = fixture(true).await;
+            let empty = fx.tracker_reserve_digest().await;
+            // The edge after the second: 500 at a later note timestamp (the same single edge).
+            let second_digest = fx.digest_with(BUILT_AT + 1, 500).await;
+            let origin = fx.reserve_box(&box_id(1), &tx_id(0), VALUE, &empty);
+            let middle = fx.redeem_out_of_band(&tx_id(1), &"b1".repeat(32), &origin, &box_id(2), 300, BUILT_AT, &fx.built_r5, true);
+            fx.redeem_out_of_band(&tx_id(2), &"b2".repeat(32), &middle, &box_id(3), 200, BUILT_AT + 1, &second_digest, true);
+            let reserves = fx.reserves(&box_id(3));
+            let mut cache = ReconcileCache::default();
+            assert_eq!(fx.reconcile(&reserves, &mut cache).await.journaled, vec![tx_id(1)]);
+            assert_eq!(fx.check().await.applied, vec![tx_id(1)]);
+            assert_eq!(fx.reconcile(&reserves, &mut cache).await.journaled, vec![tx_id(2)]);
+            let entry = fx.storage.journaled_redemption(&tx_id(2)).unwrap().unwrap();
+            assert_eq!((entry.redeemed_amount, entry.new_already_redeemed), (200, 500));
+            assert_eq!(fx.check().await.applied, vec![tx_id(2)]);
+            assert_eq!(fx.tracker_reserve_digest().await, second_digest);
+            assert_eq!(fx.applied.load(Ordering::SeqCst), 2);
+        }
+
+        /// A reserve out of step that no redemption the tracker can reproduce explains: logged
+        /// once for an operator, nothing journaled, not asked again while unchanged. One whose
+        /// redemption is journaled already (the tracker's own) is left to the confirmer.
+        #[tokio::test]
+        async fn an_unexplained_reserve_is_reported_once_and_changes_nothing() {
+            let fx = fixture(true).await;
+            let empty = fx.tracker_reserve_digest().await;
+            let origin = fx.reserve_box(&box_id(1), &tx_id(0), VALUE, &empty);
+            // R5 that 300 at BUILT_AT does not give.
+            fx.redeem_out_of_band(&tx_id(1), &"b1".repeat(32), &origin, &box_id(2), 300, BUILT_AT, &"77".repeat(33), false);
+            let reserves = fx.reserves(&box_id(2));
+            let mut cache = ReconcileCache::default();
+            let outcome = fx.reconcile(&reserves, &mut cache).await;
+            assert_eq!(outcome.unexplained, vec![box_id(2)]);
+            assert!(outcome.journaled.is_empty());
+            assert!(fx.journaled().is_empty());
+            let requests = fx.requests();
+            assert_eq!(fx.reconcile(&reserves, &mut cache).await, ReconcileOutcome::default());
+            assert_eq!(fx.requests(), requests);
+
+            // The tracker's own redemption of this reserve is journaled: not looked at.
+            let mut fresh = ReconcileCache::default();
+            fx.journal(TX);
+            let requests = fx.requests();
+            assert_eq!(fx.reconcile(&reserves, &mut fresh).await, ReconcileOutcome::default());
+            assert_eq!(fx.requests(), requests);
+        }
     }
 
     #[test]

@@ -750,11 +750,12 @@ async fn main() {
         tracker_storage.clone(),
         shared_tracker_state_for_updater.clone(),
         tx.clone(),
+        ergo_scanner.reserve_tracker.clone(),
         basis_server::redemption_confirmer::REDEMPTION_CHECK_INTERVAL,
         shutdown_tx.subscribe(),
     ));
     tracing::info!(
-        "Redemption confirmer started: submitted redemptions are applied once in a block, {} deep",
+        "Redemption confirmer started: submitted redemptions, and those found on chain for a tracked reserve, are applied once in a block, {} deep",
         config.confirmation.min_depth
     );
 

@@ -11,6 +11,7 @@ pub mod note_limits;
 pub mod redemption_build;
 pub mod redemption_confirmer;
 pub mod reserve_api;
+pub mod reserve_reconciler;
 pub mod reserve_repair;
 pub mod store;
 pub mod tracker_box_updater;

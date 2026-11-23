@@ -735,15 +735,38 @@ and `/redeem/complete` takes it as `reserve_tree_timestamp` (without it, the not
 timestamp, with a warning). Builds recorded by 6113b8d live only in memory and do not survive the
 upgrade, so no 6113b8d build is applied by the new code.
 
-Not done in round 5 or 5b: **scanner reconciliation** of a redemption that did not go through this
-tracker's submit (broadcast by the recipient through another node, or through the front's
-`/node/transactions`, or one dropped from the journal by an operator and mined later). The tracker's
-reserve tree is then behind the chain, and the build answers that no reserve matches the tracker's
-reserve tree until an operator records it with `/redeem/complete`, as before. A redemption dropped
-from every mempool that can still be mined keeps its reserve blocked until it can no longer be mined
-(at the latest when a confirmed commit replaces the tracker box it reads, which the heartbeat does
-within `heartbeat_blocks`) or until an operator drops it. Round 6 (risk 3) releases that one
-with a release commit (above).
+**Redemptions found on chain (round 6, risk 2).** Until round 6 only redemptions submitted
+through `/redemption/submit` were journaled. One that did not go through this tracker's submit
+(broadcast by the recipient through another node, or through the front's `/node/transactions`, or
+one dropped from the journal by an operator and mined later) left the tracker's reserve tree behind
+R5 of the reserve box on chain, and every build of the reserve answered that no reserve matches the
+tracker's reserve tree until an operator repaired it. Now, before each pass of the confirmer (every
+60 s), the **reserve reconciler** compares each reserve the scanner tracks for this tracker (one per
+issuer and denomination; an issuer with two in one denomination is skipped, as builds refuse it)
+with the tracker's reserve tree:
+
+- a reserve with a journaled redemption is left to the confirmer; one whose box (`/utxo/byId`) holds
+  the tracker's digest in R5 is in step. A reserve whose box and tracker digest were compared
+  already is not asked again until either changes (no node request for unchanged reserves);
+- otherwise its lineage is walked back on the blockchain index (`/blockchain/box/byId`,
+  `/blockchain/transaction/byId`: the box's creating transaction and its input with the same
+  contract and owner R4), at most 8 boxes, to the oldest reserve box whose R5 is the tracker's
+  reserve tree. The transaction that spent it is reproduced: its context extension (from the
+  indexed input's `spendingProof`, or else `/blocks/{blockId}/transactions`) must be a redemption
+  (variable 0: action 0, and the reserve output it names is the next box), with the receiver
+  (variable 1) and the note timestamp (variable 4); the redeemed amount is the reserve's value
+  (or reserve token) delta, the cumulative amount the edge's stored amount in the tracker's tree
+  plus it; and the tracker's reserve tree with that value must hash to R5 of the reserve output;
+- reproduced: it is journaled like the tracker's own redemption (`detected_on_chain: true`; the
+  spent reserve box, the data inputs, the timestamp and R5 digest), synced to disk, and logged
+  (warning). From then on the reserve answers `409` ("found on chain ...; the tracker applies it
+  once it is deep enough"), it never holds back a commit (mined already; not restored at startup
+  either), and the confirmer applies it once `min_depth` deep and compares the reserve tree with
+  the journaled R5 (its reserve output need not be output 0). Several in a row are taken one per
+  pass, oldest first;
+- not reproduced (another action changed the tree, the lineage does not reach the tracker's tree,
+  the values give another digest): logged once per reserve box and tracker digest for an operator
+  (`POST /redemption/tree/repair`); nothing changes.
 
 **Commits wait for it (round 5, 5b).** The broadcast redemption reads the tracker box as its data
 input, and a tracker commit spends that box. The submit records the redemption's tx id and data

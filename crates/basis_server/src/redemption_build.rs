@@ -2853,6 +2853,7 @@ pub async fn submit_redemption(
         reserve_r5_digest: Some(hex::encode(&pending.reserve_r5_digest)),
         digest_mismatch: None,
         next_check_at_ms: 0,
+        detected_on_chain: false,
     };
     // Round 5b (F9): the entry is on disk before the node can have the transaction.
     if let Err(e) = state
