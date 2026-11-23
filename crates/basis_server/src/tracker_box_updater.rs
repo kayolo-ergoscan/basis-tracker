@@ -277,8 +277,8 @@ impl SharedTrackerState {
     }
 
     /// Round 6 (risk 3): ask the updater for a release commit that spends `tracker_box_id`, which
-    /// the long-missing redemption `tx_id` reads (see [`ReleaseRequest`]), and wake it. `true`
-    /// when the request is new.
+    /// the long-missing redemption `tx_id` reads (see [`ReleaseRequest`]), and wake it when the
+    /// request is new. `true` when it is.
     pub fn request_release_commit(&self, tx_id: &str, tracker_box_id: &str) -> bool {
         let request = ReleaseRequest {
             tx_id: tx_id.to_ascii_lowercase(),
@@ -300,7 +300,11 @@ impl SharedTrackerState {
                 true
             }
         };
-        self.release_wake.notify_one();
+        // Only a new request wakes the updater (round 6, review LOW-5): a repeat is picked up by
+        // the cycle the first one woke, or by the regular schedule.
+        if added {
+            self.release_wake.notify_one();
+        }
         added
     }
 
@@ -3877,11 +3881,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn release_requests_are_kept_once_per_redemption_and_forgotten_by_id() {
+    #[tokio::test]
+    async fn release_requests_are_kept_once_per_redemption_and_forgotten_by_id() {
         let shared = SharedTrackerState::new();
+        let woken = |shared: &SharedTrackerState| {
+            let wake = shared.release_wake.clone();
+            async move {
+                tokio::time::timeout(Duration::from_millis(50), wake.notified())
+                    .await
+                    .is_ok()
+            }
+        };
         assert!(shared.request_release_commit(&"AA".repeat(32), &"BB".repeat(32)));
+        assert!(woken(&shared).await, "a new request wakes the updater");
         assert!(!shared.request_release_commit(&"aa".repeat(32), &"bb".repeat(32)));
+        assert!(!woken(&shared).await, "a repeat does not (review LOW-5)");
         // A newer tracker box for the same redemption replaces the request.
         assert!(shared.request_release_commit(&"aa".repeat(32), &"cc".repeat(32)));
         assert!(shared.request_release_commit(&"dd".repeat(32), &"cc".repeat(32)));
