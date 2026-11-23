@@ -48,14 +48,18 @@ holds:
    anyone before the scanner first sees it; then the root is admitted when its NFT leads
    back (input holding it at `tokens(0)` with amount 1, same R4 and R6, at the contract,
    still clean: empty R5, `R7 == 0`, so only top-ups happened) to a box whose creating
-   transaction has the owner's P2PK input.
+   transaction has the owner's P2PK input. Round 6d: or to a reserve box with a pending
+   refund (`R7 != 0`) holding the NFT: redemption (#0) and top-up (#1) keep R7 and refund
+   initiation (#2) needs `R7 == 0`, so only the owner's refund completion (#3) turns it
+   into a clean box.
 3. **Successor** — the box holds the reserve NFT of a tracked box of its
    `(owner, denomination)` (the NFT of each tracked box is cached: from the scan, or one
    `GET /blockchain/box/byId` per tracked box; round 6c). A box holding none of them is
    quarantined at once, with no walk and no retry: a newcomer never displaces a tracked
    reserve. For a box holding the tracked box's NFT, `GET /blockchain/box/byId` of the
    tracked box gives the transaction that spent it; when that transaction created the
-   box, it is the successor (no transaction is read, however large). Otherwise the walk
+   box and the NFT is a singleton, it is the successor (no transaction is read, however
+   large; round 6d: a NFT that is not a singleton is walked). Otherwise the walk
    goes back from the box through its creating transaction to the input that holds the
    NFT as a reserve box does (`tokens(0)` = (NFT, 1), the same R4 and R6, and the
    tracked box or at the reserve contract; not merely the first input holding the
@@ -63,7 +67,17 @@ holds:
    6c), until that input is the tracked box or was created by the transaction that spent
    it. When the walk gives no verdict (depth used up, a transaction over the 2 MiB body
    cap, a node error), a singleton NFT decides: with the tracked box spent, no other box
-   can hold it. Otherwise the box is pending (retried), never quarantined for that.
+   can hold it. Round 6d: so it does when the index does not know the tracked box (a
+   reorg dropped the transaction that made it) or still shows it unspent, so a
+   successor a reorg dropped never strands the reserve. Otherwise the box is pending
+   (retried), never quarantined for that.
+
+   **Round 6d: a completed refund starts anew.** Every step from the tracked box to the
+   box (the direct spend, each walked input, the singleton decision) must keep a
+   pending refund: when the box before has `R7 != 0` the box after must have the same
+   R7. Otherwise the owner completed the refund (#3) and made the box anew, and it is
+   judged as a root (C4 setup checks, singleton, owner proof): a box re-created with the
+   same NFT, `R7 == 0` and a pre-filled R5 is quarantined.
    The reserve contract keeps the token list, R4 and R6 of the output each reserve input
    names (`selfPreserved` in `contract/basis.es`: `selfOut.tokens == SELF.tokens`; in
    `basis-token.es` the NFT at `tokens(0)` and the token id at `tokens(1)`), so the NFT
@@ -84,6 +98,11 @@ holds:
    spending transaction creates several reserve-contract outputs, only the one holding
    the NFT is the successor.
 
+   **Round 6d: a new reserve in the window of a withdrawal.** When none of the owner's
+   tracked boxes in the denomination is in this cycle's scan (the owner withdrew the
+   reserve), a box that holds none of their NFTs is not quarantined: it waits, and once
+   the spent box is removed it is judged as a root.
+
 Anything else is **quarantined**: it never enters the tracker (so
 `resolve_issuer_reserve` never sees a duplicate) and a record (`box_id`, `owner`,
 `denomination`, `reason`, timestamp) is persisted in the `quarantined_reserves`
@@ -97,25 +116,44 @@ box is **pending**: it is neither admitted nor quarantined, and the tracked box 
 the same `(owner, denomination)` is not removed as spent that cycle — a transient
 node error must not orphan the lineage and brick the issuer. Round 6c: only while that
 tracked box is the owner's only reserve there; once a successor holding its NFT is
-tracked, a pending check never keeps the spent box next to it. The lineage and
-ownership checks share a budget of 512 node requests per scan cycle; past it a check is
-pending (a successor with a singleton NFT is still followed).
+tracked, a pending check never keeps the spent box next to it. Round 6d: only a box that
+holds (or may hold) the tracked box's NFT keeps it; a root candidate that is retried
+keeps nothing. The lineage and ownership checks share a budget of 512 node requests per
+scan cycle; past it a check is pending (a successor with a singleton NFT is still
+followed).
+
+**Node requests per cycle (round 6d).** A scan cycle starts by learning the NFT of every
+tracked reserve (from the scan, else one `GET /blockchain/box/byId`) and checks first
+the tracked boxes, boxes removed in the last day, and boxes holding a tracked NFT; then
+the rest. Reading the tracked box and the singleton lookup of a box holding a tracked
+NFT are outside the shared budget (bounded by the number of tracked reserves), so no
+number of other boxes, in any scan order, can push a successor past the budget. Root
+candidates are capped at `MAX_ROOT_CHECKS_PER_CYCLE = 128` per cycle (never-checked
+first, then the least recently checked; past the cap they wait for the next cycle). A
+transaction or box read once in a cycle is reused by every check of that cycle (errors
+too, up to 64 MiB of transaction inputs), so one transaction over the 2 MiB body cap that
+makes 512 junk roots costs one request per cycle.
 
 **Spent reserves (round 6c).** A tracked reserve absent from the scan is spent and
 removed. When the scan lists no valid box at all, the snapshot is not taken as
 authoritative (manually inserted reserves on a local test node), so an absent reserve
 is removed only when `GET /blockchain/box/byId` shows it spent: the last reserve, withdrawn
 by refund completion, no longer stays tracked for good (which made the owner's next
-reserve a quarantined newcomer).
+reserve a quarantined newcomer). Round 6d: and only once that spend is at least
+`SPENT_REMOVAL_DEPTH = 10` blocks deep (`spendingHeight` of the box, else the spending
+transaction's `inclusionHeight`, against `/info` `fullHeight`). A removed box is
+remembered (box id and NFT) for a day, about 720 blocks: when a reorg brings it back to
+the scan, it is restored as the tracked box instead of being judged as a root (unless a
+tracked box of the owner in the denomination is in the scan too).
 
 **Operator release (round 6c).** `POST /reserves/quarantined/release` (Admin; body
 `box_id`, `note`) moves a quarantine record to a journal (`quarantine_releases`,
 listed by `GET /reserves/quarantined/releases`) in one batch. The release does not
 track the box: at its next cycle the scanner judges it again by the rules of the day,
 and a box that still fails them is quarantined again. For boxes an older rule
-quarantined (more than 8 actions between two scans before round 6c, say), or a new
+quarantined (more than 8 actions between two scans before round 6c, say, or a new
 reserve that appeared in the same scan cycle in which the owner's withdrawn reserve was
-still tracked.
+still tracked, before round 6d).
 
 Both ingestion paths go through admission: `ServerState::process_scan_boxes` (the
 scanner loop) and the server's background scanner task (which delegates to
@@ -127,7 +165,9 @@ error as defense in depth; with admission control it should be unreachable.
 A newcomer never displaces a tracked reserve: while the owner has one tracked in a
 denomination, every other box of that owner and denomination goes through the successor
 rule, and the tracked box leaves the tracker only when the scan no longer lists it (spent)
-and no successor check is pending.
+and no successor check is pending (round 6d: the only exception is a box holding none of
+the tracked NFTs while none of the tracked boxes is in the scan, which waits instead of
+being quarantined).
 
 ## Why the P2PK proof closes the front-run
 
@@ -175,8 +215,11 @@ backing up.
 
 - `crates/basis_store/src/ergo_scanner.rs`
   - `parse_reserve_box` — per-box structural validation only.
-  - `admit_reserve_box` — admission decision (C4 checks + P2PK proof for roots,
-    lineage for successors, quarantine stickiness).
+  - `admit_reserve_box` — admission decision (lineage for successors, quarantine
+    stickiness, restoring a removed box a reorg brought back; round 6d).
+  - `admit_root` — the root rules: C4 checks, singleton, P2PK proof, the per-cycle cap.
+  - `begin_cycle` — per-cycle state, the tracked NFTs, and the order of the checks
+    (round 6d).
   - `p2pk_ergo_tree` / `has_owner_p2pk_input` — the `0008cd || pubkey` proof check.
   - `is_lineage_successor` — the tracked box's spender first, then a bounded backwards
     walk over `/blockchain/transaction/byId` following the reserve NFT (round 6b), with

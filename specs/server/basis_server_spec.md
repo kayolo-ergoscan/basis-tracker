@@ -302,6 +302,9 @@ The server provides an endpoint to generate reserve creation payloads for Ergo n
   - `erg_amount` above `server.reserve_creation_max_erg_nano` (default 10 ERG)
   - in token mode, `token_amount` above `server.reserve_creation_max_token_amount` (default 1e9)
   - an `owner_pubkey` that is not a valid secp256k1 curve point
+  - an `nft_id` the scanner node knows (`GET /blockchain/token/byId`) as a token whose emission
+    is not 1 (round 6d: the scanner admits a reserve only with a singleton NFT); a token the node
+    does not know yet, or a node that cannot tell, passes
 
 - HTTP 503 until the tracker box for the configured tracker NFT is confirmed on chain (the
   tracker box updater has found it in the blockchain index, which lists boxes in blocks only).

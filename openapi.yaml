@@ -667,7 +667,9 @@ paths:
         '400':
           description: >-
             Bad request - invalid input parameters, including an owner_pubkey that
-            is not a compressed secp256k1 point (02/03 prefix, on the curve)
+            is not a compressed secp256k1 point (02/03 prefix, on the curve), or an
+            nft_id the scanner node knows as a token whose emission is not 1 (round 6d;
+            a token the node does not know yet passes)
           content:
             application/json:
               schema:

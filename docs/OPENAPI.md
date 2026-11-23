@@ -129,7 +129,9 @@ All endpoints return a standardized response envelope:
 - `POST /reserves/create` - Build a reserve creation payment request
 
 `POST /reserves/create` only *builds* the payment request, and only once the tracker
-box for the configured tracker NFT is confirmed on chain (until then it answers 503). To
+box for the configured tracker NFT is confirmed on chain (until then it answers 503). An
+`nft_id` the node knows as a token whose emission is not 1 is refused with 400 (the
+scanner tracks a reserve only with a singleton NFT; round 6d). To
 create the reserve on-chain, submit the returned `requests` array to your own Ergo
 node's wallet directly:
 
