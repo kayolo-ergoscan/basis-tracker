@@ -107,11 +107,28 @@ fn scan_box_nft(scan_box: &ScanBox) -> Option<String> {
 }
 
 /// Node requests the lineage and ownership checks may make in one scan cycle
-/// (round 6c). The checks walk at most `LINEAGE_WALK_DEPTH` transactions per
-/// box, and only boxes holding a tracked reserve's NFT (or root candidates)
-/// are walked; past the budget a check gives no verdict and is retried next
-/// cycle, and a successor whose NFT is a singleton is still followed.
+/// on the shared lane (round 6c). The checks walk at most `LINEAGE_WALK_DEPTH`
+/// transactions per box; past the budget a check gives no verdict and is
+/// retried next cycle. Round 6d (P1): the tracked lane (reading the tracked
+/// boxes, their anchors and the singleton lookup of a box holding a tracked
+/// NFT) is outside this budget, bounded by the number of tracked reserves, and
+/// those boxes are checked first, so a successor whose NFT is a singleton is
+/// still followed however many other boxes the scan lists.
 const LINEAGE_REQUESTS_PER_CYCLE: usize = 512;
+
+/// Root candidates checked against the node per scan cycle (round 6d, P1).
+/// Never-checked candidates go first, then the least recently checked, so a
+/// new reserve is not starved by junk that stays undecided.
+const MAX_ROOT_CHECKS_PER_CYCLE: usize = 128;
+
+/// How deep the spend of a tracked reserve must be before a scan without any
+/// valid box removes it (round 6d, P2-3).
+const SPENT_REMOVAL_DEPTH: u64 = 10;
+
+/// How long a removed reserve box is remembered (round 6d, P2-3): about 720
+/// blocks. A box a reorg brings back within that time is restored as the
+/// tracked box instead of being judged as a root.
+const REMEMBER_REMOVED_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// What the scanner knows about reserve NFTs (round 6c, P1-2), in memory only:
 /// it is read back from the node after a restart.
@@ -121,17 +138,78 @@ pub struct NftCache {
     box_nft: std::collections::HashMap<String, Option<String>>,
     /// NFT id -> whether its emission is 1.
     singleton: std::collections::HashMap<String, bool>,
+    /// Round 6d (P2-3): removed reserve box id -> (its NFT, when, in ms).
+    removed: std::collections::HashMap<String, (Option<String>, u64)>,
+    /// Round 6d (P1): root candidate box id -> the cycle it was last checked in.
+    root_checked: std::collections::HashMap<String, u64>,
+    /// Scan cycles run so far.
+    cycles: u64,
+}
+
+/// Bytes of transaction inputs one scan cycle keeps for reuse (round 6d, P1);
+/// past it a transaction is still read but not kept.
+const CYCLE_MEMO_BYTES: usize = 64 * 1024 * 1024;
+
+/// What one scan cycle has asked the node (round 6d, P1): request count of the
+/// shared lane, root checks, and the answers by id, so a transaction or box
+/// read by many candidates is fetched once. Reset at each cycle.
+#[derive(Debug, Default)]
+pub struct CycleState {
+    requests: usize,
+    root_checks: usize,
+    memo_bytes: usize,
+    tx_inputs: std::collections::HashMap<String, Result<Vec<ChainBox>, String>>,
+    boxes: std::collections::HashMap<String, Result<Option<ChainBox>, String>>,
+    /// Box ids the scan listed this cycle (`None` outside `process_scan_boxes`).
+    scanned: Option<std::collections::HashSet<String>>,
+}
+
+/// Which allowance a node request of the admission checks counts against
+/// (round 6d, P1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// The tracked reserves and boxes holding their NFT: not budgeted.
+    Tracked,
+    /// Everything else: `LINEAGE_REQUESTS_PER_CYCLE`.
+    Shared,
+}
+
+/// A lineage verdict (round 6d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lineage {
+    /// The box continues the tracked reserve.
+    Successor,
+    /// It does not.
+    NotSuccessor,
+    /// It holds the reserve NFT after a pending refund was completed (R7 not
+    /// kept, P2-2): the owner made it anew, so it is judged as a root.
+    Root,
+}
+
+/// R7 of a box as the contract reads it (`getOrElse(0)`).
+fn refund_height(r7: Option<&String>) -> u64 {
+    decode_ergo_long_register(r7)
+}
+
+/// Whether going from a box with refund height `before` to one with `after`
+/// breaks what contract actions #0 and #1 keep (round 6d, P2-2): a pending
+/// refund (R7 != 0) is kept by every action but the owner's refund completion
+/// (#2 needs R7 = 0).
+fn refund_broken(before: u64, after: u64) -> bool {
+    before != 0 && after != before
 }
 
 /// A box as the blockchain index gives it: an input of
 /// `GET /blockchain/transaction/byId`, or `GET /blockchain/box/byId`.
 #[derive(Debug, Clone)]
-struct ChainBox {
+pub struct ChainBox {
     box_id: String,
     address: String,
     creating_tx: String,
     /// The transaction that spent the box; empty while unspent.
     spent_tx: String,
+    /// The height of that spend (`spendingHeight`), when the index gives it.
+    spent_height: Option<u64>,
     ergo_tree: String,
     /// `(token id, amount)` in box order; `None` when the index gave no `assets`.
     assets: Option<Vec<(String, u64)>>,
@@ -140,6 +218,25 @@ struct ChainBox {
 }
 
 impl ChainBox {
+    /// About how much memory the box takes.
+    fn approx_bytes(&self) -> usize {
+        self.box_id.len()
+            + self.address.len()
+            + self.creating_tx.len()
+            + self.spent_tx.len()
+            + self.ergo_tree.len()
+            + self
+                .assets
+                .as_ref()
+                .map_or(0, |assets| assets.iter().map(|(id, _)| id.len() + 8).sum())
+            + self
+                .registers
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+            + 64
+    }
+
     /// The box's reserve NFT: its first token when held once.
     fn reserve_nft(&self) -> Option<String> {
         let (token_id, amount) = self.assets.as_ref()?.first()?;
@@ -207,6 +304,7 @@ impl ChainBox {
             address: text("address"),
             creating_tx: text("transactionId"),
             spent_tx: text("spentTransactionId"),
+            spent_height: input.get("spendingHeight").and_then(|h| h.as_u64()),
             ergo_tree: text("ergoTree"),
             assets,
             registers,
@@ -233,6 +331,10 @@ pub enum ReserveAdmission {
     /// quarantined, and the tracked box for the same (owner, denomination)
     /// must not be removed as spent while a successor candidate is pending.
     Retry,
+    /// Retry next cycle without keeping any tracked box (round 6d): a root
+    /// candidate past the per-cycle cap or without a verdict, or a newcomer
+    /// whose owner's tracked reserve is spent this cycle.
+    Deferred,
 }
 
 /// The outcome of ingesting one scanned reserve box (parse + admission +
@@ -249,6 +351,9 @@ pub enum ScanBoxIngest {
     /// and denomination of the pending lineage so the caller keeps the
     /// currently tracked box until the check resolves.
     Pending(String, crate::DenomKey),
+    /// Retried next cycle, keeping no tracked box (round 6d); carries the
+    /// normalized box id.
+    Deferred(String),
 }
 
 /// Page size for `POST /blockchain/box/unspent/byAddress`. The node defaults to
@@ -381,8 +486,8 @@ pub struct ServerState {
     pub reserve_storage: ReserveStorage,
     /// Reserve NFTs of tracked boxes and singleton verdicts (round 6c).
     pub nft_cache: Arc<std::sync::Mutex<NftCache>>,
-    /// Node requests of the lineage checks in the current scan cycle.
-    pub lineage_requests: Arc<std::sync::atomic::AtomicUsize>,
+    /// What the current scan cycle has asked the node (round 6d).
+    pub cycle: Arc<std::sync::Mutex<CycleState>>,
 }
 
 impl ServerState {
@@ -480,7 +585,7 @@ impl ServerState {
             metadata_storage,
             reserve_storage,
             nft_cache: Arc::default(),
-            lineage_requests: Arc::default(),
+            cycle: Arc::default(),
         })
     }
 
@@ -981,8 +1086,34 @@ impl ServerState {
     /// Fetch the inputs of a transaction via
     /// `GET /blockchain/transaction/byId/{txId}` (the index gives each input as
     /// a full box).
-    async fn fetch_tx_inputs(&self, tx_id: &str) -> Result<Vec<ChainBox>, ScannerError> {
-        self.take_node_budget(tx_id)?;
+    async fn fetch_tx_inputs(
+        &self,
+        tx_id: &str,
+        lane: Lane,
+    ) -> Result<Vec<ChainBox>, ScannerError> {
+        if let Some(known) = self.cycle_state().tx_inputs.get(tx_id) {
+            return known.clone().map_err(ScannerError::NodeError);
+        }
+        if lane == Lane::Shared {
+            self.take_node_budget(tx_id)?;
+        }
+        let fetched = self.fetch_tx_inputs_uncached(tx_id).await;
+        let size = fetched
+            .as_ref()
+            .map_or(0, |inputs| inputs.iter().map(ChainBox::approx_bytes).sum());
+        let mut cycle = self.cycle_state();
+        if cycle.memo_bytes + size <= CYCLE_MEMO_BYTES {
+            cycle.memo_bytes += size;
+            cycle.tx_inputs.insert(
+                tx_id.to_string(),
+                fetched.as_ref().map(Vec::clone).map_err(|e| e.to_string()),
+            );
+        }
+        drop(cycle);
+        fetched
+    }
+
+    async fn fetch_tx_inputs_uncached(&self, tx_id: &str) -> Result<Vec<ChainBox>, ScannerError> {
         let url = format!(
             "{}/blockchain/transaction/byId/{}",
             self.config.node_url, tx_id
@@ -1017,8 +1148,55 @@ impl ServerState {
 
     /// GET `/blockchain/box/byId/{id}`: the box, spent or unspent, as the index
     /// gives it; `None` when the index does not know it.
-    async fn fetch_indexed_box(&self, box_id: &str) -> Result<Option<ChainBox>, ScannerError> {
-        self.take_node_budget(box_id)?;
+    async fn fetch_indexed_box(
+        &self,
+        box_id: &str,
+        lane: Lane,
+    ) -> Result<Option<ChainBox>, ScannerError> {
+        if let Some(known) = self.cycle_state().boxes.get(box_id) {
+            return known.clone().map_err(ScannerError::NodeError);
+        }
+        if lane == Lane::Shared {
+            self.take_node_budget(box_id)?;
+        }
+        let fetched = self.fetch_indexed_box_uncached(box_id).await;
+        self.cycle_state().boxes.insert(
+            box_id.to_string(),
+            fetched
+                .as_ref()
+                .map(Option::clone)
+                .map_err(|e| e.to_string()),
+        );
+        fetched
+    }
+
+    /// The height of the block that included transaction `tx_id`
+    /// (`inclusionHeight`), or `None` when the node cannot tell.
+    async fn fetch_tx_inclusion_height(&self, tx_id: &str) -> Option<u64> {
+        let url = format!(
+            "{}/blockchain/transaction/byId/{}",
+            self.config.node_url, tx_id
+        );
+        let response = self
+            .request_builder(reqwest::Method::GET, &url)
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        crate::http::read_json_capped(response)
+            .await
+            .ok()?
+            .get("inclusionHeight")
+            .and_then(|h| h.as_u64())
+            .filter(|h| *h > 0)
+    }
+
+    async fn fetch_indexed_box_uncached(
+        &self,
+        box_id: &str,
+    ) -> Result<Option<ChainBox>, ScannerError> {
         let url = format!("{}/blockchain/box/byId/{}", self.config.node_url, box_id);
         let response = self
             .request_builder(reqwest::Method::GET, &url)
@@ -1053,7 +1231,7 @@ impl ServerState {
         if let Some(nft) = self.nft_cache().box_nft.get(box_id) {
             return Ok(nft.clone());
         }
-        let Some(chain_box) = self.fetch_indexed_box(box_id).await? else {
+        let Some(chain_box) = self.fetch_indexed_box(box_id, Lane::Tracked).await? else {
             return Err(ScannerError::NodeError(format!(
                 "Tracked reserve box {} is not in the blockchain index",
                 box_id
@@ -1066,11 +1244,13 @@ impl ServerState {
 
     /// Whether the token index gives `nft` an emission of exactly 1 (round 6c,
     /// P2-2): only then can no other box ever hold it. Cached per token.
-    async fn is_singleton_nft(&self, nft: &str) -> Result<bool, ScannerError> {
+    async fn is_singleton_nft(&self, nft: &str, lane: Lane) -> Result<bool, ScannerError> {
         if let Some(singleton) = self.nft_cache().singleton.get(nft) {
             return Ok(*singleton);
         }
-        self.take_node_budget(nft)?;
+        if lane == Lane::Shared {
+            self.take_node_budget(nft)?;
+        }
         let url = format!("{}/blockchain/token/byId/{}", self.config.node_url, nft);
         let response = self
             .request_builder(reqwest::Method::GET, &url)
@@ -1109,6 +1289,12 @@ impl ServerState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn cycle_state(&self) -> std::sync::MutexGuard<'_, CycleState> {
+        self.cycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn remember_nft(&self, box_id: &str, nft: Option<String>) {
         self.nft_cache().box_nft.insert(box_id.to_string(), nft);
     }
@@ -1116,9 +1302,9 @@ impl ServerState {
     /// Count one node request of the lineage checks against this cycle's
     /// budget (round 6c): junk candidates cannot make a cycle unbounded.
     fn take_node_budget(&self, what: &str) -> Result<(), ScannerError> {
-        let used = self
-            .lineage_requests
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut cycle = self.cycle_state();
+        let used = cycle.requests;
+        cycle.requests += 1;
         if used >= LINEAGE_REQUESTS_PER_CYCLE {
             return Err(ScannerError::NodeError(format!(
                 "lineage request budget of this cycle ({}) is used up before {}",
@@ -1129,8 +1315,7 @@ impl ServerState {
     }
 
     /// Verdict on `scan_box`, which holds the reserve NFT `nft` of the tracked
-    /// box `known_box_id`: `Ok(true)` it continues that reserve, `Ok(false)` it
-    /// does not (quarantine), `Err` no verdict this cycle (retry).
+    /// box `anchor`; `Err` is no verdict this cycle (retry).
     ///
     /// Both reserve contracts keep the token list, the R4 owner and the R6
     /// tracker NFT of the output a reserve input names (`selfPreserved`), and
@@ -1140,8 +1325,9 @@ impl ServerState {
     /// box holding the NFT continues the lineage.
     ///
     /// 1. The tracked box must hold the NFT with the same R4 and R6. When the
-    ///    transaction that spent it created `scan_box`, that is the successor
-    ///    (no transaction is read, however large).
+    ///    transaction that spent it created `scan_box` and the NFT is a
+    ///    singleton, that is the successor (no transaction is read, however
+    ///    large).
     /// 2. Otherwise the walk goes back from `scan_box` through the creating
     ///    transactions, each time to the input that holds the NFT at
     ///    `tokens(0)` with amount 1, the same R4 and R6, and is the tracked box
@@ -1150,42 +1336,78 @@ impl ServerState {
     ///    `LINEAGE_WALK_DEPTH` transactions). No such input: not a successor.
     /// 3. When the walk gives no verdict (depth used up, a transaction over the
     ///    body cap, a node error; round 6c P1-1/P1-2), a singleton NFT decides:
-    ///    with the tracked box spent, no other box can hold it.
+    ///    with the tracked box spent, no other box can hold it. So it does when
+    ///    the index does not know the tracked box (a reorg dropped it) or shows
+    ///    it unspent (round 6d, P2-1).
+    ///
+    /// Every step must keep a pending refund (R7 != 0): only the owner's refund
+    /// completion does not, and then the box is judged as a root (round 6d,
+    /// P2-2). The tracked box and the singleton lookup are read on the tracked
+    /// lane (round 6d, P1).
     async fn is_lineage_successor(
         &self,
         scan_box: &ScanBox,
         nft: &str,
-        known_box_id: &str,
+        anchor: &ExtendedReserveInfo,
         contract_address: &str,
-    ) -> Result<bool, ScannerError> {
+    ) -> Result<Lineage, ScannerError> {
         let (Some(r4), Some(r6)) = (
             scan_box.additional_registers.get("R4"),
             scan_box.additional_registers.get("R6"),
         ) else {
-            return Ok(false);
+            return Ok(Lineage::NotSuccessor);
         };
-        let Some(known) = self.fetch_indexed_box(known_box_id).await? else {
-            return Err(ScannerError::NodeError(format!(
-                "Tracked reserve box {} is not in the blockchain index",
-                known_box_id
-            )));
+        let box_r7 = refund_height(scan_box.additional_registers.get("R7"));
+        let anchor_r7 = anchor.base_info.refund_initiation_height;
+        // The singleton decides: the tracked box cannot hold the NFT any more.
+        // R4 is the anchor's owner (same owner and denomination), and
+        // `parse_reserve_box` bound R6 to this tracker.
+        let by_singleton = |why: String| async move {
+            if self.is_singleton_nft(nft, Lane::Tracked).await? {
+                info!(
+                    "Reserve box {} follows tracked box {} by its singleton NFT {} ({})",
+                    scan_box.box_id, anchor.box_id, nft, why
+                );
+                Ok(if refund_broken(anchor_r7, box_r7) {
+                    Lineage::Root
+                } else {
+                    Lineage::Successor
+                })
+            } else {
+                Err(ScannerError::NodeError(format!(
+                    "lineage of box {} to {}: {}; its NFT {} is not a singleton",
+                    scan_box.box_id, anchor.box_id, why, nft
+                )))
+            }
         };
-        if !known.is_reserve_box_of(nft, r4, r6) {
-            return Ok(false);
-        }
-        if known.spent_tx.is_empty() {
-            // The index has not seen the spend yet, or the token is held more
-            // than once: no verdict.
-            return Err(ScannerError::NodeError(format!(
-                "Tracked reserve box {} is unspent while box {} holds its reserve NFT",
-                known_box_id, scan_box.box_id
-            )));
-        }
-        if scan_box
-            .transaction_id
-            .eq_ignore_ascii_case(&known.spent_tx)
-        {
-            return Ok(true);
+
+        let known = self
+            .fetch_indexed_box(&anchor.box_id, Lane::Tracked)
+            .await?;
+        let spent_by = match &known {
+            None => {
+                return by_singleton(format!(
+                    "the index does not know tracked box {}",
+                    anchor.box_id
+                ))
+                .await
+            }
+            Some(known) if !known.is_reserve_box_of(nft, r4, r6) => {
+                return Ok(Lineage::NotSuccessor)
+            }
+            Some(known) if known.spent_tx.is_empty() => {
+                return by_singleton(format!("tracked box {} shows unspent", anchor.box_id)).await
+            }
+            Some(known) => known.spent_tx.clone(),
+        };
+        if scan_box.transaction_id.eq_ignore_ascii_case(&spent_by) {
+            if refund_broken(anchor_r7, box_r7) {
+                return Ok(Lineage::Root);
+            }
+            if self.is_singleton_nft(nft, Lane::Tracked).await? {
+                return Ok(Lineage::Successor);
+            }
+            // Not a singleton: the transaction is read (the walk).
         }
 
         let walked = self
@@ -1194,31 +1416,22 @@ impl ServerState {
                 nft,
                 r4,
                 r6,
-                known_box_id,
-                &known.spent_tx,
+                &anchor.box_id,
+                anchor_r7,
+                &spent_by,
                 contract_address,
             )
             .await;
         match walked {
             Ok(Some(verdict)) => Ok(verdict),
-            no_verdict => {
-                let why = match no_verdict {
-                    Err(e) => e.to_string(),
-                    _ => format!("no verdict within {} transactions", LINEAGE_WALK_DEPTH),
-                };
-                if self.is_singleton_nft(nft).await? {
-                    info!(
-                        "Reserve box {} follows tracked box {} by its singleton NFT {} ({})",
-                        scan_box.box_id, known_box_id, nft, why
-                    );
-                    Ok(true)
-                } else {
-                    Err(ScannerError::NodeError(format!(
-                        "lineage of box {} to {}: {}; its NFT {} is not a singleton",
-                        scan_box.box_id, known_box_id, why, nft
-                    )))
-                }
+            Ok(None) => {
+                by_singleton(format!(
+                    "no verdict within {} transactions",
+                    LINEAGE_WALK_DEPTH
+                ))
+                .await
             }
+            Err(e) => by_singleton(e.to_string()).await,
         }
     }
 
@@ -1232,12 +1445,14 @@ impl ServerState {
         r4: &str,
         r6: &str,
         known_box_id: &str,
+        known_r7: u64,
         spent_by: &str,
         contract_address: &str,
-    ) -> Result<Option<bool>, ScannerError> {
+    ) -> Result<Option<Lineage>, ScannerError> {
         let mut tx_id = scan_box.transaction_id.clone();
+        let mut after_r7 = refund_height(scan_box.additional_registers.get("R7"));
         for _ in 0..LINEAGE_WALK_DEPTH {
-            let inputs = self.fetch_tx_inputs(&tx_id).await?;
+            let inputs = self.fetch_tx_inputs(&tx_id, Lane::Shared).await?;
             if inputs.iter().any(|input| input.assets.is_none()) {
                 return Err(ScannerError::JsonError(format!(
                     "Transaction {} lists an input without its assets",
@@ -1250,16 +1465,26 @@ impl ServerState {
                         || input.address == contract_address)
             }) else {
                 // The NFT came in from elsewhere (or was minted here).
-                return Ok(Some(false));
+                return Ok(Some(Lineage::NotSuccessor));
             };
-            if normalized_box_id(&carrier.box_id) == known_box_id
-                || carrier.creating_tx.eq_ignore_ascii_case(spent_by)
-            {
-                return Ok(Some(true));
+            let carrier_r7 = refund_height(carrier.registers.get("R7"));
+            if refund_broken(carrier_r7, after_r7) {
+                return Ok(Some(Lineage::Root));
+            }
+            if normalized_box_id(&carrier.box_id) == known_box_id {
+                return Ok(Some(Lineage::Successor));
+            }
+            if carrier.creating_tx.eq_ignore_ascii_case(spent_by) {
+                return Ok(Some(if refund_broken(known_r7, carrier_r7) {
+                    Lineage::Root
+                } else {
+                    Lineage::Successor
+                }));
             }
             if carrier.creating_tx.is_empty() {
-                return Ok(Some(false));
+                return Ok(Some(Lineage::NotSuccessor));
             }
+            after_r7 = carrier_r7;
             tx_id = carrier.creating_tx.clone();
         }
         Ok(None)
@@ -1292,7 +1517,7 @@ impl ServerState {
         let empty_tree = empty_reserve_tree_register();
         let mut tx_id = scan_box.transaction_id.clone();
         for _ in 0..LINEAGE_WALK_DEPTH {
-            let inputs = self.fetch_tx_inputs(&tx_id).await?;
+            let inputs = self.fetch_tx_inputs(&tx_id, Lane::Shared).await?;
             if inputs
                 .iter()
                 .any(|input| input.ergo_tree.eq_ignore_ascii_case(&expected))
@@ -1310,13 +1535,17 @@ impl ServerState {
             }) else {
                 return Ok(false);
             };
+            // Round 6d (P2-2): a reserve with a pending refund (R7 != 0) is only
+            // spent into a clean box by the owner's refund completion (#0 and #1
+            // keep R7, #2 needs R7 = 0, and the NFT is a singleton): the owner
+            // made this box.
+            if refund_height(carrier.registers.get("R7")) != 0 {
+                return Ok(true);
+            }
             let clean = carrier
                 .registers
                 .get("R5")
-                .is_some_and(|r5| r5.eq_ignore_ascii_case(&empty_tree))
-                && carrier.registers.get("R7").is_none_or(|r7| {
-                    r7.starts_with("05") && decode_ergo_long_register(Some(r7)) == 0
-                });
+                .is_some_and(|r5| r5.eq_ignore_ascii_case(&empty_tree));
             if !clean || carrier.creating_tx.is_empty() {
                 return Ok(false);
             }
@@ -1331,22 +1560,27 @@ impl ServerState {
     /// Admission control for a parsed reserve box (issue #19).
     ///
     /// A box is admitted only when it is
-    /// 1. the currently tracked box itself (refresh), or
+    /// 1. the currently tracked box itself (refresh), or a box removed as spent
+    ///    in the last day that a reorg brought back (restored, round 6d P2-3),
     /// 2. a C4-clean root for an (owner, denomination) with no tracked reserve,
     ///    holding a singleton reserve NFT, made by the R4 owner (its creating
     ///    transaction spends a P2PK input of the R4 key, or it descends by its
-    ///    NFT through top-ups from such a box), or
+    ///    NFT through top-ups from such a box, or from a reserve whose pending
+    ///    refund the owner completed), or
     /// 3. the successor of a tracked box of its (owner, denomination): it holds
     ///    that box's reserve NFT at `tokens(0)` with amount 1, and the same R4
-    ///    and R6 (round 6b/6c, see `is_lineage_successor`).
+    ///    and R6 (round 6b/6c, see `is_lineage_successor`). One that does so
+    ///    after the owner completed a pending refund is judged as a root.
     ///
     /// A box holding no tracked reserve's NFT while the owner has a tracked
-    /// reserve in the denomination is quarantined at once, with no walk and no
-    /// retry (round 6c, P1-2): a newcomer never displaces a tracked reserve.
-    /// Anything else is quarantined too, so a dust duplicate with the victim's
-    /// key in R4 can never turn `resolve_issuer_reserve` ambiguous and block
-    /// the issuer. A box already persisted as quarantined stays quarantined
-    /// until an operator releases it.
+    /// reserve in the denomination is quarantined at once, with no walk (round
+    /// 6c, P1-2): a newcomer never displaces a tracked reserve. Only when none of
+    /// those tracked boxes is in this cycle's scan (the owner withdrew it) is
+    /// the newcomer deferred, to be judged as a root once the spent box is
+    /// removed (round 6d). Anything else is quarantined too, so a dust duplicate
+    /// with the victim's key in R4 can never turn `resolve_issuer_reserve`
+    /// ambiguous and block the issuer. A box already persisted as quarantined
+    /// stays quarantined until an operator releases it.
     pub async fn admit_reserve_box(
         &self,
         scan_box: &ScanBox,
@@ -1359,6 +1593,27 @@ impl ServerState {
         if self.reserve_tracker.get_reserve(&box_id).is_ok() {
             self.remember_nft(&box_id, scan_box_nft(scan_box));
             return ReserveAdmission::Admitted;
+        }
+        // A tracked box a reorg brought back: it was verified when it was
+        // tracked, and a box id names one box (round 6d, P2-3). Not while a
+        // tracked box of the owner there is in the scan too (the index would be
+        // inconsistent): then the usual checks run.
+        if self.nft_cache().removed.contains_key(&box_id) {
+            let denomination = reserve_info.denomination();
+            let tracked_in_scan = self.cycle_state().scanned.as_ref().is_some_and(|scanned| {
+                self.reserve_tracker
+                    .get_reserves_by_owner(&reserve_info.owner_pubkey)
+                    .iter()
+                    .any(|r| r.denomination() == denomination && scanned.contains(&r.box_id))
+            });
+            if !tracked_in_scan {
+                self.nft_cache().removed.remove(&box_id);
+                info!(
+                    "Restoring reserve box {}: it was removed as spent and is unspent again (reorg)",
+                    box_id
+                );
+                return ReserveAdmission::Admitted;
+            }
         }
 
         // Once quarantined, always quarantined.
@@ -1394,64 +1649,45 @@ impl ServerState {
         };
 
         if tracked.is_empty() {
-            // Root candidate: cheap C4 setup checks first (they include the
-            // reserve NFT), then the node calls.
-            if let Some(violation) = Self::root_setup_violation(scan_box, reserve_info) {
-                return ReserveAdmission::Quarantined { reason: violation };
-            }
-            let Some(nft) = scan_box_nft(scan_box) else {
-                return ReserveAdmission::Quarantined {
-                    reason: format!("Reserve box {} holds no reserve NFT", box_id),
-                };
-            };
-            match self.is_singleton_nft(&nft).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return ReserveAdmission::Quarantined {
-                        reason: format!(
-                            "reserve root {} holds NFT {} whose emission is not 1: another box could hold it too (round 6c)",
-                            box_id, nft
-                        ),
-                    }
-                }
-                Err(e) => return retry("Token index check", e),
-            }
-            let proof = self
-                .has_owner_root(scan_box, &nft, &reserve_info.owner_pubkey, contract_address)
+            return self
+                .admit_root(scan_box, reserve_info, contract_address, true)
                 .await;
-            return match proof {
-                Ok(true) => ReserveAdmission::Admitted,
-                Ok(false) => ReserveAdmission::Quarantined {
-                    reason: format!(
-                        "reserve root {} for owner {} was created by a transaction spending no P2PK input of the R4 key, \
-                         and its NFT does not lead back through top-ups to a box that was; R4 is not authenticated \
-                         on-chain, so this is likely a dust-box blocking attempt (issue #19)",
-                        box_id, reserve_info.owner_pubkey
-                    ),
-                },
-                Err(e) => retry("Ownership check", e),
-            };
         }
 
         // The owner has a tracked reserve in this denomination: only the box
         // holding its NFT may continue it.
         let newcomer = |why: String| {
+            // Round 6d: the owner's tracked boxes all left the scan this cycle
+            // (spent, a withdrawal say): judge the box as a root once they are
+            // removed, instead of quarantining a new reserve for good.
+            let spent_this_cycle = self
+                .cycle_state()
+                .scanned
+                .as_ref()
+                .is_some_and(|scanned| tracked.iter().all(|r| !scanned.contains(&r.box_id)));
+            if spent_this_cycle {
+                info!(
+                    "Deferring reserve box {} of {}: it {}, and the tracked box is spent this cycle",
+                    box_id, reserve_info.owner_pubkey, why
+                );
+                return ReserveAdmission::Deferred;
+            }
             ReserveAdmission::Quarantined {
-            reason: format!(
-                "duplicate reserve box {} for owner {} in denomination {} {}; the tracked box {} keeps the reserve. \
-                 R4 is not authenticated on-chain and a top-up needs no signature, so this is likely a blocking \
-                 attempt (issue #19, round 6b/6c)",
-                box_id,
-                reserve_info.owner_pubkey,
-                denomination_id,
-                why,
-                tracked
-                    .iter()
-                    .map(|r| r.box_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
+                reason: format!(
+                    "duplicate reserve box {} for owner {} in denomination {} {}; the tracked box {} keeps the reserve. \
+                     R4 is not authenticated on-chain and a top-up needs no signature, so this is likely a blocking \
+                     attempt (issue #19, round 6b/6c)",
+                    box_id,
+                    reserve_info.owner_pubkey,
+                    denomination_id,
+                    why,
+                    tracked
+                        .iter()
+                        .map(|r| r.box_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
         };
         let Some(nft) = scan_box_nft(scan_box) else {
             return newcomer("holds no reserve NFT at tokens(0)".to_string());
@@ -1461,7 +1697,7 @@ impl ServerState {
         for reserve in &tracked {
             match self.tracked_nft(&reserve.box_id).await {
                 Ok(Some(tracked_nft)) if tracked_nft == nft => {
-                    anchor = Some(reserve.box_id.clone());
+                    anchor = Some(reserve.clone());
                     break;
                 }
                 Ok(_) => {}
@@ -1481,12 +1717,93 @@ impl ServerState {
             .is_lineage_successor(scan_box, &nft, &anchor, contract_address)
             .await
         {
-            Ok(true) => ReserveAdmission::Admitted,
-            Ok(false) => newcomer(format!(
+            Ok(Lineage::Successor) => ReserveAdmission::Admitted,
+            Ok(Lineage::NotSuccessor) => newcomer(format!(
                 "holds the reserve NFT {} but does not continue the tracked box {} through reserve boxes",
-                nft, anchor
+                nft, anchor.box_id
             )),
+            Ok(Lineage::Root) => {
+                info!(
+                    "Reserve box {} holds the NFT of tracked box {} after a completed refund: judged as a root",
+                    box_id, anchor.box_id
+                );
+                self.admit_root(scan_box, reserve_info, contract_address, false)
+                    .await
+            }
             Err(e) => retry("Lineage check", e),
+        }
+    }
+
+    /// The root rules (issue #19, rounds 6c/6d): C4-clean, a singleton reserve
+    /// NFT, made by the R4 owner. `capped`: a root candidate of an owner with no
+    /// tracked reserve, which counts against `MAX_ROOT_CHECKS_PER_CYCLE` and
+    /// is deferred past it; a box holding a tracked NFT (after a completed
+    /// refund) is not capped, and its retries keep the tracked box.
+    async fn admit_root(
+        &self,
+        scan_box: &ScanBox,
+        reserve_info: &ExtendedReserveInfo,
+        contract_address: &str,
+        capped: bool,
+    ) -> ReserveAdmission {
+        let box_id = &reserve_info.box_id;
+        // Cheap C4 setup checks first (they include the reserve NFT).
+        if let Some(violation) = Self::root_setup_violation(scan_box, reserve_info) {
+            return ReserveAdmission::Quarantined { reason: violation };
+        }
+        let Some(nft) = scan_box_nft(scan_box) else {
+            return ReserveAdmission::Quarantined {
+                reason: format!("Reserve box {} holds no reserve NFT", box_id),
+            };
+        };
+        let retry = |what: &str, e: ScannerError| {
+            warn!(
+                "{} for reserve root {} failed ({}); retrying next cycle",
+                what, box_id, e
+            );
+            if capped {
+                ReserveAdmission::Deferred
+            } else {
+                ReserveAdmission::Retry
+            }
+        };
+        if capped {
+            let cycles = self.nft_cache().cycles;
+            let mut cycle = self.cycle_state();
+            if cycle.root_checks >= MAX_ROOT_CHECKS_PER_CYCLE {
+                return ReserveAdmission::Deferred;
+            }
+            cycle.root_checks += 1;
+            drop(cycle);
+            self.nft_cache().root_checked.insert(box_id.clone(), cycles);
+        }
+        let lane = if capped { Lane::Shared } else { Lane::Tracked };
+        match self.is_singleton_nft(&nft, lane).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return ReserveAdmission::Quarantined {
+                    reason: format!(
+                        "reserve root {} holds NFT {} whose emission is not 1: another box could hold it too (round 6c)",
+                        box_id, nft
+                    ),
+                }
+            }
+            Err(e) => return retry("Token index check", e),
+        }
+        match self
+            .has_owner_root(scan_box, &nft, &reserve_info.owner_pubkey, contract_address)
+            .await
+        {
+            Ok(true) => ReserveAdmission::Admitted,
+            Ok(false) => ReserveAdmission::Quarantined {
+                reason: format!(
+                    "reserve root {} for owner {} was created by a transaction spending no P2PK input of the R4 key, \
+                     and its NFT does not lead back through top-ups to a box that was; R4 is not authenticated \
+                     on-chain, so this is likely a dust-box blocking attempt (issue #19)",
+                    box_id, reserve_info.owner_pubkey
+                ),
+            },
+            Err(e) => retry("Ownership check", e),
         }
     }
 
@@ -1557,7 +1874,84 @@ impl ServerState {
                 let denomination = reserve_info.denomination().unwrap_or(crate::DenomKey::Erg);
                 ScanBoxIngest::Pending(reserve_info.owner_pubkey.clone(), denomination)
             }
+            ReserveAdmission::Deferred => ScanBoxIngest::Deferred(reserve_info.box_id),
         }
+    }
+
+    /// Start a scan cycle (round 6d, P1): reset the per-cycle node answers and
+    /// budget, learn the NFT of every tracked reserve (from the scan, else one
+    /// `/blockchain/box/byId` on the tracked lane), and order the boxes: the
+    /// tracked ones, boxes removed lately, and boxes holding a tracked NFT
+    /// first, so no other box can use up the budget before them; then the rest,
+    /// never-checked root candidates before the least recently checked.
+    async fn begin_cycle(&self, scan_boxes: Vec<TaggedScanBox>) -> Vec<TaggedScanBox> {
+        let scanned: std::collections::HashSet<String> = scan_boxes
+            .iter()
+            .map(|tagged| normalized_box_id(&tagged.scan_box.box_id))
+            .collect();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        {
+            let mut cycle = self.cycle_state();
+            *cycle = CycleState::default();
+            cycle.scanned = Some(scanned.clone());
+        }
+        {
+            let mut cache = self.nft_cache();
+            cache.cycles += 1;
+            cache
+                .removed
+                .retain(|_, (_, removed_at)| now.saturating_sub(*removed_at) < REMEMBER_REMOVED_MS);
+            cache
+                .root_checked
+                .retain(|box_id, _| scanned.contains(box_id));
+        }
+
+        let tracked = self.reserve_tracker.get_all_reserves();
+        for reserve in &tracked {
+            if self.nft_cache().box_nft.contains_key(&reserve.box_id) {
+                continue;
+            }
+            match scan_boxes
+                .iter()
+                .find(|tagged| normalized_box_id(&tagged.scan_box.box_id) == reserve.box_id)
+            {
+                Some(tagged) => self.remember_nft(&reserve.box_id, scan_box_nft(&tagged.scan_box)),
+                None => {
+                    if let Err(e) = self.tracked_nft(&reserve.box_id).await {
+                        warn!(
+                            "Cannot read the NFT of tracked reserve {}: {}",
+                            reserve.box_id, e
+                        );
+                    }
+                }
+            }
+        }
+        let (first_ids, first_nfts, root_checked) = {
+            let cache = self.nft_cache();
+            let mut ids: std::collections::HashSet<String> =
+                tracked.iter().map(|r| r.box_id.clone()).collect();
+            ids.extend(cache.removed.keys().cloned());
+            let nfts: std::collections::HashSet<String> = tracked
+                .iter()
+                .filter_map(|r| cache.box_nft.get(&r.box_id).cloned().flatten())
+                .chain(cache.removed.values().filter_map(|(nft, _)| nft.clone()))
+                .collect();
+            (ids, nfts, cache.root_checked.clone())
+        };
+        let (mut first, mut rest): (Vec<_>, Vec<_>) = scan_boxes.into_iter().partition(|tagged| {
+            first_ids.contains(&normalized_box_id(&tagged.scan_box.box_id))
+                || scan_box_nft(&tagged.scan_box).is_some_and(|nft| first_nfts.contains(&nft))
+        });
+        rest.sort_by_key(|tagged| {
+            root_checked
+                .get(&normalized_box_id(&tagged.scan_box.box_id))
+                .map_or(0, |cycle| cycle + 1)
+        });
+        first.append(&mut rest);
+        first
     }
 
     /// Process scan boxes and update reserve tracker
@@ -1565,8 +1959,7 @@ impl ServerState {
         info!("Starting to process scan boxes...");
         let scan_boxes = self.get_scan_boxes().await?;
         info!("Retrieved {} scan boxes to process", scan_boxes.len());
-        self.lineage_requests
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let scan_boxes = self.begin_cycle(scan_boxes).await;
 
         let mut current_box_ids = Vec::new();
         // Box IDs that failed admission, normalized the same way
@@ -1598,6 +1991,9 @@ impl ServerState {
                 ScanBoxIngest::Pending(owner, denomination) => {
                     pending_lineages.push((owner, denomination));
                 }
+                ScanBoxIngest::Deferred(box_id) => {
+                    debug!("Reserve box {} deferred to the next cycle", box_id);
+                }
             }
         }
 
@@ -1617,6 +2013,7 @@ impl ServerState {
         // (the last reserve withdrawn by refund completion, say). Otherwise an
         // absent reserve is spent.
         let authoritative = !current_box_ids.is_empty();
+        let mut current_height: Option<Result<u64, ScannerError>> = None;
         if !authoritative {
             info!("Scan returned no valid box: absent reserves are removed only when the chain shows them spent");
         }
@@ -1650,8 +2047,15 @@ impl ServerState {
                 }
             }
             if !authoritative {
-                match self.fetch_indexed_box(&reserve.box_id).await {
-                    Ok(Some(chain_box)) if !chain_box.spent_tx.is_empty() => {}
+                // Round 6d (P2-3): only a spend at least SPENT_REMOVAL_DEPTH
+                // blocks deep, so a reorg does not take the reserve away.
+                let spent_at = match self.fetch_indexed_box(&reserve.box_id, Lane::Tracked).await {
+                    Ok(Some(chain_box)) if !chain_box.spent_tx.is_empty() => {
+                        match chain_box.spent_height {
+                            Some(height) => Some(height),
+                            None => self.fetch_tx_inclusion_height(&chain_box.spent_tx).await,
+                        }
+                    }
                     Ok(_) => continue,
                     Err(e) => {
                         warn!(
@@ -1660,6 +2064,22 @@ impl ServerState {
                         );
                         continue;
                     }
+                };
+                if current_height.is_none() {
+                    current_height = Some(self.fetch_current_height().await);
+                }
+                let deep = match (spent_at, current_height.as_ref()) {
+                    (Some(spent_at), Some(Ok(height))) => {
+                        height.saturating_sub(spent_at) + 1 >= SPENT_REMOVAL_DEPTH
+                    }
+                    _ => false,
+                };
+                if !deep {
+                    info!(
+                        "Keeping reserve {}: its spend (height {:?}) is not {} blocks deep yet",
+                        reserve.box_id, spent_at, SPENT_REMOVAL_DEPTH
+                    );
+                    continue;
                 }
             }
             info!(
@@ -1670,7 +2090,17 @@ impl ServerState {
             if let Err(e) = self.reserve_tracker.remove_reserve(&reserve.box_id) {
                 warn!("Failed to remove reserve {}: {}", reserve.box_id, e);
             } else {
-                self.nft_cache().box_nft.remove(&reserve.box_id);
+                // Remembered for a day (round 6d, P2-3): a reorg may bring it back.
+                let removed_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let mut cache = self.nft_cache();
+                let nft = cache.box_nft.remove(&reserve.box_id).flatten();
+                cache
+                    .removed
+                    .insert(reserve.box_id.clone(), (nft, removed_at));
+                drop(cache);
                 // Remove from database
                 if let Err(e) = self.reserve_storage.remove_reserve(&reserve.box_id) {
                     warn!(
@@ -3068,10 +3498,24 @@ mod tests {
         boxes_body: String,
         txs: std::sync::Arc<HashMap<String, String>>,
     ) -> std::net::SocketAddr {
+        spawn_counting_mock_node(boxes_body, txs).await.0
+    }
+
+    /// Requests a mock node received, by path.
+    type Hits = std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>;
+
+    /// `spawn_mock_node`, also counting the requests by path. The scan answer
+    /// is paged by the `offset` and `limit` of the query.
+    async fn spawn_counting_mock_node(
+        boxes_body: String,
+        txs: std::sync::Arc<HashMap<String, String>>,
+    ) -> (std::net::SocketAddr, Hits) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let hits = Hits::default();
+        let hits_task = hits.clone();
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = match listener.accept().await {
@@ -3080,6 +3524,7 @@ mod tests {
                 };
                 let boxes_body = boxes_body.clone();
                 let txs = txs.clone();
+                let hits = hits_task.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let n = match socket.read(&mut buf).await {
@@ -3088,7 +3533,9 @@ mod tests {
                     };
                     let request = String::from_utf8_lossy(&buf[..n]);
                     let request_line = request.lines().next().unwrap_or_default();
-                    let path = request_line.split_whitespace().nth(1).unwrap_or_default();
+                    let target = request_line.split_whitespace().nth(1).unwrap_or_default();
+                    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                    *hits.lock().unwrap().entry(path.to_string()).or_default() += 1;
                     // `txs` keys are transaction ids, or full paths for the
                     // box and token index (404 when absent).
                     let (status, body) = if let Some(body) = txs.get(path) {
@@ -3107,7 +3554,28 @@ mod tests {
                     } else if path.starts_with("/blockchain/box/byId/") {
                         ("404 Not Found", "{}".to_string())
                     } else {
-                        ("200 OK", boxes_body)
+                        let param = |name: &str| {
+                            query.split('&').find_map(|part| {
+                                part.strip_prefix(name)?
+                                    .strip_prefix('=')?
+                                    .parse::<usize>()
+                                    .ok()
+                            })
+                        };
+                        match (
+                            serde_json::from_str::<Vec<serde_json::Value>>(&boxes_body),
+                            param("offset"),
+                            param("limit"),
+                        ) {
+                            (Ok(all), Some(offset), Some(limit)) => (
+                                "200 OK",
+                                serde_json::Value::from(
+                                    all.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),
+                                )
+                                .to_string(),
+                            ),
+                            _ => ("200 OK", boxes_body),
+                        }
                     };
                     let response = format!(
                         "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -3119,7 +3587,7 @@ mod tests {
                 });
             }
         });
-        addr
+        (addr, hits)
     }
 
     fn mock_state(addr: std::net::SocketAddr) -> ServerState {
@@ -3218,9 +3686,21 @@ mod tests {
     ) -> (String, String) {
         let mut chain_box = reserve_input(box_id, &"c0".repeat(32), assets);
         chain_box["spentTransactionId"] = serde_json::json!(spent_by);
+        chain_box["spendingHeight"] = serde_json::json!(spent_by.map(|_| TEST_SPENT_AT));
         (
             format!("/blockchain/box/byId/{}", box_id),
             chain_box.to_string(),
+        )
+    }
+
+    /// The height `tracked_box_route` spends a box at.
+    const TEST_SPENT_AT: u64 = 1_000;
+
+    /// The mock node route of `/info` at `height`.
+    fn info_route(height: u64) -> (String, String) {
+        (
+            "/info".to_string(),
+            serde_json::json!({ "fullHeight": height }).to_string(),
         )
     }
 
@@ -4097,6 +4577,18 @@ mod tests {
             let routes = HashMap::from([
                 tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&top_up_tx)),
                 token_route(TEST_RESERVE_NFT, 2),
+                // No singleton: the top-up transaction is read.
+                (
+                    top_up_tx.clone(),
+                    tx_json_inputs(
+                        &top_up_tx,
+                        vec![reserve_input(
+                            &tracked_box,
+                            &"c0".repeat(32),
+                            &[(TEST_RESERVE_NFT, 1)],
+                        )],
+                    ),
+                ),
             ]);
             let genuine = scanned_box_json(
                 &topped_up,
@@ -4322,23 +4814,33 @@ mod tests {
     /// chain shows it spent, and kept when it does not.
     #[tokio::test]
     async fn test_last_reserve_spent_without_successor_is_removed() {
+        // Round 6d (P2-3): and only once the spend is SPENT_REMOVAL_DEPTH deep.
         let owner = &VALID_PREFIXED_PUBKEY[2..];
         let tracked_box = "11".repeat(32);
-        for spent in [true, false] {
+        let deep_at = TEST_SPENT_AT + SPENT_REMOVAL_DEPTH - 1;
+        for (spent, height, removed) in [
+            (false, deep_at + 100, false),
+            (true, deep_at - 1, false),
+            (true, deep_at, true),
+        ] {
             let spent_by = "cc".repeat(32);
-            let routes = HashMap::from([tracked_box_route(
-                &tracked_box,
-                &[(TEST_RESERVE_NFT, 1)],
-                spent.then_some(spent_by.as_str()),
-            )]);
+            let routes = HashMap::from([
+                tracked_box_route(
+                    &tracked_box,
+                    &[(TEST_RESERVE_NFT, 1)],
+                    spent.then_some(spent_by.as_str()),
+                ),
+                info_route(height),
+            ]);
             let state =
                 mock_state(spawn_mock_node("[]".to_string(), std::sync::Arc::new(routes)).await);
             insert_tracked_reserve(&state, &tracked_box, owner);
             state.process_scan_boxes().await.unwrap();
+            let case = format!("spent {spent}, height {height}");
             assert_eq!(
                 state.reserve_tracker.get_reserve(&tracked_box).is_ok(),
-                !spent,
-                "spent {spent}"
+                !removed,
+                "{case}"
             );
             assert_eq!(
                 state
@@ -4346,7 +4848,8 @@ mod tests {
                     .get_reserve(&tracked_box)
                     .unwrap()
                     .is_some(),
-                !spent
+                !removed,
+                "{case}"
             );
         }
     }
@@ -4366,5 +4869,408 @@ mod tests {
             .await
             .expect("the scanner stops at its wait instead of sleeping on");
         assert!(matches!(result, Ok(Ok(()))), "{result:?}");
+    }
+
+    /// A valid compressed public key (hex) for owner number `i`.
+    fn test_owner_key(i: usize) -> String {
+        let secp = secp256k1::Secp256k1::new();
+        let mut secret = [0u8; 32];
+        secret[24..].copy_from_slice(&(i as u64 + 1_000).to_be_bytes());
+        let secret = secp256k1::SecretKey::from_slice(&secret).unwrap();
+        hex::encode(secp256k1::PublicKey::from_secret_key(&secp, &secret).serialize())
+    }
+
+    /// R7 = 1000 (a pending refund), as a Long constant.
+    const R7_REFUND_1000: &str = "05d00f";
+
+    /// Round 6d (P1): one transaction over the 2 MiB body cap spends the
+    /// tracked box T into its successor S and 512 junk reserve boxes, each with
+    /// its own singleton NFT and another R4, all listed before S. S is followed
+    /// and T removed; no junk box is tracked or quarantined; the transaction is
+    /// read once per cycle; the root checks stop at the cap, and the next cycle
+    /// checks the junk boxes not checked yet.
+    #[tokio::test]
+    async fn test_junk_roots_never_starve_the_successor() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let successor = "55".repeat(32);
+        let fat_tx = "fa".repeat(32);
+        let mut scanned: Vec<serde_json::Value> = (0..512)
+            .map(|i| {
+                let nft = format!("{:064x}", 0x7000 + i);
+                let mut junk = scanned_box_json(
+                    &format!("{:064x}", 0x9000 + i),
+                    &fat_tx,
+                    1_000_000_000,
+                    &[(nft.as_str(), 1)],
+                    None,
+                );
+                junk["additionalRegisters"]["R4"] =
+                    serde_json::Value::from(format!("07{}", test_owner_key(i)));
+                junk
+            })
+            .collect();
+        scanned.push(scanned_box_json(
+            &successor,
+            &fat_tx,
+            1_100_000_000,
+            &[(TEST_RESERVE_NFT, 1)],
+            None,
+        ));
+        let routes = HashMap::from([
+            (fat_tx.clone(), fat_tx_body()),
+            tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&fat_tx)),
+        ]);
+        let (addr, hits) = spawn_counting_mock_node(
+            serde_json::Value::from(scanned).to_string(),
+            std::sync::Arc::new(routes),
+        )
+        .await;
+        let state = mock_state(addr);
+        insert_tracked_reserve(&state, &tracked_box, owner);
+        let fat_path = format!("/blockchain/transaction/byId/{fat_tx}");
+
+        for cycle in 1..=2 {
+            state.process_scan_boxes().await.unwrap();
+            assert!(
+                state.reserve_tracker.get_reserve(&successor).is_ok(),
+                "cycle {cycle}"
+            );
+            assert!(state.reserve_tracker.get_reserve(&tracked_box).is_err());
+            assert_eq!(state.reserve_tracker.get_all_reserves().len(), 1);
+            assert!(state
+                .reserve_storage
+                .get_all_quarantined()
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                hits.lock().unwrap()[&fat_path],
+                cycle,
+                "read once per cycle"
+            );
+            assert_eq!(
+                state.nft_cache().root_checked.len(),
+                cycle * MAX_ROOT_CHECKS_PER_CYCLE,
+                "never-checked roots first"
+            );
+            assert!(state.cycle_state().requests <= LINEAGE_REQUESTS_PER_CYCLE);
+        }
+    }
+
+    /// Round 6d (P2-1): a reorg dropped the transaction that made the tracked
+    /// successor S (the index no longer knows S, or still shows it unspent),
+    /// and T was spent again into S2. A box holding the singleton NFT follows
+    /// S, and S is removed; with a NFT that is not a singleton the check stays
+    /// pending and S is kept.
+    #[tokio::test]
+    async fn test_successor_dropped_by_a_reorg_is_replaced_by_the_singleton_holder() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let phantom = "51".repeat(32);
+        let respent = "52".repeat(32);
+        let respend_tx = "e2".repeat(32);
+        for (index_shows, singleton) in [
+            ("unknown", true),
+            ("unspent", true),
+            ("unknown", false),
+            ("unspent", false),
+        ] {
+            let mut routes =
+                HashMap::from([token_route(TEST_RESERVE_NFT, if singleton { 1 } else { 2 })]);
+            if index_shows == "unspent" {
+                routes.extend([tracked_box_route(&phantom, &[(TEST_RESERVE_NFT, 1)], None)]);
+            }
+            let scanned = serde_json::json!([scanned_box_json(
+                &respent,
+                &respend_tx,
+                1_000_000_000,
+                &[(TEST_RESERVE_NFT, 1)],
+                None
+            )]);
+            let state =
+                mock_state(spawn_mock_node(scanned.to_string(), std::sync::Arc::new(routes)).await);
+            insert_tracked_reserve(&state, &phantom, owner);
+            state.remember_nft(&phantom, Some(TEST_RESERVE_NFT.to_string()));
+            state.process_scan_boxes().await.unwrap();
+            let case = format!("index shows S {index_shows}, singleton {singleton}");
+            assert_eq!(
+                state.reserve_tracker.get_reserve(&respent).is_ok(),
+                singleton,
+                "{case}"
+            );
+            assert_eq!(
+                state.reserve_tracker.get_reserve(&phantom).is_ok(),
+                !singleton,
+                "{case}"
+            );
+            assert!(
+                state
+                    .reserve_storage
+                    .get_all_quarantined()
+                    .unwrap()
+                    .is_empty(),
+                "{case}"
+            );
+        }
+    }
+
+    /// Round 6d (P2-2): the tracked box T has a pending refund (R7 = 1000).
+    /// The owner completes it into a box R holding the same NFT with R7 = 0,
+    /// directly or after a top-up. R is judged as a root: with R5 already
+    /// filled it is quarantined (C4); a clean R is admitted, the refund
+    /// completion being the owner's.
+    #[tokio::test]
+    async fn test_refund_completion_with_the_same_nft_is_judged_as_a_root() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let topped_up = "12".repeat(32);
+        let recreated = "13".repeat(32);
+        let spend_tx = "e1".repeat(32);
+        let complete_tx = "e3".repeat(32);
+        let pending_refund = |box_id: &str, creating_tx: &str| {
+            let mut input = reserve_input(box_id, creating_tx, &[(TEST_RESERVE_NFT, 1)]);
+            input["additionalRegisters"]["R7"] = serde_json::Value::from(R7_REFUND_1000);
+            input
+        };
+        for (after_top_up, prefilled_r5) in
+            [(false, true), (false, false), (true, true), (true, false)]
+        {
+            let (last, last_tx) = if after_top_up {
+                (pending_refund(&topped_up, &spend_tx), complete_tx.clone())
+            } else {
+                (pending_refund(&tracked_box, "c0c0"), spend_tx.clone())
+            };
+            let routes = HashMap::from([
+                tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&spend_tx)),
+                (last_tx.clone(), tx_json_inputs(&last_tx, vec![last])),
+            ]);
+            let mut box_r = scanned_box_json(
+                &recreated,
+                &last_tx,
+                1_000_000_000,
+                &[(TEST_RESERVE_NFT, 1)],
+                Some("0500"),
+            );
+            if prefilled_r5 {
+                box_r["additionalRegisters"]["R5"] =
+                    serde_json::Value::from(format!("64{}032000", "77".repeat(33)));
+            }
+            let state = mock_state(
+                spawn_mock_node(
+                    serde_json::json!([box_r]).to_string(),
+                    std::sync::Arc::new(routes),
+                )
+                .await,
+            );
+            insert_tracked_reserve(&state, &tracked_box, owner);
+            let mut info = state.reserve_tracker.get_reserve(&tracked_box).unwrap();
+            info.base_info.refund_initiation_height = 1000;
+            state.reserve_tracker.update_reserve(info).unwrap();
+            state.process_scan_boxes().await.unwrap();
+            let case = format!("after a top-up {after_top_up}, R5 filled {prefilled_r5}");
+            assert_eq!(
+                state.reserve_tracker.get_reserve(&recreated).is_ok(),
+                !prefilled_r5,
+                "{case}"
+            );
+            let quarantined = state.reserve_storage.get_quarantined(&recreated).unwrap();
+            assert_eq!(quarantined.is_some(), prefilled_r5, "{case}");
+            if let Some(record) = quarantined {
+                assert!(
+                    record.reason.contains("non-empty AVL tree"),
+                    "{case}: {}",
+                    record.reason
+                );
+            }
+        }
+    }
+
+    /// Round 6d (P2-3): the successor S of T was tracked and T removed; a reorg
+    /// drops S, and T is unspent again. T is restored as the tracked box (its
+    /// NFT is not a singleton, so no lineage check could take it back), and S
+    /// is removed.
+    #[tokio::test]
+    async fn test_a_removed_box_a_reorg_brings_back_is_restored() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let successor = "55".repeat(32);
+        let spend_tx = "e1".repeat(32);
+        let routes = HashMap::from([
+            token_route(TEST_RESERVE_NFT, 2),
+            (
+                spend_tx.clone(),
+                tx_json_inputs(
+                    &spend_tx,
+                    vec![reserve_input(
+                        &tracked_box,
+                        "c0c0",
+                        &[(TEST_RESERVE_NFT, 1)],
+                    )],
+                ),
+            ),
+            tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&spend_tx)),
+        ]);
+        let before = serde_json::json!([scanned_box_json(
+            &successor,
+            &spend_tx,
+            1_100_000_000,
+            &[(TEST_RESERVE_NFT, 1)],
+            None
+        )]);
+        let after = serde_json::json!([scanned_box_json(
+            &tracked_box,
+            "c0c0",
+            1_000_000_000,
+            &[(TEST_RESERVE_NFT, 1)],
+            None
+        )]);
+        let routes = std::sync::Arc::new(routes);
+        let state = mock_state(spawn_mock_node(before.to_string(), routes.clone()).await);
+        insert_tracked_reserve(&state, &tracked_box, owner);
+        state.process_scan_boxes().await.unwrap();
+        assert!(state.reserve_tracker.get_reserve(&successor).is_ok());
+        assert!(state.reserve_tracker.get_reserve(&tracked_box).is_err());
+
+        // The reorg: the scan shows T again, S is gone.
+        let mut config = state.config.clone();
+        config.node_url = format!(
+            "http://{}",
+            spawn_mock_node(after.to_string(), routes).await
+        );
+        let state = ServerState { config, ..state };
+        state.process_scan_boxes().await.unwrap();
+        assert!(state.reserve_tracker.get_reserve(&tracked_box).is_ok());
+        assert!(state
+            .reserve_storage
+            .get_reserve(&tracked_box)
+            .unwrap()
+            .is_some());
+        assert!(state.reserve_tracker.get_reserve(&successor).is_err());
+        assert!(state
+            .reserve_storage
+            .get_all_quarantined()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Round 6d (LOW): with a NFT that is not a singleton the direct-spend
+    /// shortcut is not taken: a box made by the transaction that spent T is
+    /// followed only when that transaction is read and spends T; when it
+    /// cannot be read the check stays pending and T is kept.
+    #[tokio::test]
+    async fn test_shortcut_only_for_a_singleton_nft() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let candidate = "55".repeat(32);
+        let spend_tx = "e1".repeat(32);
+        for (singleton, tx_readable, followed) in [
+            (true, false, true),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let mut routes = HashMap::from([
+                token_route(TEST_RESERVE_NFT, if singleton { 1 } else { 2 }),
+                tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&spend_tx)),
+            ]);
+            if tx_readable {
+                routes.insert(
+                    spend_tx.clone(),
+                    tx_json_inputs(
+                        &spend_tx,
+                        vec![reserve_input(
+                            &tracked_box,
+                            "c0c0",
+                            &[(TEST_RESERVE_NFT, 1)],
+                        )],
+                    ),
+                );
+            }
+            let scanned = serde_json::json!([scanned_box_json(
+                &candidate,
+                &spend_tx,
+                1_100_000_000,
+                &[(TEST_RESERVE_NFT, 1)],
+                None
+            )]);
+            let (addr, hits) =
+                spawn_counting_mock_node(scanned.to_string(), std::sync::Arc::new(routes)).await;
+            let state = mock_state(addr);
+            insert_tracked_reserve(&state, &tracked_box, owner);
+            state.process_scan_boxes().await.unwrap();
+            let case = format!("singleton {singleton}, transaction readable {tx_readable}");
+            assert_eq!(
+                state.reserve_tracker.get_reserve(&candidate).is_ok(),
+                followed,
+                "{case}"
+            );
+            assert_eq!(
+                state.reserve_tracker.get_reserve(&tracked_box).is_ok(),
+                !followed,
+                "{case}"
+            );
+            let reads = hits
+                .lock()
+                .unwrap()
+                .get(&format!("/blockchain/transaction/byId/{spend_tx}"))
+                .copied()
+                .unwrap_or(0);
+            assert_eq!(reads, usize::from(!singleton), "{case}");
+        }
+    }
+
+    /// Round 6d (LOW): the owner withdrew the tracked reserve T and made a new
+    /// reserve R2 (another NFT) in the same scan window. R2 is not quarantined
+    /// for good next to a spent T: it waits, T is removed once its spend is
+    /// deep enough, and R2 is then admitted as a root.
+    #[tokio::test]
+    async fn test_new_reserve_in_the_window_of_a_withdrawal_waits_for_the_root_check() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let new_box = "66".repeat(32);
+        let withdraw_tx = "e1".repeat(32);
+        let create_tx = "e6".repeat(32);
+        let new_nft = "67".repeat(32);
+        let routes = HashMap::from([
+            tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&withdraw_tx)),
+            info_route(TEST_SPENT_AT + 50),
+            (
+                create_tx.clone(),
+                tx_json_inputs(
+                    &create_tx,
+                    vec![plain_input(
+                        &"68".repeat(32),
+                        "owner_wallet",
+                        "c1c1",
+                        &p2pk_ergo_tree(owner),
+                    )],
+                ),
+            ),
+        ]);
+        let scanned = serde_json::json!([scanned_box_json(
+            &new_box,
+            &create_tx,
+            1_000_000_000,
+            &[(new_nft.as_str(), 1)],
+            None
+        )]);
+        let state =
+            mock_state(spawn_mock_node(scanned.to_string(), std::sync::Arc::new(routes)).await);
+        insert_tracked_reserve(&state, &tracked_box, owner);
+
+        state.process_scan_boxes().await.unwrap();
+        assert!(state
+            .reserve_storage
+            .get_quarantined(&new_box)
+            .unwrap()
+            .is_none());
+        assert!(state.reserve_tracker.get_reserve(&tracked_box).is_err());
+        assert!(state.reserve_tracker.get_reserve(&new_box).is_err());
+
+        state.process_scan_boxes().await.unwrap();
+        assert!(state.reserve_tracker.get_reserve(&new_box).is_ok());
+        assert!(state
+            .reserve_storage
+            .get_all_quarantined()
+            .unwrap()
+            .is_empty());
     }
 }
