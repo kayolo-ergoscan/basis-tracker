@@ -134,6 +134,9 @@ pub struct TrackerStorage {
     /// The operator's reserve tree repairs, oldest first (round 6, risk 1; see
     /// [`ReserveTreeRepairRecord`]).
     tree_repairs: fjall::Partition,
+    /// Journal entries an operator dropped (`POST /redemption/journal/drop`), by transaction id
+    /// (round 6, review P2-1; see [`DroppedRedemption`]).
+    redemption_drops: fjall::Partition,
     /// Serializes the journal writes, so a write-back of an entry read earlier
     /// ([`Self::update_journaled_redemption`]) never brings back an entry removed meanwhile
     /// (round 5b, F8). Shared by the clones of this storage.
@@ -149,6 +152,22 @@ pub const REDEMPTION_JOURNAL_PARTITION: &str = "redemption_journal";
 /// 6, risk 1). It is created on first open; a data dir without it opens unchanged, and an older
 /// binary leaves it alone.
 pub const RESERVE_TREE_REPAIRS_PARTITION: &str = "reserve_tree_repairs";
+
+/// The partition of [`TrackerStorage`] that remembers the journal entries an operator dropped
+/// (round 6, review P2-1). It is created on first open; a data dir without it opens unchanged,
+/// and an older binary leaves it alone.
+pub const REDEMPTION_DROPS_PARTITION: &str = "redemption_drops";
+
+/// A journal entry an operator dropped (`POST /redemption/journal/drop`), kept under its
+/// transaction id so the reserve reconciler never journals that transaction again when it finds
+/// it on chain (round 6, review P2-1): the operator decided about it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DroppedRedemption {
+    /// Unix milliseconds of the drop.
+    pub dropped_at_ms: u64,
+    /// The entry as it was dropped.
+    pub entry: JournaledRedemption,
+}
 
 /// One reserve tree repair (`POST /redemption/tree/repair`, round 6, risk 1), kept as the record
 /// of what an operator changed: the edge, the reserve box whose R5 it was checked against, the
@@ -1654,13 +1673,55 @@ impl TrackerStorage {
                 ))
             })?;
 
+        let redemption_drops = keyspace
+            .open_partition(REDEMPTION_DROPS_PARTITION, PartitionCreateOptions::default())
+            .map_err(|e| {
+                NoteError::StorageError(format!(
+                    "Failed to open the redemption drops partition: {}",
+                    e
+                ))
+            })?;
+
         Ok(Self {
             keyspace,
             partition,
             redemption_journal,
             tree_repairs,
+            redemption_drops,
             journal_writes: Default::default(),
         })
+    }
+
+    /// Remember that an operator dropped `drop.entry` (round 6, review P2-1), synced to disk.
+    pub fn record_dropped_redemption(&self, drop: &DroppedRedemption) -> Result<(), NoteError> {
+        let key = journal_key(&drop.entry.tx_id)?;
+        let value = serde_json::to_vec(drop).map_err(|e| {
+            NoteError::StorageError(format!("Failed to serialize a dropped redemption: {}", e))
+        })?;
+        self.redemption_drops
+            .insert(key.as_bytes(), value)
+            .map_err(|e| {
+                NoteError::StorageError(format!("Failed to record a dropped redemption: {}", e))
+            })?;
+        self.persist_journal()
+    }
+
+    /// The drop of `tx_id`, if an operator dropped it (`None` too for an id that is no
+    /// transaction id).
+    pub fn dropped_redemption(&self, tx_id: &str) -> Result<Option<DroppedRedemption>, NoteError> {
+        let Ok(key) = journal_key(tx_id) else {
+            return Ok(None);
+        };
+        match self.redemption_drops.get(key.as_bytes()) {
+            Ok(Some(value)) => serde_json::from_slice(&value).map(Some).map_err(|e| {
+                NoteError::StorageError(format!("Failed to read dropped redemption {}: {}", key, e))
+            }),
+            Ok(None) => Ok(None),
+            Err(e) => Err(NoteError::StorageError(format!(
+                "Failed to read the redemption drops: {}",
+                e
+            ))),
+        }
     }
 
     /// Record a reserve tree repair (round 6, risk 1) and sync it to disk: the record of an
@@ -2226,6 +2287,42 @@ mod redemption_journal_tests {
         assert_eq!(read[1].next_check_at_ms, 0);
         // ...and without the round-6 field.
         assert!(!read[1].detected_on_chain);
+    }
+
+    /// Round 6 (review P2-1): dropped entries are remembered by transaction id (any case), survive
+    /// a reopen, and a dir written before opens with none.
+    #[test]
+    fn dropped_redemptions_are_remembered_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let keyspace = Config::new(dir.path()).open().unwrap();
+            let partition = keyspace
+                .open_partition("tracker_metadata", PartitionCreateOptions::default())
+                .unwrap();
+            partition.insert(b"some-box", b"{}").unwrap();
+            keyspace.persist(fjall::PersistMode::SyncAll).unwrap();
+        }
+        let storage = TrackerStorage::open(dir.path()).unwrap();
+        let tx = "ab".repeat(32);
+        assert_eq!(storage.dropped_redemption(&tx).unwrap(), None);
+        let dropped = DroppedRedemption {
+            dropped_at_ms: 7,
+            entry: entry(&tx),
+        };
+        storage.record_dropped_redemption(&dropped).unwrap();
+        drop(storage);
+        let storage = TrackerStorage::open(dir.path()).unwrap();
+        assert_eq!(
+            storage.dropped_redemption(&tx.to_ascii_uppercase()).unwrap(),
+            Some(dropped)
+        );
+        assert_eq!(storage.dropped_redemption("x").unwrap(), None);
+        assert!(storage
+            .record_dropped_redemption(&DroppedRedemption {
+                dropped_at_ms: 1,
+                entry: entry("short"),
+            })
+            .is_err());
     }
 
     /// Round 6 (risk 1): a tracker_boxes dir written before round 6 opens with no tree repairs;

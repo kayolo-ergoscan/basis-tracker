@@ -779,6 +779,19 @@ pub async fn drop_journal_entry(
         Ok(entry) => entry,
         Err(answer) => return answer,
     };
+    // Round 6 (review P2-1): remembered first, so the reserve reconciler never journals this
+    // transaction again when it finds it on chain.
+    let dropped = basis_store::persistence::DroppedRedemption {
+        dropped_at_ms: unix_ms(),
+        entry: entry.clone(),
+    };
+    if let Err(e) = state.tracker_storage.record_dropped_redemption(&dropped) {
+        error!("Cannot record the drop of redemption {}: {:?}", entry.tx_id, e);
+        return journal_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "the tracker cannot write its redemption journal",
+        );
+    }
     if let Err(e) = state.tracker_storage.remove_journaled_redemption(&entry.tx_id) {
         error!("Cannot remove journaled redemption {}: {:?}", entry.tx_id, e);
         return journal_error(
@@ -788,8 +801,9 @@ pub async fn drop_journal_entry(
     }
     let shared = state.shared_tracker_state.lock().await.clone();
     shared.forget_submitted_redemptions(std::slice::from_ref(&entry.tx_id));
+    shared.forget_release_requests(std::slice::from_ref(&entry.tx_id));
     warn!(
-        "Operator dropped journaled redemption {} ({} of {} -> {} in {}, cumulative {}{}): nothing was applied. If it is mined after all, the tracker's reserve tree is out of step with the chain.",
+        "Operator dropped journaled redemption {} ({} of {} -> {} in {}, cumulative {}{}): nothing was applied, and the reserve reconciler will not journal it again. If it is mined after all, the tracker's reserve tree is out of step with the chain (POST /redemption/tree/repair).",
         entry.tx_id,
         entry.redeemed_amount,
         entry.issuer_pubkey,
@@ -1104,6 +1118,18 @@ mod tests {
                     } => {
                         let _ = response_tx
                             .send(manager.tracker.reserve_state_digest(&issuer_pubkey, &denomination));
+                    }
+                    TrackerCommand::GetNoteByIssuerAndRecipient {
+                        issuer_pubkey,
+                        recipient_pubkey,
+                        denomination,
+                        response_tx,
+                    } => {
+                        let _ = response_tx.send(manager.tracker.get_note_optional(
+                            &issuer_pubkey,
+                            &recipient_pubkey,
+                            &denomination,
+                        ));
                     }
                     TrackerCommand::GetReserveLookupProof {
                         issuer_pubkey,
@@ -1931,6 +1957,87 @@ mod tests {
             let requests = fx.requests();
             assert_eq!(fx.reconcile(&reserves, &mut fresh).await, ReconcileOutcome::default());
             assert_eq!(fx.requests(), requests);
+        }
+
+        /// Review P2-1: a redemption the confirmer could not apply is not journaled (it would
+        /// keep its reserve answering 409 and fail at every check): one of a note the tracker
+        /// does not hold, and one whose cumulative amount exceeds the note's total. Both are
+        /// reported once.
+        #[tokio::test]
+        async fn a_redemption_that_could_not_be_applied_is_not_journaled() {
+            let fx = fixture(false).await;
+            let empty = fx.tracker_reserve_digest().await;
+            let origin = fx.reserve_box(&box_id(1), &tx_id(0), VALUE, &empty);
+            fx.redeem_out_of_band(&tx_id(1), &"b1".repeat(32), &origin, &box_id(2), 300, BUILT_AT, &fx.built_r5, false);
+            let reserves = fx.reserves(&box_id(2));
+            let mut cache = ReconcileCache::default();
+            let outcome = fx.reconcile(&reserves, &mut cache).await;
+            assert_eq!(outcome.unexplained, vec![box_id(2)], "no note");
+            assert!(fx.journaled().is_empty());
+
+            let fx = fixture(true).await;
+            let over = fx.digest_with(BUILT_AT, 1_100).await;
+            let origin = fx.reserve_box(&box_id(1), &tx_id(0), VALUE, &empty);
+            fx.redeem_out_of_band(&tx_id(1), &"b1".repeat(32), &origin, &box_id(2), 1_100, BUILT_AT, &over, false);
+            let reserves = fx.reserves(&box_id(2));
+            let outcome = fx.reconcile(&reserves, &mut ReconcileCache::default()).await;
+            assert_eq!(outcome.unexplained, vec![box_id(2)], "above the note's total");
+            assert!(fx.journaled().is_empty());
+        }
+
+        /// Review P2-1: a detected redemption an operator dropped is never journaled again.
+        #[tokio::test]
+        async fn a_redemption_an_operator_dropped_is_not_journaled_again() {
+            let fx = fixture(true).await;
+            let empty = fx.tracker_reserve_digest().await;
+            let origin = fx.reserve_box(&box_id(1), &tx_id(0), VALUE, &empty);
+            fx.redeem_out_of_band(&tx_id(1), &"b1".repeat(32), &origin, &box_id(2), 300, BUILT_AT, &fx.built_r5, false);
+            let reserves = fx.reserves(&box_id(2));
+            assert_eq!(
+                fx.reconcile(&reserves, &mut ReconcileCache::default()).await.journaled,
+                vec![tx_id(1)]
+            );
+            // What POST /redemption/journal/drop does to the journal.
+            let entry = fx.storage.journaled_redemption(&tx_id(1)).unwrap().unwrap();
+            fx.storage
+                .record_dropped_redemption(&basis_store::persistence::DroppedRedemption {
+                    dropped_at_ms: 1,
+                    entry,
+                })
+                .unwrap();
+            fx.storage.remove_journaled_redemption(&tx_id(1)).unwrap();
+            let outcome = fx.reconcile(&reserves, &mut ReconcileCache::default()).await;
+            assert_eq!(outcome.unexplained, vec![box_id(2)]);
+            assert!(outcome.journaled.is_empty());
+            assert!(fx.journaled().is_empty());
+        }
+
+        /// Review LOW-2: an indexed input with an empty extension falls back to the block's
+        /// transactions; when the block gives none either, nothing is reported or remembered,
+        /// and the next pass asks again.
+        #[tokio::test]
+        async fn an_empty_indexed_extension_falls_back_to_the_block() {
+            let fx = fixture(true).await;
+            let empty = fx.tracker_reserve_digest().await;
+            let origin = fx.reserve_box(&box_id(1), &tx_id(0), VALUE, &empty);
+            fx.redeem_out_of_band(&tx_id(1), &"b1".repeat(32), &origin, &box_id(2), 300, BUILT_AT, &fx.built_r5, false);
+            fx.node.lock().unwrap().indexed_txs.get_mut(&tx_id(1)).unwrap()["inputs"][0]
+                ["spendingProof"]["extension"] = serde_json::json!({});
+            let block_extension = fx.node.lock().unwrap().blocks[&"b1".repeat(32)]["transactions"][0]
+                ["inputs"][0]["spendingProof"]["extension"]
+                .clone();
+            fx.node.lock().unwrap().blocks.get_mut(&"b1".repeat(32)).unwrap()["transactions"][0]
+                ["inputs"][0]["spendingProof"]["extension"] = serde_json::json!({});
+            let reserves = fx.reserves(&box_id(2));
+            let mut cache = ReconcileCache::default();
+            assert_eq!(fx.reconcile(&reserves, &mut cache).await, ReconcileOutcome::default());
+            let requests = fx.requests();
+            assert_eq!(fx.reconcile(&reserves, &mut cache).await, ReconcileOutcome::default());
+            assert!(fx.requests() > requests, "not remembered: asked again");
+
+            fx.node.lock().unwrap().blocks.get_mut(&"b1".repeat(32)).unwrap()["transactions"][0]
+                ["inputs"][0]["spendingProof"]["extension"] = block_extension;
+            assert_eq!(fx.reconcile(&reserves, &mut cache).await.journaled, vec![tx_id(1)]);
         }
     }
 

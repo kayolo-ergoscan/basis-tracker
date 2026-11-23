@@ -18,11 +18,15 @@
 //! transaction's reserve output. Then it is journaled like the tracker's own redemption
 //! (`detected_on_chain`), and the confirmer applies it once it is `min_depth` deep, compared with
 //! that R5. Several redemptions in a row are taken one per pass, oldest first. A step that cannot
-//! be reproduced is logged once (per reserve box and tracker digest) for an operator
-//! (`POST /redemption/tree/repair`); nothing is changed.
+//! be reproduced, that the confirmer could not apply (no note, the note's redeemed amount is not
+//! the tree's, or the cumulative amount exceeds the note's total: review P2-1), or whose
+//! transaction an operator dropped from the journal (`POST /redemption/journal/drop`), is logged
+//! once (per reserve box and tracker digest) for an operator (`POST /redemption/tree/repair`);
+//! nothing is changed.
 //!
-//! The extension is read from the transaction's indexed input (`spendingProof`), or else from the
-//! block's transactions (`/blocks/{blockId}/transactions`). Unchanged reserves cost no node
+//! The extension is read from the transaction's indexed input (`spendingProof`) when it holds
+//! variable 0, or else from the block's transactions (`/blocks/{blockId}/transactions`); with no
+//! non-empty extension from either, the reserve is compared again at the next pass. Unchanged reserves cost no node
 //! request: a reserve whose box and tracker digest were already compared is skipped.
 
 use std::collections::HashMap;
@@ -241,6 +245,18 @@ async fn reproduce(
         .ok_or("the indexed transaction has no id")?
         .to_ascii_lowercase();
     let unexplained = |why: String| Ok(Step::Unexplained(format!("transaction {tx_id} {why}")));
+    // Review P2-1: an operator dropped it from the journal; journaling it again would bring
+    // back what they removed.
+    match storage.dropped_redemption(&tx_id) {
+        Ok(None) => {}
+        Ok(Some(dropped)) => {
+            return unexplained(format!(
+                "was dropped from the journal by an operator (at {} ms) and is not journaled again",
+                dropped.dropped_at_ms
+            ))
+        }
+        Err(e) => return Err(format!("the redemption drops cannot be read: {e:?}")),
+    }
     let Some(extension) = input_extension(config, tx, &tx_id, input_index).await? else {
         return Err(format!(
             "the context extension of transaction {tx_id} cannot be read from the node"
@@ -318,6 +334,32 @@ async fn reproduce(
             chain,
             successor_id
         ));
+    }
+    // Review P2-1: journaled, it must apply as the confirmer applies it (the note exists, its
+    // redeemed amount is the tree's, the cumulative amount within its total); one that cannot
+    // would answer 409 for its reserve at every build and fail at every check.
+    match tracker_note(cmd_tx, issuer, &recipient, denomination).await? {
+        None => {
+            return unexplained(format!(
+                "redeems a note of {} -> {} in {} that the tracker does not hold",
+                hex::encode(issuer),
+                hex::encode(recipient),
+                denomination.denomination_id()
+            ))
+        }
+        Some(note) if note.amount_redeemed != stored => {
+            return unexplained(format!(
+                "cannot be applied: the note's redeemed amount is {}, the reserve tree's {}",
+                note.amount_redeemed, stored
+            ))
+        }
+        Some(note) if new_already_redeemed > note.amount_collected => {
+            return unexplained(format!(
+                "cannot be applied: cumulative {} exceeds the note's total {}",
+                new_already_redeemed, note.amount_collected
+            ))
+        }
+        Some(_) => {}
     }
 
     let entry = JournaledRedemption {
@@ -407,7 +449,9 @@ async fn reserve_input(
 }
 
 /// The context extension of input `input_index` of `tx`: from the indexed input's
-/// `spendingProof`, or else from the block's transactions.
+/// `spendingProof` when it holds variable 0, or else from the block's transactions (review
+/// LOW-2: an index may give an empty extension). `None` when neither gives a non-empty one, so
+/// the reserve is compared again at the next pass rather than reported.
 async fn input_extension(
     config: &TrackerBoxUpdateConfig,
     tx: &Value,
@@ -423,23 +467,30 @@ async fn input_extension(
             .and_then(Value::as_object)
             .cloned()
     };
-    if let Some(extension) = extension_of(tx) {
-        return Ok(Some(extension));
+    let indexed = extension_of(tx);
+    if let Some(extension) = indexed.as_ref().filter(|e| e.contains_key("0")) {
+        return Ok(Some(extension.clone()));
     }
-    let Some(block_id) = str_field(tx, "blockId") else {
-        return Ok(None);
+    let from_block = match str_field(tx, "blockId") {
+        Some(block_id) => node_get(config, &format!("/blocks/{block_id}/transactions"))
+            .await?
+            .and_then(|block| {
+                block
+                    .get("transactions")
+                    .and_then(Value::as_array)
+                    .and_then(|txs| {
+                        txs.iter().find(|t| {
+                            str_field(t, "id").is_some_and(|id| id.eq_ignore_ascii_case(tx_id))
+                        })
+                    })
+                    .and_then(extension_of)
+            }),
+        None => None,
     };
-    let Some(block) = node_get(config, &format!("/blocks/{block_id}/transactions")).await? else {
-        return Ok(None);
-    };
-    Ok(block
-        .get("transactions")
-        .and_then(Value::as_array)
-        .and_then(|txs| {
-            txs.iter()
-                .find(|t| str_field(t, "id").is_some_and(|id| id.eq_ignore_ascii_case(tx_id)))
-        })
-        .and_then(extension_of))
+    Ok([from_block, indexed]
+        .into_iter()
+        .flatten()
+        .find(|extension| !extension.is_empty()))
 }
 
 /// The amount a reserve box holds in `denomination`: its value, or its reserve token amount.
@@ -548,6 +599,29 @@ async fn tracker_reserve_digest(
         .await
         .ok()?;
     response_rx.await.ok().map(hex::encode)
+}
+
+/// The note the tracker holds for the edge, if it holds one.
+async fn tracker_note(
+    cmd_tx: &tokio::sync::mpsc::Sender<TrackerCommand>,
+    issuer: &PubKey,
+    recipient: &PubKey,
+    denomination: &DenomKey,
+) -> Result<Option<basis_store::IouNote>, String> {
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(TrackerCommand::GetNoteByIssuerAndRecipient {
+            issuer_pubkey: *issuer,
+            recipient_pubkey: *recipient,
+            denomination: *denomination,
+            response_tx,
+        })
+        .await
+        .map_err(|_| "the tracker thread is unavailable".to_string())?;
+    response_rx
+        .await
+        .map_err(|_| "the tracker thread did not answer".to_string())?
+        .map_err(|e| format!("the note cannot be read: {e:?}"))
 }
 
 /// The cumulative redeemed amount of the edge in the tracker's reserve tree (0 when absent).
