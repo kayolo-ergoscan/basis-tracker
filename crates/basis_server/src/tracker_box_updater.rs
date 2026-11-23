@@ -71,6 +71,26 @@ pub struct SharedTrackerState {
     /// Redemptions submitted through `/redemption/submit` and not yet seen out of the mempool
     /// (see [`SubmittedRedemption`]).
     pub submitted_redemptions: Arc<RwLock<Vec<SubmittedRedemption>>>,
+    /// Round 6 (risk 3): release commits the redemption confirmer asked for (see
+    /// [`ReleaseRequest`]).
+    pub release_requests: Arc<RwLock<Vec<ReleaseRequest>>>,
+    /// Wakes the updater for a cycle now when a release commit is asked for.
+    pub release_wake: Arc<tokio::sync::Notify>,
+}
+
+/// Round 6 (risk 3): a journaled redemption that has been in no mempool and not on chain for
+/// [`crate::redemption_confirmer::MAX_REDEMPTION_MISSING_CHECKS`] checks, but can still be mined:
+/// its reserve box is unspent and it reads the tracker's current confirmed box. Nothing else
+/// would make it unmineable until the next digest change or heartbeat (up to `heartbeat_blocks`,
+/// a day), and its reserve builds nothing meanwhile. The updater commits once (the unchanged
+/// digest when nothing else is due), spending `tracker_box_id`; once that commit is confirmed
+/// the redemption can never be mined and the confirmer drops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRequest {
+    /// The redemption that waits.
+    pub tx_id: String,
+    /// The tracker box it reads, which the release commit spends.
+    pub tracker_box_id: String,
 }
 
 impl Default for SharedTrackerState {
@@ -91,6 +111,8 @@ impl SharedTrackerState {
             confirmed: Arc::new(RwLock::new(ConfirmedState::default())),
             pending: Arc::new(RwLock::new(PendingState::default())),
             submitted_redemptions: Arc::new(RwLock::new(Vec::new())),
+            release_requests: Arc::new(RwLock::new(Vec::new())),
+            release_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -103,6 +125,8 @@ impl SharedTrackerState {
             confirmed: Arc::new(RwLock::new(ConfirmedState::default())),
             pending: Arc::new(RwLock::new(PendingState::default())),
             submitted_redemptions: Arc::new(RwLock::new(Vec::new())),
+            release_requests: Arc::new(RwLock::new(Vec::new())),
+            release_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -250,6 +274,64 @@ impl SharedTrackerState {
             .write()
             .unwrap_or_else(|e| e.into_inner());
         submitted.retain(|r| !tx_ids.iter().any(|id| id.eq_ignore_ascii_case(&r.tx_id)));
+    }
+
+    /// Round 6 (risk 3): ask the updater for a release commit that spends `tracker_box_id`, which
+    /// the long-missing redemption `tx_id` reads (see [`ReleaseRequest`]), and wake it. `true`
+    /// when the request is new.
+    pub fn request_release_commit(&self, tx_id: &str, tracker_box_id: &str) -> bool {
+        let request = ReleaseRequest {
+            tx_id: tx_id.to_ascii_lowercase(),
+            tracker_box_id: tracker_box_id.to_ascii_lowercase(),
+        };
+        let added = {
+            let mut requests = self
+                .release_requests
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if requests.contains(&request) {
+                false
+            } else {
+                requests.retain(|r| r.tx_id != request.tx_id);
+                requests.push(request);
+                // One per journaled redemption at most; the journal is bounded by the builds.
+                let excess = requests.len().saturating_sub(MAX_SUBMITTED_REDEMPTIONS);
+                requests.drain(..excess);
+                true
+            }
+        };
+        self.release_wake.notify_one();
+        added
+    }
+
+    /// The release requests, oldest first.
+    pub fn get_release_requests(&self) -> Vec<ReleaseRequest> {
+        self.release_requests
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
+    /// Forget the release requests of these redemptions.
+    pub fn forget_release_requests(&self, tx_ids: &[String]) {
+        if tx_ids.is_empty() {
+            return;
+        }
+        let mut requests = self
+            .release_requests
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        requests.retain(|r| !tx_ids.iter().any(|id| id.eq_ignore_ascii_case(&r.tx_id)));
+    }
+
+    /// Keep only the release requests that name `tracker_box_id`: the others read a box that is
+    /// spent already.
+    fn keep_release_requests_for(&self, tracker_box_id: &str) {
+        let mut requests = self
+            .release_requests
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        requests.retain(|r| r.tracker_box_id.eq_ignore_ascii_case(tracker_box_id));
     }
 }
 
@@ -641,6 +723,9 @@ impl TrackerBoxUpdater {
                 }
                 _ = ticker.tick(), if !retry_soon => false,
                 _ = pending_poll.tick(), if pending_tx.is_some() && !retry_soon => true,
+                // Round 6 (risk 3): a release commit was asked for; the regular schedule keeps
+                // its ticks.
+                _ = shared_state.release_wake.notified(), if !retry_soon => false,
             };
 
             if poll_only {
@@ -812,6 +897,8 @@ impl TrackerBoxUpdater {
 
             // Refresh the confirmed box id in shared state from the live node.
             shared_state.set_tracker_box_id(tracker_box.box_id.clone());
+            // Release requests for an older tracker box are done: that box is spent.
+            shared_state.keep_release_requests_for(&tracker_box.box_id);
 
             // The tracker box must be locked by P2PK(tracker pk); otherwise the tracker key
             // cannot spend it. Reads and reconciliation below still run; committing does not.
@@ -905,16 +992,28 @@ impl TrackerBoxUpdater {
             }
 
             // With nothing to commit, a due heartbeat recommits the unchanged digest anyway
-            // so the tracker box never ages into the emergency window.
+            // so the tracker box never ages into the emergency window. Round 6 (risk 3): so does
+            // a release commit, which makes a long-missing redemption that reads this tracker
+            // box unmineable.
             let mut heartbeat = false;
             if let Some(reason) = nothing_to_commit {
-                if !Self::heartbeat_now(&config, &tracker_box).await {
+                if Self::heartbeat_now(&config, &tracker_box).await {
+                    heartbeat = true;
+                } else if let Some(release) =
+                    Self::release_due(&config, &shared_state, &tracker_box).await
+                {
+                    warn!(
+                        "Release commit: redemption {} reads tracker box {} and has been in no mempool and not on chain for {} checks; recommitting the current digest spends that box, so the redemption can no longer be mined and its reserve builds again once the commit is confirmed",
+                        release.tx_id,
+                        tracker_box.box_id,
+                        crate::redemption_confirmer::MAX_REDEMPTION_MISSING_CHECKS
+                    );
+                } else {
                     info!("{}", reason);
                     // Nothing waits to be committed: no deferral runs (round 5b, F3).
                     deferring_since = None;
                     continue;
                 }
-                heartbeat = true;
             }
 
             if !tracker_box_spendable {
@@ -1312,6 +1411,50 @@ impl TrackerBoxUpdater {
         }
         shared_state.forget_submitted_redemptions(&done);
         holding
+    }
+
+    /// Round 6 (risk 3): the release request this cycle commits for, if one is due: it names
+    /// `tracker_box`, and its redemption is still in no mempool and not on chain. One seen in a
+    /// mempool or on chain again is not released (the confirmer follows it as before); one whose
+    /// status cannot be read waits for the next cycle.
+    async fn release_due(
+        config: &TrackerBoxUpdateConfig,
+        shared_state: &SharedTrackerState,
+        tracker_box: &ErgoBoxApi,
+    ) -> Option<ReleaseRequest> {
+        let requests: Vec<ReleaseRequest> = shared_state
+            .get_release_requests()
+            .into_iter()
+            .filter(|r| r.tracker_box_id.eq_ignore_ascii_case(&tracker_box.box_id))
+            .collect();
+        let mut seen = Vec::new();
+        let mut due = None;
+        for request in requests {
+            match Self::check_transaction_confirmation(config, &request.tx_id).await {
+                Ok(TxStatus::Missing) => {
+                    due = Some(request);
+                    break;
+                }
+                Ok(status) => {
+                    info!(
+                        "No release commit for redemption {}: it is {} again",
+                        request.tx_id,
+                        if status == TxStatus::InMempool {
+                            "in the mempool"
+                        } else {
+                            "on chain"
+                        }
+                    );
+                    seen.push(request.tx_id);
+                }
+                Err(e) => warn!(
+                    "Status of redemption {} cannot be read ({}); no release commit this cycle",
+                    request.tx_id, e
+                ),
+            }
+        }
+        shared_state.forget_release_requests(&seen);
+        due
     }
 
     /// Whether this cycle should recommit an unchanged digest (heartbeat): enabled, and the
@@ -3633,6 +3776,123 @@ mod tests {
                 "new digest {new_digest}: the first cycle commits"
             );
         }
+    }
+
+    /// Round 6 (risk 3): the digest of the fixture's tracker box (nothing new to commit).
+    fn unchanged_digest(fx: &CommitFixture) -> [u8; 33] {
+        let r5 = hex::decode(&fx.tracker_api.additional_registers["R5"]).unwrap();
+        r5[1..34].try_into().unwrap()
+    }
+
+    /// Round 6 (risk 3): with nothing new to commit, no heartbeat due and a ten-minute
+    /// interval, the first cycle commits nothing (a request for an older tracker box is
+    /// dropped). A release request for the current tracker box, whose redemption is in no
+    /// mempool and not on chain, wakes the updater for a cycle that commits the unchanged
+    /// digest, spending the box.
+    #[tokio::test]
+    async fn a_release_request_wakes_the_updater_for_a_commit() {
+        use std::sync::atomic::AtomicU64;
+        let height = Arc::new(AtomicU64::new(123_500));
+        let handle: Arc<std::sync::Mutex<Option<(SharedTrackerState, String)>>> = Arc::default();
+        let setup_handle = handle.clone();
+        let mut first_cycle_seen = false;
+        let mut asked_at = None;
+        let (seen, shared) = run_updater_with(
+            |_: &str| (404, "{}".to_string()),
+            height,
+            move |config, shared, fx| {
+                config.update_interval_seconds = 600;
+                shared.set_avl_root_digest(unchanged_digest(fx));
+                // A request for an older tracker box, put in without waking the updater.
+                shared.release_requests.write().unwrap().push(ReleaseRequest {
+                    tx_id: "0d".repeat(32),
+                    tracker_box_id: "ee".repeat(32),
+                });
+                *setup_handle.lock().unwrap() =
+                    Some((shared.clone(), fx.tracker_api.box_id.clone()));
+            },
+            move |seen| {
+                if asked_at.is_none() {
+                    // The first cycle ends with the heartbeat check (/info); ask one poll later.
+                    if first_cycle_seen {
+                        let (shared, tracker_box) = handle.lock().unwrap().clone().unwrap();
+                        assert_eq!(broadcasts(seen), 0, "nothing to commit in the first cycle");
+                        assert!(shared.get_release_requests().is_empty(), "older box dropped");
+                        assert!(shared.request_release_commit(REDEMPTION_TX, &tracker_box));
+                        assert!(!shared.request_release_commit(REDEMPTION_TX, &tracker_box));
+                        asked_at = Some(seen.len());
+                    }
+                    first_cycle_seen = count(seen, "/info") >= 1;
+                }
+                broadcasts(seen) >= 1
+            },
+        )
+        .await;
+        let broadcast = seen.iter().position(is_broadcast).unwrap();
+        assert_eq!(
+            count(&seen[..broadcast], "/blockchain/box/unspent/byTokenId/"),
+            2,
+            "a second cycle, woken by the request"
+        );
+        assert_eq!(
+            count(&seen[..broadcast], &format!("{MEMPOOL_LOOKUP}{REDEMPTION_TX}")),
+            1,
+            "the redemption is looked up once before the release commit"
+        );
+        assert_eq!(shared.get_release_requests().len(), 1);
+    }
+
+    /// Round 6 (risk 3), the other direction: a release request whose redemption is in a
+    /// mempool or on chain again commits nothing, and the request is forgotten.
+    #[tokio::test]
+    async fn a_redemption_seen_again_gets_no_release_commit() {
+        use std::sync::atomic::AtomicU64;
+        for where_seen in [MEMPOOL_LOOKUP, CHAIN_LOOKUP] {
+            let lookup = move |path: &str| {
+                if path.starts_with(&format!("{where_seen}{REDEMPTION_TX}")) {
+                    (200, serde_json::json!({ "id": REDEMPTION_TX }).to_string())
+                } else {
+                    (404, "{}".to_string())
+                }
+            };
+            let mut looked_up = false;
+            let (seen, shared) = run_updater_with(
+                lookup,
+                Arc::new(AtomicU64::new(123_500)),
+                |config, shared, fx| {
+                    config.update_interval_seconds = 600;
+                    shared.set_avl_root_digest(unchanged_digest(fx));
+                    shared.request_release_commit(REDEMPTION_TX, &fx.tracker_api.box_id);
+                },
+                move |seen| {
+                    // One poll after the lookup, the cycle is over.
+                    let done = looked_up;
+                    looked_up = count(seen, &format!("{where_seen}{REDEMPTION_TX}")) >= 1;
+                    done
+                },
+            )
+            .await;
+            assert_eq!(broadcasts(&seen), 0, "{where_seen}");
+            assert!(shared.get_release_requests().is_empty(), "{where_seen}");
+        }
+    }
+
+    #[test]
+    fn release_requests_are_kept_once_per_redemption_and_forgotten_by_id() {
+        let shared = SharedTrackerState::new();
+        assert!(shared.request_release_commit(&"AA".repeat(32), &"BB".repeat(32)));
+        assert!(!shared.request_release_commit(&"aa".repeat(32), &"bb".repeat(32)));
+        // A newer tracker box for the same redemption replaces the request.
+        assert!(shared.request_release_commit(&"aa".repeat(32), &"cc".repeat(32)));
+        assert!(shared.request_release_commit(&"dd".repeat(32), &"cc".repeat(32)));
+        assert_eq!(shared.get_release_requests().len(), 2);
+        assert_eq!(shared.get_release_requests()[0].tracker_box_id, "cc".repeat(32));
+        shared.keep_release_requests_for(&"CC".repeat(32));
+        assert_eq!(shared.get_release_requests().len(), 2);
+        shared.forget_release_requests(&["AA".repeat(32)]);
+        assert_eq!(shared.get_release_requests()[0].tx_id, "dd".repeat(32));
+        shared.keep_release_requests_for(&"ee".repeat(32));
+        assert!(shared.get_release_requests().is_empty());
     }
 
     #[test]

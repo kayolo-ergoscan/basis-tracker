@@ -640,13 +640,24 @@ Now:
      it alone and the reserve builds nothing until an operator has looked at it;
    - in a mempool, or in a block not deep enough yet: kept;
    - in neither for 10 consecutive checks: kept while it can still be mined, and from then on
-     looked at every 10 minutes (`next_check_at_ms`; round 5b, F4). It is dropped, never applied,
-     only once it can no longer be mined: its reserve box is spent by another transaction (the
-     spender the blockchain index names), or the tracker box it reads as a data input is out of
-     the UTXO set while its reserve box is unspent and the tracker's confirmed box is another one
-     (a confirmed commit replaced it). A reserve box out of the UTXO set whose spender the index
-     does not name yet (an index that lags behind the chain) keeps it: the redemption may be in a
-     block the index has not reached;
+     looked at every 10 minutes (`next_check_at_ms`; round 5b, F4), or at the next check once
+     the tracker's confirmed box is no longer one it reads (round 6). It is dropped, never
+     applied, only once it can no longer be mined: its reserve box, or a tracker box it reads
+     as a data input (not the tracker's confirmed box), is spent by another transaction that the
+     blockchain index names and that is at least `[confirmation] min_depth` deep (round 6: a
+     shallower spend can still be undone by a reorganization). A box out of the UTXO set whose
+     spender the index does not name yet (an index that lags behind the chain) keeps it: the
+     redemption may be in a block the index has not reached;
+   - round 6 (risk 3): in neither for 10 checks, its reserve box unspent and reading the
+     tracker's current confirmed box: it can still be mined, and before round 6 only the next
+     digest change or heartbeat (up to `heartbeat_blocks`, a day) changed that, its reserve
+     answering `409` meanwhile. Now the confirmer asks the tracker box updater for a **release
+     commit** (the unchanged digest, once, waking the updater at once;
+     `specs/server/tracker_box_update_spec.md`, step 4). The commit spends the tracker box the
+     redemption reads; once it is `min_depth` deep the redemption can never be mined and is
+     dropped as above, usually within a quarter of an hour of the tenth missing check. A
+     redemption seen in a mempool or on chain again is never released: its request is forgotten
+     and it is followed as before; one that lands before the release commit is applied;
    - a node error: kept, not counted;
    - applying fails (the tracker's state no longer matches the build): kept with the error,
      logged once and tried again at every check. An operator repair (`/redeem/complete` below,
@@ -731,7 +742,8 @@ reserve tree is then behind the chain, and the build answers that no reserve mat
 reserve tree until an operator records it with `/redeem/complete`, as before. A redemption dropped
 from every mempool that can still be mined keeps its reserve blocked until it can no longer be mined
 (at the latest when a confirmed commit replaces the tracker box it reads, which the heartbeat does
-within `heartbeat_blocks`) or until an operator drops it.
+within `heartbeat_blocks`) or until an operator drops it. Round 6 (risk 3) releases that one
+with a release commit (above).
 
 **Commits wait for it (round 5, 5b).** The broadcast redemption reads the tracker box as its data
 input, and a tracker commit spends that box. The submit records the redemption's tx id and data

@@ -131,14 +131,19 @@ pub async fn check_journal(
     for mut entry in entries {
         let tx_id = entry.tx_id.clone();
         // Applied, but out of step with the chain: an operator's (GET /redemption/journal).
-        // Not due yet: a long-missing redemption that can still be mined.
-        if entry.digest_mismatch.is_some() || entry.next_check_at_ms > now_ms {
+        // Not due yet: a long-missing redemption that can still be mined, unless the tracker's
+        // confirmed box is no longer one it reads (a commit, such as the release commit asked
+        // for below, replaced it: round 6, risk 3).
+        if entry.digest_mismatch.is_some()
+            || (entry.next_check_at_ms > now_ms && !tracker_box_moved(shared_state, &entry))
+        {
             outcome.waiting.push(tx_id);
             continue;
         }
         match TrackerBoxUpdater::check_transaction_confirmation(config, &tx_id).await {
             Ok(TxStatus::OnChain) => {
                 reset_missing(storage, &mut entry);
+                shared_state.forget_release_requests(std::slice::from_ref(&tx_id));
                 match TrackerBoxUpdater::confirmed_first_output_r5(config, &tx_id).await {
                     // A failed apply stays journaled; `apply_journaled_against` recorded and
                     // logged it.
@@ -170,7 +175,10 @@ pub async fn check_journal(
                     ),
                 }
             }
-            Ok(TxStatus::InMempool) => reset_missing(storage, &mut entry),
+            Ok(TxStatus::InMempool) => {
+                reset_missing(storage, &mut entry);
+                shared_state.forget_release_requests(std::slice::from_ref(&tx_id));
+            }
             Ok(TxStatus::Missing) => {
                 entry.missing_checks = entry.missing_checks.saturating_add(1);
                 if entry.missing_checks >= MAX_REDEMPTION_MISSING_CHECKS {
@@ -188,6 +196,20 @@ pub async fn check_journal(
                             forget(storage, shared_state, &tx_id);
                             outcome.dropped.push(tx_id);
                             continue;
+                        }
+                        Ok(Fate::ReadsCurrentTrackerBox(tracker_box)) => {
+                            // Round 6 (risk 3): only a commit that spends the tracker box it
+                            // reads makes it unmineable; ask for one now instead of waiting for
+                            // the next digest change or heartbeat.
+                            if shared_state.request_release_commit(&tx_id, &tracker_box) {
+                                warn!(
+                                    "Redemption {} was in neither a mempool nor the chain for {} checks; its reserve box is unspent and it reads the tracker's current box {}, so it can still be mined. Asked for a release commit that spends that box: once it is {} blocks deep the redemption can no longer be mined and is dropped, and its reserve builds again.",
+                                    tx_id,
+                                    entry.missing_checks,
+                                    tracker_box,
+                                    config.min_confirmation_depth
+                                );
+                            }
                         }
                         Ok(Fate::CanStillBeMined(why)) => {
                             let log = format!(
@@ -229,20 +251,24 @@ pub async fn check_journal(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Fate {
     CanStillBeMined(String),
+    /// Its reserve box is unspent and it reads the tracker's current confirmed box (named): it
+    /// can still be mined, and only a commit that spends that box changes that (round 6, risk 3).
+    ReadsCurrentTrackerBox(String),
     CannotBeMined(String),
 }
 
-/// See [`Fate`]. A redemption can no longer be mined once its reserve box is spent by another
-/// transaction (the spender the blockchain index names), or once the tracker box it reads as a
-/// data input is spent by a confirmed commit (the tracker's confirmed box is another one, and
-/// the data input is out of the UTXO set). A reserve box out of the UTXO set whose spender the
-/// index does not name yet may be spent by this very redemption, in a block the index has not
-/// reached: it can still be applied, so it is kept.
+/// See [`Fate`]. A redemption can no longer be mined once its reserve box, or a tracker box it
+/// reads as a data input (not the tracker's confirmed box), is spent by another transaction
+/// that the blockchain index names and that is at least `min_confirmation_depth` deep (round 6:
+/// a shallower spend can still be undone by a reorganization). A box out of the UTXO set whose
+/// spender the index does not name yet keeps it: for the reserve box, this very redemption may
+/// be in a block the index has not reached.
 async fn fate(
     config: &TrackerBoxUpdateConfig,
     shared_state: &SharedTrackerState,
     entry: &JournaledRedemption,
 ) -> Result<Fate, String> {
+    let depth = config.min_confirmation_depth;
     if !TrackerBoxUpdater::box_is_unspent(config, &entry.reserve_box_id)
         .await
         .map_err(|e| e.to_string())?
@@ -258,10 +284,19 @@ async fn fate(
                         entry.reserve_box_id
                     ))
                 }
-                Some(spender) => Fate::CannotBeMined(format!(
-                    "its reserve box {} is spent by transaction {}",
-                    entry.reserve_box_id, spender
-                )),
+                Some(spender) => {
+                    if spent_deep_enough(config, &spender).await? {
+                        Fate::CannotBeMined(format!(
+                            "its reserve box {} is spent by transaction {}, at least {} blocks deep",
+                            entry.reserve_box_id, spender, depth
+                        ))
+                    } else {
+                        Fate::CanStillBeMined(format!(
+                            "its reserve box {} is spent by transaction {}, not {} blocks deep yet",
+                            entry.reserve_box_id, spender, depth
+                        ))
+                    }
+                }
                 None => Fate::CanStillBeMined(format!(
                     "its reserve box {} is spent by a transaction the blockchain index does not name yet",
                     entry.reserve_box_id
@@ -275,24 +310,75 @@ async fn fate(
                 .to_string(),
         ));
     };
+    let mut reads_current = None;
+    let mut kept = None;
     for data_input in &entry.data_input_ids {
         if data_input.eq_ignore_ascii_case(&confirmed_box) {
+            reads_current = Some(data_input.to_ascii_lowercase());
             continue;
         }
-        if !TrackerBoxUpdater::box_is_unspent(config, data_input)
+        if TrackerBoxUpdater::box_is_unspent(config, data_input)
             .await
             .map_err(|e| e.to_string())?
         {
-            return Ok(Fate::CannotBeMined(format!(
-                "the tracker box {} it reads is spent by a confirmed commit (the tracker box is {} now)",
-                data_input, confirmed_box
-            )));
+            continue;
+        }
+        match TrackerBoxUpdater::box_spent_by(config, data_input)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Some(spender) if spent_deep_enough(config, &spender).await? => {
+                return Ok(Fate::CannotBeMined(format!(
+                    "the tracker box {} it reads is spent by commit {}, at least {} blocks deep (the tracker box is {} now)",
+                    data_input, spender, depth, confirmed_box
+                )));
+            }
+            Some(spender) => {
+                kept = Some(format!(
+                    "the tracker box {} it reads is spent by commit {}, not {} blocks deep yet",
+                    data_input, spender, depth
+                ))
+            }
+            None => {
+                kept = Some(format!(
+                    "the tracker box {} it reads is out of the UTXO set, and the blockchain index names no spender yet",
+                    data_input
+                ))
+            }
         }
     }
+    if let Some(why) = kept {
+        return Ok(Fate::CanStillBeMined(why));
+    }
+    if let Some(tracker_box) = reads_current {
+        return Ok(Fate::ReadsCurrentTrackerBox(tracker_box));
+    }
     Ok(Fate::CanStillBeMined(
-        "its reserve box is unspent and the tracker box it reads is not spent by a confirmed commit"
-            .to_string(),
+        "its reserve box is unspent and the tracker boxes it reads are unspent".to_string(),
     ))
+}
+
+/// Whether `spender` is in a block at least `min_confirmation_depth` deep (round 6).
+async fn spent_deep_enough(config: &TrackerBoxUpdateConfig, spender: &str) -> Result<bool, String> {
+    TrackerBoxUpdater::confirmed_deep_enough(config, spender)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Round 6 (risk 3): a long-missing entry whose tracker boxes no longer include the tracker's
+/// confirmed box: a commit replaced the box it reads, so whether it can still be mined is worth
+/// a look before its slow interval has passed.
+fn tracker_box_moved(shared_state: &SharedTrackerState, entry: &JournaledRedemption) -> bool {
+    if entry.missing_checks < MAX_REDEMPTION_MISSING_CHECKS || entry.data_input_ids.is_empty() {
+        return false;
+    }
+    match shared_state.get_confirmed().box_id {
+        Some(confirmed) => !entry
+            .data_input_ids
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(&confirmed)),
+        None => false,
+    }
 }
 
 /// Apply a journaled redemption that is in a block, deep enough, without the chain's R5 to
@@ -433,6 +519,12 @@ pub fn waiting_reason(waiting: &JournaledRedemption) -> String {
              chain ({}); an operator has to look at it before the reserve is used again",
             waiting.tx_id, mismatch
         ),
+        None if waiting.missing_checks >= MAX_REDEMPTION_MISSING_CHECKS => format!(
+            "redemption {} has not been seen in a mempool or on chain for {} checks; it is \
+             released once it can no longer be mined (the tracker replaces the tracker box it \
+             reads with a commit for that), usually within a quarter of an hour; try again then",
+            waiting.tx_id, waiting.missing_checks
+        ),
         None => format!(
             "redemption {} is waiting for the chain; try again once it is confirmed, or once it \
              can no longer be mined (its reserve box spent by another transaction, or the \
@@ -558,6 +650,7 @@ pub(crate) fn forget(storage: &TrackerStorage, shared_state: &SharedTrackerState
         error!("Cannot remove journaled redemption {}: {:?}", tx_id, e);
     }
     shared_state.forget_submitted_redemptions(&[tx_id.to_string()]);
+    shared_state.forget_release_requests(&[tx_id.to_string()]);
 }
 
 /// Write back `entry`, read from the journal earlier, unless it was removed meanwhile (round 5b,
@@ -744,6 +837,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const TX: &str = "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a";
+    /// A tracker commit that spends the tracker box the redemptions read.
+    const COMMIT: &str = "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
     /// The note's timestamp when the redemptions below were built.
     const BUILT_AT: u64 = 1_700_000_000_000;
 
@@ -1058,6 +1153,29 @@ mod tests {
             assert!(self.storage.update_journaled_redemption(&entry).unwrap());
         }
 
+        /// `spender` in a block at `height`.
+        fn spend_in_block(&self, spender: &str, height: u64) {
+            self.set(
+                spender,
+                Chain {
+                    included_at: Some(height),
+                    ..Default::default()
+                },
+            );
+        }
+
+        /// The commit `commit`, in a block at `height`, spent the tracker box the redemptions
+        /// read; the tracker's confirmed box is its output.
+        fn replace_tracker_box(&self, commit: &str, height: u64) {
+            {
+                let mut node = self.node.lock().unwrap();
+                node.unspent.remove(&tracker_box());
+                node.spent_by.insert(tracker_box(), commit.to_string());
+            }
+            self.spend_in_block(commit, height);
+            self.shared.set_confirmed([0x12; 33], "ef".repeat(32), height);
+        }
+
         fn lookups(&self, tx_id: &str) -> usize {
             self.node.lock().unwrap().lookups.get(tx_id).copied().unwrap_or(0)
         }
@@ -1201,6 +1319,11 @@ mod tests {
             node.unspent.remove(&reserve_box());
             node.spent_by.insert(reserve_box(), "9c".repeat(32));
         }
+        // Round 6: a spender one block deep could still be undone by a reorganization.
+        fx.spend_in_block(&"9c".repeat(32), 1_000);
+        fx.make_due(TX);
+        assert_eq!(fx.check().await.waiting, vec![TX.to_string()], "spender 1 deep");
+        fx.spend_in_block(&"9c".repeat(32), 999);
         fx.make_due(TX);
         let outcome = fx.check().await;
         assert_eq!(outcome.dropped, vec![TX.to_string()]);
@@ -1249,12 +1372,106 @@ mod tests {
         fx.make_due(TX);
         assert_eq!(fx.check().await.waiting, vec![TX.to_string()]);
 
-        fx.node.lock().unwrap().unspent.remove(&tracker_box());
-        fx.shared.set_confirmed([0x12; 33], "ef".repeat(32), 1_000);
+        fx.replace_tracker_box(COMMIT, 990);
         fx.make_due(TX);
         assert_eq!(fx.check().await.dropped, vec![TX.to_string()]);
         assert!(fx.journaled().is_empty());
         assert_eq!(fx.applied.load(Ordering::SeqCst), 0);
+    }
+
+    /// Round 6 (risk 3): a redemption in neither a mempool nor the chain for the limit of
+    /// checks, whose reserve box is unspent and which reads the tracker's current box, can
+    /// still be mined, and before round 6 nothing but the next digest change or heartbeat (up
+    /// to a day) changed that. Now the confirmer asks for a release commit (once). The commit
+    /// replaces the tracker box: the entry is looked at again at the next check, not after its
+    /// slow interval; while the commit is one block deep it is kept (a reorganization could
+    /// bring the box back), and once it is two deep the redemption can never be mined: dropped,
+    /// never applied, the release request forgotten. Meanwhile the build's 409 says so.
+    #[tokio::test]
+    async fn a_redemption_reading_the_current_tracker_box_is_released_by_a_commit() {
+        let fx = fixture(true).await;
+        fx.journal(TX);
+        fx.shared.set_confirmed([0x11; 33], tracker_box(), 900);
+        for _ in 0..MAX_REDEMPTION_MISSING_CHECKS - 1 {
+            fx.check().await;
+        }
+        assert!(fx.shared.get_release_requests().is_empty());
+        assert_eq!(fx.check().await.waiting, vec![TX.to_string()]);
+        assert_eq!(
+            fx.shared.get_release_requests(),
+            vec![crate::tracker_box_updater::ReleaseRequest {
+                tx_id: TX.to_string(),
+                tracker_box_id: tracker_box(),
+            }]
+        );
+        let waiting = fx.journaled().remove(0);
+        assert!(waiting_reason(&waiting).contains("released once it can no longer be mined"));
+
+        // Not due: nothing is looked up, the request stays.
+        let lookups = fx.lookups(TX);
+        fx.check().await;
+        assert_eq!(fx.lookups(TX), lookups);
+
+        // The release commit is in a block, one deep: looked at at once, kept.
+        fx.replace_tracker_box(COMMIT, 1_000);
+        assert_eq!(fx.check().await.waiting, vec![TX.to_string()]);
+        assert_eq!(fx.lookups(TX), lookups + 1, "looked at before its slow interval");
+        // Two deep: dropped.
+        fx.height.store(1_001, Ordering::SeqCst);
+        assert_eq!(fx.check().await.dropped, vec![TX.to_string()]);
+        assert!(fx.journaled().is_empty());
+        assert!(fx.shared.get_release_requests().is_empty());
+        assert!(fx.shared.get_submitted_redemptions().is_empty());
+        assert_eq!(fx.applied.load(Ordering::SeqCst), 0);
+    }
+
+    /// Round 6 (risk 3), the other direction: a redemption that may still land is never
+    /// released. Seen in a mempool again after the release request: the request is forgotten
+    /// and the count starts over. In a block before the release commit (its reserve box spent
+    /// by it): applied once deep enough, even though a commit replaced the tracker box it read
+    /// meanwhile, never dropped.
+    #[tokio::test]
+    async fn a_redemption_that_may_still_land_is_never_released() {
+        let fx = fixture(true).await;
+        fx.journal(TX);
+        fx.shared.set_confirmed([0x11; 33], tracker_box(), 900);
+        for _ in 0..MAX_REDEMPTION_MISSING_CHECKS {
+            fx.check().await;
+        }
+        assert_eq!(fx.shared.get_release_requests().len(), 1);
+        fx.set(
+            TX,
+            Chain {
+                mempool: true,
+                ..Default::default()
+            },
+        );
+        fx.make_due(TX);
+        assert_eq!(fx.check().await.waiting, vec![TX.to_string()]);
+        assert!(fx.shared.get_release_requests().is_empty());
+        assert_eq!(fx.journaled()[0].missing_checks, 0);
+
+        // Gone from the mempool again, past the limit: asked again.
+        fx.set(TX, Chain::default());
+        for _ in 0..MAX_REDEMPTION_MISSING_CHECKS {
+            fx.check().await;
+        }
+        assert_eq!(fx.shared.get_release_requests().len(), 1);
+        // It lands before the release commit: its reserve box is spent by it (the transaction
+        // lookup lags), and then the commit replaces the tracker box it read.
+        {
+            let mut node = fx.node.lock().unwrap();
+            node.unspent.remove(&reserve_box());
+            node.spent_by.insert(reserve_box(), TX.to_string());
+        }
+        fx.replace_tracker_box(COMMIT, 990);
+        assert_eq!(fx.check().await.waiting, vec![TX.to_string()], "kept, not dropped");
+        assert_eq!(fx.journaled().len(), 1);
+        fx.mine(TX, 995, &fx.built_r5);
+        fx.make_due(TX);
+        assert_eq!(fx.check().await.applied, vec![TX.to_string()]);
+        assert_eq!(fx.applied.load(Ordering::SeqCst), 1);
+        assert!(fx.shared.get_release_requests().is_empty());
     }
 
     /// A node error is not a missing check: the redemption stays, uncounted.
