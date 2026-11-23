@@ -488,6 +488,25 @@ async fn main() {
 
                     let _ = response_tx.send(result);
                 }
+                TrackerCommand::RepairReserveTreeValue {
+                    issuer_pubkey,
+                    recipient_pubkey,
+                    denomination,
+                    value,
+                    chain_digest,
+                    dry_run,
+                    response_tx,
+                } => {
+                    let result = redemption_manager.tracker.repair_reserve_tree_value(
+                        &issuer_pubkey,
+                        &recipient_pubkey,
+                        &denomination,
+                        value,
+                        &chain_digest,
+                        dry_run,
+                    );
+                    let _ = response_tx.send(result);
+                }
                 TrackerCommand::GetNotes { response_tx } => {
                     let result = redemption_manager.tracker.get_all_notes_with_issuer();
                     let _ = response_tx.send(result);
@@ -968,6 +987,15 @@ async fn main() {
         .route(
             "/redemption/journal/apply",
             post(basis_server::redemption_confirmer::apply_journal_entry),
+        )
+        // Round 6 (risk 1), Admin: bring a reserve tree back in step with the chain.
+        .route(
+            "/redemption/tree/repair",
+            post(basis_server::reserve_repair::repair_reserve_tree),
+        )
+        .route(
+            "/redemption/tree/repairs",
+            get(basis_server::reserve_repair::list_tree_repairs),
         )
         .route("/reserves", get(get_all_reserves))
         .route(

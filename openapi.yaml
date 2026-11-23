@@ -1414,6 +1414,107 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
 
+  /redemption/tree/repair:
+    post:
+      summary: Repair a reserve tree value towards the chain (admin)
+      description: |
+        Bring one edge of a reserve tree back in step with the chain (round 6):
+        the edge's value `timestamp || already_redeemed` and the note's
+        cumulative redeemed amount become the given ones, but only when the
+        tracker's reserve tree then hashes to R5 of the issuer's tracked
+        reserve box, read from the node's UTXO set. The values are given
+        explicitly or taken from a journal entry (`tx_id`: its
+        `reserve_tree_timestamp` and `new_already_redeemed`). A repeat changes
+        nothing (`unchanged`); `dry_run` changes nothing (`would_repair`). A
+        repair is written to the reserve journal together with the note (so it
+        survives a restart), recorded (`GET /redemption/tree/repairs`) and
+        logged; the reserve's journal entries marked out of step
+        (`digest_mismatch`) are removed once the tree equals the chain's.
+        Admin only; the public front does not pass it.
+      operationId: repairReserveTree
+      tags:
+        - Redemption
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TreeRepairRequest'
+      responses:
+        '200':
+          description: >-
+            The reserve tree holds the value and equals the chain's R5
+            (`repaired`, `unchanged`), or would (`would_repair`, a dry run)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseTreeRepair'
+        '400':
+          description: A malformed request (keys, denomination, missing fields, both forms)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '403':
+          description: The caller is not an admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '404':
+          description: No such journaled redemption, or the tracker holds no such note
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '409':
+          description: >-
+            Not repaired: the reserve tree with the value would not hash to the
+            chain's R5 (both digests named; nothing changed), the issuer has no
+            single tracked reserve, its box is not unspent or has no tree, or
+            the chain's cumulative amount exceeds the note's total
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '502':
+          description: The reserve box cannot be read from the node
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+
+  /redemption/tree/repairs:
+    get:
+      summary: List the reserve tree repairs (admin)
+      description: |
+        Every reserve tree repair made through `POST /redemption/tree/repair`
+        (round 6), oldest first: the edge, the reserve box whose R5 it matched,
+        the value before and after, and the marked journal entries it cleared.
+        Admin only.
+      operationId: listReserveTreeRepairs
+      tags:
+        - Redemption
+      responses:
+        '200':
+          description: The repairs, oldest first
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseTreeRepairs'
+        '403':
+          description: The caller is not an admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+        '500':
+          description: The records cannot be read
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
+
   /acceptance/check:
     post:
       summary: Check note acceptance
@@ -3537,6 +3638,114 @@ components:
           description: >-
             Unix ms before which the confirmer does not look at it again (a
             long-missing redemption that can still be mined; round 5b)
+
+    TreeRepairRequest:
+      type: object
+      description: >-
+        Either `tx_id` (a journaled redemption whose edge,
+        `reserve_tree_timestamp` and `new_already_redeemed` are taken) or the
+        edge and value written out (round 6)
+      properties:
+        tx_id:
+          type: string
+          pattern: '^[0-9a-fA-F]{64}$'
+        issuer_pubkey:
+          type: string
+          description: 33-byte key, hex
+        recipient_pubkey:
+          type: string
+          description: 33-byte key, hex
+        denomination:
+          type: string
+          description: '"erg" (the default) or "token:<64-hex>"'
+        timestamp:
+          type: integer
+          format: uint64
+          description: The timestamp of the edge's value on chain
+        already_redeemed:
+          type: integer
+          format: uint64
+          description: The edge's cumulative redeemed amount on chain
+        dry_run:
+          type: boolean
+          default: false
+
+    ReserveTreeValue:
+      type: object
+      properties:
+        timestamp:
+          type: integer
+          format: uint64
+        already_redeemed:
+          type: integer
+          format: uint64
+
+    ReserveTreeRepair:
+      type: object
+      properties:
+        outcome:
+          type: string
+          enum: [repaired, unchanged, would_repair, refused]
+        before:
+          allOf:
+            - $ref: '#/components/schemas/ReserveTreeValue'
+          nullable: true
+          description: The edge's value before (null when the tree had none)
+        after:
+          $ref: '#/components/schemas/ReserveTreeValue'
+        note_redeemed_before:
+          type: integer
+          format: uint64
+        digest_before:
+          type: string
+        digest_after:
+          type: string
+        chain_digest:
+          type: string
+          description: R5 digest of the reserve box it was checked against
+
+    ReserveTreeRepairRecord:
+      type: object
+      properties:
+        repaired_at_ms:
+          type: integer
+          format: uint64
+        issuer_pubkey:
+          type: string
+        recipient_pubkey:
+          type: string
+        denomination:
+          type: string
+        reserve_box_id:
+          type: string
+        tx_id:
+          type: string
+          nullable: true
+        repair:
+          $ref: '#/components/schemas/ReserveTreeRepair'
+        cleared_marked:
+          type: array
+          items:
+            type: string
+          description: Marked journal entries removed because the tree now equals the chain's
+
+    ApiResponseTreeRepair:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              $ref: '#/components/schemas/ReserveTreeRepairRecord'
+
+    ApiResponseTreeRepairs:
+      allOf:
+        - $ref: '#/components/schemas/ApiResponse'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/ReserveTreeRepairRecord'
 
     ApiResponseRedemptionJournal:
       allOf:

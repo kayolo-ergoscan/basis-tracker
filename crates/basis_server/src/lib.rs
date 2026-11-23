@@ -11,6 +11,7 @@ pub mod note_limits;
 pub mod redemption_build;
 pub mod redemption_confirmer;
 pub mod reserve_api;
+pub mod reserve_repair;
 pub mod store;
 pub mod tracker_box_updater;
 
@@ -20,6 +21,8 @@ mod create_reserve_tests;
 mod note_route_tests;
 #[cfg(test)]
 mod redemption_build_e2e_tests;
+#[cfg(test)]
+mod reserve_repair_tests;
 
 use tokio::sync::Mutex;
 
@@ -190,6 +193,20 @@ pub enum TrackerCommand {
         /// timestamp at build time. Falls back to the note's current timestamp when `None`.
         reserve_tree_timestamp: Option<u64>,
         response_tx: tokio::sync::oneshot::Sender<Result<(), basis_store::RedemptionError>>,
+    },
+    /// Round 6 (risk 1): set one edge's reserve tree value (and the note's cumulative redeemed
+    /// amount) when the reserve tree then hashes to `chain_digest`, the R5 digest of the
+    /// reserve box on chain (`TrackerStateManager::repair_reserve_tree_value`).
+    RepairReserveTreeValue {
+        issuer_pubkey: basis_store::PubKey,
+        recipient_pubkey: basis_store::PubKey,
+        denomination: basis_store::DenomKey,
+        value: basis_store::ReserveTreeValue,
+        chain_digest: [u8; 33],
+        dry_run: bool,
+        response_tx: tokio::sync::oneshot::Sender<
+            Result<basis_store::ReserveTreeRepair, basis_store::NoteError>,
+        >,
     },
     GenerateProof {
         issuer_pubkey: basis_store::PubKey,

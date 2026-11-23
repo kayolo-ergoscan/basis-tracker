@@ -62,6 +62,8 @@ fn required_role(path: &str, method: &str) -> ClientRole {
             "/redeem/complete" => ClientRole::Admin,
             // Admin-only (round 5b, F6): drop or apply a journaled redemption.
             "/redemption/journal/drop" | "/redemption/journal/apply" => ClientRole::Admin,
+            // Admin-only (round 6, risk 1): set a reserve tree value to the chain's.
+            "/redemption/tree/repair" => ClientRole::Admin,
             // Write: state-changing redemption and note operations. `/reserves/create` only
             // builds a payload the owner submits to their own node (PR #16 B4), and an
             // `/acceptance/policy` upload is signed by the recipient it applies to, so both are
@@ -89,6 +91,8 @@ fn required_role(path: &str, method: &str) -> ClientRole {
             "/notes" | "/events" | "/events/paginated" => ClientRole::Admin,
             // Every journaled redemption with its keys and amounts (round 5b, F6).
             "/redemption/journal" => ClientRole::Admin,
+            // The operator's reserve tree repairs, with keys and amounts (round 6, risk 1).
+            "/redemption/tree/repairs" => ClientRole::Admin,
             // All other GET endpoints expose tracker state and are readable.
             _ => ClientRole::Read,
         },
@@ -188,6 +192,15 @@ mod tests {
         );
         assert_eq!(
             required_role("/redemption/journal/apply", "POST"),
+            ClientRole::Admin
+        );
+        // Round 6 (risk 1): so are the reserve tree repairs.
+        assert_eq!(
+            required_role("/redemption/tree/repair", "POST"),
+            ClientRole::Admin
+        );
+        assert_eq!(
+            required_role("/redemption/tree/repairs", "GET"),
             ClientRole::Admin
         );
         assert_eq!(

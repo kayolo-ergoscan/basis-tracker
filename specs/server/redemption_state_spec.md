@@ -650,8 +650,9 @@ Now:
    - a node error: kept, not counted;
    - applying fails (the tracker's state no longer matches the build): kept with the error,
      logged once and tried again at every check. An operator repair (`/redeem/complete` below,
-     with the same `new_already_redeemed` and `reserve_tree_timestamp`) records it, and the next
-     attempt finds it applied.
+     with the same `new_already_redeemed` and `reserve_tree_timestamp`, or, when the tree holds
+     the amount with another timestamp, `POST /redemption/tree/repair` with the `tx_id`; round 6)
+     records it, and the next attempt finds it applied.
 
    Every write-back of an entry is a compare-and-set: an entry removed meanwhile (refused at
    submit, applied or dropped by an operator) is not brought back (round 5b, F8).
@@ -678,6 +679,30 @@ Now:
    the reserve tree with the journaled digest (`409` when it cannot be applied or the digests
    differ). The front proxy's route allowlist does not pass them: they are reached on the
    tracker's own port.
+7. **Reserve tree repair (round 6, Admin only).** A reserve tree can hold an edge with the right
+   cumulative amount and another timestamp than the chain's (a redemption applied by 6113b8d
+   after a re-sign, or by `/redeem/complete` without `reserve_tree_timestamp`). Then nothing
+   brought it back: the apply refuses "the same amount with another timestamp", the confirmer
+   keeps the entry with that error, a drop leaves the tree as it is, and every build of the
+   reserve answers that no reserve box matches the tracker's reserve tree.
+   `POST /redemption/tree/repair` sets one edge's value (`timestamp || already_redeemed`) and the
+   note's `amount_redeemed` to the given ones, only when the reserve tree then hashes to R5 of the
+   issuer's tracked reserve box in that denomination, read from the node's UTXO set (`/utxo/byId`).
+   So it can only put the tracker where the chain is; anything else is refused (`409`, both
+   digests named, nothing changed). Body: `{"tx_id"}` (the journal entry's edge,
+   `reserve_tree_timestamp` and `new_already_redeemed`) or
+   `{"issuer_pubkey", "recipient_pubkey", "denomination" ("erg" default or "token:<hex>"),
+   "timestamp", "already_redeemed"}`, plus `"dry_run"` (default `false`). The answer is the
+   record: outcome `repaired`, `unchanged` (a repeat: nothing written), `would_repair` (dry run),
+   the edge's value before and after, the note's redeemed amount before, the tree digest before
+   and after and R5, the reserve box, and the marked entries it cleared. A cumulative amount
+   above the note's total is refused. The note and the reserve tree's journal record are written
+   in one batch (replayed at startup like any reserve tree change). Once the reserve tree equals
+   R5, the reserve's entries marked out of step (`digest_mismatch`) are removed: nothing is left
+   for them to wait for. Each change is logged (warning) and recorded in partition
+   `reserve_tree_repairs` of the `tracker_boxes` store, listed oldest first by
+   `GET /redemption/tree/repairs`. A repair changes values of existing or new edges only; a tree
+   that differs from the chain in its shape (an edge the chain lacks) cannot be repaired this way.
 
 **Reserve debt while a redemption is journaled (round 5b, F11).** `total_debt` of `/reserves`,
 `/reserves/issuer/{pubkey}` and `/reserves/{box_id}` is the owner's outstanding debt on the notes

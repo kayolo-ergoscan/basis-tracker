@@ -10,14 +10,14 @@ use crate::api::create_note;
 use crate::models::CreateNoteRequest;
 use crate::{AppState, TrackerCommand};
 
-const TRACKER_NFT: [u8; 32] = [0x5a; 32];
+pub(crate) const TRACKER_NFT: [u8; 32] = [0x5a; 32];
 const OTHER_NFT: [u8; 32] = [0x5b; 32];
 
 static STORAGE_INIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// The caps of a test state.
 #[derive(Clone, Copy)]
-struct Caps {
+pub(crate) struct Caps {
     require_reserve: bool,
     recipients: u32,
     updates: u32,
@@ -25,7 +25,7 @@ struct Caps {
     new_edges_per_issuer: u32,
 }
 
-const DEFAULT_CAPS: Caps = Caps {
+pub(crate) const DEFAULT_CAPS: Caps = Caps {
     require_reserve: true,
     recipients: 50,
     updates: 120,
@@ -64,7 +64,7 @@ fn spawn_tracker_thread() -> tokio::sync::mpsc::Sender<TrackerCommand> {
     tx
 }
 
-fn state(caps: Caps) -> AppState {
+pub(crate) fn state(caps: Caps) -> AppState {
     let data_dir = tempfile::tempdir().unwrap().keep();
     let (scanner, tracker_storage, policy_storage) = {
         let _guard = STORAGE_INIT_LOCK.lock().unwrap();
@@ -155,7 +155,7 @@ fn state(caps: Caps) -> AppState {
 
 /// A reserve of `owner` (ERG, or the token `token`), bound to `nft`, in refund since
 /// `refund_height` (0: none).
-fn reserve_info(
+pub(crate) fn reserve_info(
     owner: &PubKey,
     box_id: &str,
     token: Option<[u8; 32]>,
@@ -179,7 +179,7 @@ fn reserve_info(
 }
 
 /// Track a reserve (see [`reserve_info`]).
-async fn add_reserve(
+pub(crate) async fn add_reserve(
     state: &AppState,
     owner: &PubKey,
     box_id: &str,

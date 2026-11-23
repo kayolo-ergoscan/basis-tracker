@@ -313,6 +313,25 @@ mod redemption_api_tests {
                         let _ = response_tx.send(result);
                     }
                     TrackerCommand::Shutdown => break,
+                    TrackerCommand::RepairReserveTreeValue {
+                        issuer_pubkey,
+                        recipient_pubkey,
+                        denomination,
+                        value,
+                        chain_digest,
+                        dry_run,
+                        response_tx,
+                    } => {
+                        let result = redemption_manager.tracker.repair_reserve_tree_value(
+                            &issuer_pubkey,
+                            &recipient_pubkey,
+                            &denomination,
+                            value,
+                            &chain_digest,
+                            dry_run,
+                        );
+                        let _ = response_tx.send(result);
+                    }
                     TrackerCommand::ExchangeNotes {
                         issuer_pubkey,
                         recipient_pubkey,

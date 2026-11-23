@@ -265,6 +265,7 @@ mod http_api_tests {
                     }
                     TrackerCommand::Shutdown => break,
                     TrackerCommand::ExchangeNotes { .. } => {}
+                    TrackerCommand::RepairReserveTreeValue { .. } => {}
                     TrackerCommand::ListStagedExchanges { response_tx } => {
                         let result = redemption_manager.tracker.list_staged_exchanges();
                         let _ = response_tx.send(result);

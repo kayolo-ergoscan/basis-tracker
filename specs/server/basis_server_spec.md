@@ -89,6 +89,9 @@ fjall keyspace waits up to one fsync interval to close.
   (round 5b)
 - `POST /redemption/journal/apply` - Admin: apply a journaled redemption without waiting for the
   chain (round 5b)
+- `POST /redemption/tree/repair` - Admin: set one edge of a reserve tree to the chain's value, only
+  when the tree then hashes to R5 of the reserve box (round 6)
+- `GET /redemption/tree/repairs` - Admin: the recorded reserve tree repairs (round 6)
 - `GET /proof/redemption` - Get redemption-specific proof with tracker state digest
 
 ### Tracker State and Proof Endpoints

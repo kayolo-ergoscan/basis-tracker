@@ -98,7 +98,8 @@ signature_timestamp_tolerance_ms = 30000
 
 With `admin_api_key` set, the shared `api_key` grants only Write access; Admin routes
 (`/redeem/complete`, `GET /redemption/journal`, `POST /redemption/journal/drop`,
-`POST /redemption/journal/apply`, `GET /notes`, `GET /events`, `GET /events/paginated`) require
+`POST /redemption/journal/apply`, `POST /redemption/tree/repair`, `GET /redemption/tree/repairs`,
+`GET /notes`, `GET /events`, `GET /events/paginated`) require
 the admin key.
 Without it, `api_key` keeps its full Admin meaning (a startup warning is printed).
 
