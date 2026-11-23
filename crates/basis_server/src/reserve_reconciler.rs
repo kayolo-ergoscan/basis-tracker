@@ -129,7 +129,7 @@ pub async fn reconcile_reserves(
         )
         .await
         {
-            Ok(Step::InStep) => {}
+            Ok(Step::Matches) => {}
             Ok(Step::Journaled(tx_id)) => {
                 outcome.journaled.push(tx_id);
                 // The digest changes once the confirmer applies it; compare again then.
@@ -159,9 +159,8 @@ pub async fn reconcile_reserves(
 /// What reconciling one reserve found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Step {
-    /// Its box's R5 is the tracker's reserve tree (or the box is not unspent yet: the scanner
-    /// follows it).
-    InStep,
+    /// Its box's R5 is the tracker's reserve tree, or the redemption is journaled already.
+    Matches,
     /// A redemption found on chain was journaled.
     Journaled(String),
     /// Out of step, and not by a redemption the tracker can reproduce: why.
@@ -182,7 +181,7 @@ async fn reconcile_reserve(
         return Err(format!("reserve box {box_id} is not in the UTXO set"));
     };
     if box_digest(&current).as_deref() == Some(tracker_digest) {
-        return Ok(Step::InStep);
+        return Ok(Step::Matches);
     }
 
     // Walk back to the oldest reserve box whose R5 is the tracker's reserve tree.
@@ -350,7 +349,7 @@ async fn reproduce(
     };
     match storage.journaled_redemption(&tx_id) {
         Ok(None) => {}
-        Ok(Some(_)) => return Ok(Step::InStep),
+        Ok(Some(_)) => return Ok(Step::Matches),
         Err(e) => return Err(format!("the redemption journal cannot be read: {e:?}")),
     }
     storage
