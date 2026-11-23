@@ -10,8 +10,9 @@
 //!
 //! `POST /redemption/tree/repair` (Admin) sets the edge's value `timestamp ‖ already_redeemed`
 //! (and the note's cumulative redeemed amount) to the chain's, but only when the reserve tree then
-//! hashes to R5 of the issuer's tracked reserve box, read from the node's UTXO set: it can only
-//! put the tracker where the chain is. The values are given explicitly or taken from a journal
+//! hashes to R5 of the issuer's tracked reserve box, read from the node's UTXO set and at least
+//! `[confirmation] min_depth` blocks deep (review P2-2): it can only put the tracker where the
+//! chain is. The values are given explicitly or taken from a journal
 //! entry (`tx_id`: its `reserve_tree_timestamp` and `new_already_redeemed`). A repeat changes
 //! nothing; `dry_run` shows what it would do. A repair is written to the reserve journal in one
 //! batch with the note (replayed at startup), recorded in the `reserve_tree_repairs` partition
@@ -200,38 +201,23 @@ async fn chain_reserve_digest<T>(
         }
         Err(conflict) => return Err(refuse(StatusCode::CONFLICT, conflict)),
     };
-    let node = &state.config.ergo.scanner;
-    let path = format!("/utxo/byId/{box_id}");
-    let mut request = basis_store::http::bounded_client()
-        .get(format!("{}{path}", node.node_url.trim_end_matches('/')));
-    if let Some(key) = node.api_key.as_deref().filter(|k| !k.is_empty()) {
-        request = request.header("api_key", key);
-    }
     let unreadable = |e: String| {
         refuse(
             StatusCode::BAD_GATEWAY,
             format!("the reserve box {box_id} cannot be read from the node: {e}"),
         )
     };
-    let response = request
-        .send()
+    let Some(body) = node_json(state, &format!("/utxo/byId/{box_id}"))
         .await
-        .map_err(|e| unreadable(e.to_string()))?;
-    match response.status().as_u16() {
-        200 => {}
-        404 => {
-            return Err(refuse(
-                StatusCode::CONFLICT,
-                format!(
-                    "the tracked reserve box {box_id} is not in the node's UTXO set (spent, or not in a block yet); retry once the scanner follows the reserve"
-                ),
-            ))
-        }
-        status => return Err(unreadable(format!("HTTP {status}"))),
-    }
-    let body = basis_store::http::read_json_capped(response)
-        .await
-        .map_err(|e| unreadable(e.to_string()))?;
+        .map_err(unreadable)?
+    else {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!(
+                "the tracked reserve box {box_id} is not in the node's UTXO set (spent, or not in a block yet); retry once the scanner follows the reserve"
+            ),
+        ));
+    };
     let digest = body
         .get("additionalRegisters")
         .and_then(|r| r.get("R5"))
@@ -239,12 +225,67 @@ async fn chain_reserve_digest<T>(
         .and_then(crate::redemption_confirmer::r5_digest_hex)
         .and_then(|hex_digest| hex::decode(hex_digest).ok())
         .and_then(|bytes| <[u8; 33]>::try_from(bytes.as_slice()).ok());
-    match digest {
-        Some(digest) => Ok((box_id, digest)),
-        None => Err(refuse(
+    let Some(digest) = digest else {
+        return Err(refuse(
             StatusCode::CONFLICT,
             format!("the reserve box {box_id} has no reserve tree in R5"),
-        )),
+        ));
+    };
+
+    // Review P2-2: the tracker is aligned only to a box at least `[confirmation] min_depth`
+    // deep, as the confirmer applies redemptions; a shallower one can still be undone.
+    let min_depth = state.config.confirmation.min_depth;
+    let too_shallow = |why: String| {
+        refuse(
+            StatusCode::CONFLICT,
+            format!(
+                "not repaired: the reserve box {box_id} {why}; the tracker repairs towards a reserve box at least {min_depth} blocks deep. Retry in a few minutes."
+            ),
+        )
+    };
+    let Some(created_by) = body.get("transactionId").and_then(|t| t.as_str()) else {
+        return Err(too_shallow("names no creating transaction".to_string()));
+    };
+    let inclusion_height = node_json(state, &format!("/blockchain/transaction/byId/{created_by}"))
+        .await
+        .map_err(unreadable)?
+        .and_then(|tx| tx.get("inclusionHeight").and_then(|h| h.as_u64()))
+        .unwrap_or(0);
+    if inclusion_height == 0 {
+        return Err(too_shallow(format!(
+            "was created by transaction {created_by}, which the blockchain index has not in a block yet"
+        )));
+    }
+    let height = node_json(state, "/info")
+        .await
+        .map_err(unreadable)?
+        .and_then(|info| info.get("fullHeight").and_then(|h| h.as_u64()))
+        .ok_or_else(|| unreadable("the node height is unknown".to_string()))?;
+    let depth = crate::tracker_box_updater::confirmation_depth(height, inclusion_height);
+    if depth < min_depth {
+        return Err(too_shallow(format!(
+            "is only {depth} block(s) deep (created by {created_by} at height {inclusion_height})"
+        )));
+    }
+    Ok((box_id, digest))
+}
+
+/// `GET {scanner node}{path}`: the JSON on 200, `None` on 404, an error otherwise.
+async fn node_json(state: &AppState, path: &str) -> Result<Option<serde_json::Value>, String> {
+    let node = &state.config.ergo.scanner;
+    let mut request = basis_store::http::bounded_client()
+        .get(format!("{}{path}", node.node_url.trim_end_matches('/')));
+    if let Some(key) = node.api_key.as_deref().filter(|k| !k.is_empty()) {
+        request = request.header("api_key", key);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    match response.status().as_u16() {
+        200 => basis_store::http::read_json_capped(response)
+            .await
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        404 => Ok(None),
+        status => Err(format!("HTTP {status} from {path}")),
     }
 }
 

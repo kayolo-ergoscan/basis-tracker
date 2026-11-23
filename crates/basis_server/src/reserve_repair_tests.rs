@@ -2,6 +2,7 @@
 //! real tracker state and a mock node on 127.0.0.1 that holds the reserve box.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Json, State};
@@ -128,26 +129,54 @@ struct Fixture {
     state: AppState,
     /// The node's UTXO set: box id -> R5 (serialized, hex).
     utxo: Arc<Mutex<HashMap<String, String>>>,
+    /// The inclusion height of the transaction that created the reserve box.
+    included_at: Arc<AtomicU64>,
     issuer_secret: [u8; 32],
     issuer: PubKey,
     recipient: PubKey,
 }
 
+/// The transaction that created the reserve box on the mock node.
+fn creating_tx() -> String {
+    "c7".repeat(32)
+}
+
+/// The mock node's height.
+const HEIGHT: u64 = 1_000;
+
 async fn fixture() -> Fixture {
     let utxo: Arc<Mutex<HashMap<String, String>>> = Arc::default();
-    let node_utxo = utxo.clone();
+    // The creating transaction's inclusion height: 10 blocks deep unless a test says otherwise.
+    let included_at = Arc::new(AtomicU64::new(HEIGHT - 10));
+    let (node_utxo, node_included_at) = (utxo.clone(), included_at.clone());
     let (url, _) = crate::local_wallet::tests::mock_node(move |method, target, _| {
+        let not_found = (404, r#"{"error":404}"#.to_string());
+        if method != "GET" {
+            return not_found;
+        }
+        if target == "/info" {
+            return (200, serde_json::json!({ "fullHeight": HEIGHT }).to_string());
+        }
+        if target == format!("/blockchain/transaction/byId/{}", creating_tx()) {
+            return (
+                200,
+                serde_json::json!({ "id": creating_tx(),
+                    "inclusionHeight": node_included_at.load(Ordering::SeqCst) })
+                .to_string(),
+            );
+        }
         match target.strip_prefix("/utxo/byId/") {
-            Some(id) if method == "GET" => match node_utxo.lock().unwrap().get(id) {
+            Some(id) => match node_utxo.lock().unwrap().get(id) {
                 Some(r5) => (
                     200,
                     serde_json::json!({ "boxId": id, "value": 1_000_000_000u64,
+                        "transactionId": creating_tx(),
                         "additionalRegisters": { "R5": r5 } })
                     .to_string(),
                 ),
-                None => (404, r#"{"error":404}"#.to_string()),
+                None => not_found,
             },
-            _ => (404, r#"{"error":404}"#.to_string()),
+            None => not_found,
         }
     })
     .await;
@@ -163,6 +192,7 @@ async fn fixture() -> Fixture {
     let fx = Fixture {
         state,
         utxo,
+        included_at,
         issuer_secret,
         issuer,
         recipient,
@@ -529,4 +559,61 @@ async fn the_repair_route_refuses_what_it_cannot_check() {
 
     assert_eq!(fx.note_redeemed().await, 0);
     assert!(fx.repairs().await.is_empty());
+}
+
+/// Review P2-2: the reserve box was created one block ago, so a reorganization could still
+/// undo it: the repair is refused (409) and nothing changes; two blocks deep, it is made.
+#[tokio::test]
+async fn the_repair_waits_until_the_reserve_box_is_deep_enough() {
+    let fx = fixture().await;
+    let chain = fx.digest_with(BUILT_AT, 300).await;
+    fx.chain_holds(&chain);
+    let before = fx.tracker_digest().await;
+    fx.included_at.store(HEIGHT, Ordering::SeqCst);
+    let (status, body) = fx.repair(fx.explicit(BUILT_AT, 300)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let refusal = body.error.unwrap();
+    assert!(refusal.contains("only 1 block(s) deep"), "{refusal}");
+    assert_eq!(fx.tracker_digest().await, before);
+    assert_eq!(fx.note_redeemed().await, 0);
+    assert!(fx.repairs().await.is_empty());
+
+    fx.included_at.store(HEIGHT - 1, Ordering::SeqCst);
+    let (status, body) = fx.repair(fx.explicit(BUILT_AT, 300)).await;
+    assert_eq!(status, StatusCode::OK, "{:?}", body.error);
+    assert_eq!(fx.tracker_digest().await, chain);
+}
+
+/// Review P2-1 and LOW-1: the drop route remembers the dropped transaction (so the reserve
+/// reconciler never journals it again) and forgets its release request.
+#[tokio::test]
+async fn a_dropped_entry_is_remembered_and_its_release_request_forgotten() {
+    let fx = fixture().await;
+    let tx_id = "3d".repeat(32);
+    let entry = fx.entry(&tx_id, &"00".repeat(33));
+    fx.state.tracker_storage.journal_redemption(&entry).unwrap();
+    let shared = fx.state.shared_tracker_state.lock().await.clone();
+    shared.request_release_commit(&tx_id, &"cd".repeat(32));
+    let (status, _) = crate::redemption_confirmer::drop_journal_entry(
+        State(fx.state.clone()),
+        Json(crate::redemption_confirmer::JournalEntryRequest {
+            tx_id: tx_id.to_ascii_uppercase(),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(fx
+        .state
+        .tracker_storage
+        .journaled_redemptions()
+        .unwrap()
+        .is_empty());
+    let dropped = fx
+        .state
+        .tracker_storage
+        .dropped_redemption(&tx_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(dropped.entry, entry);
+    assert!(shared.get_release_requests().is_empty());
 }
