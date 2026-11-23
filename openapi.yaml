@@ -1311,7 +1311,9 @@ paths:
         again. The answer is the removed entry. If the transaction is mined
         after all, the tracker never applies it and its reserve tree is out of
         step with the chain: drop only a redemption that can no longer be
-        mined, or a marked one already dealt with. Admin only.
+        mined, or a marked one already dealt with. Round 6: the id is
+        remembered, so the reserve reconciler never journals it again when it
+        finds it on chain. Admin only.
       operationId: dropJournaledRedemption
       tags:
         - Redemption
@@ -1422,7 +1424,8 @@ paths:
         the edge's value `timestamp || already_redeemed` and the note's
         cumulative redeemed amount become the given ones, but only when the
         tracker's reserve tree then hashes to R5 of the issuer's tracked
-        reserve box, read from the node's UTXO set. The values are given
+        reserve box, read from the node's UTXO set and at least
+        `[confirmation] min_depth` blocks deep (409 otherwise). The values are given
         explicitly or taken from a journal entry (`tx_id`: its
         `reserve_tree_timestamp` and `new_already_redeemed`). A repeat changes
         nothing (`unchanged`); `dry_run` changes nothing (`would_repair`). A

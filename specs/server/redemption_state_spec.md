@@ -685,7 +685,9 @@ Now:
    the confirmer follows them. Marked entries are applied already and hold nothing back.
 6. **Operator routes (round 5b, F6, Admin only).** `GET /redemption/journal` lists the entries;
    `POST /redemption/journal/drop` `{"tx_id"}` removes one unapplied (its reserve builds again;
-   if it is mined after all, the reserve tree is out of step with the chain);
+   if it is mined after all, the reserve tree is out of step with the chain; round 6: the id is
+   remembered, so the reserve reconciler never journals it again, and its release request is
+   forgotten);
    `POST /redemption/journal/apply` `{"tx_id"}` applies one now, without the chain, and compares
    the reserve tree with the journaled digest (`409` when it cannot be applied or the digests
    differ). The front proxy's route allowlist does not pass them: they are reached on the
@@ -698,7 +700,9 @@ Now:
    reserve answers that no reserve box matches the tracker's reserve tree.
    `POST /redemption/tree/repair` sets one edge's value (`timestamp || already_redeemed`) and the
    note's `amount_redeemed` to the given ones, only when the reserve tree then hashes to R5 of the
-   issuer's tracked reserve box in that denomination, read from the node's UTXO set (`/utxo/byId`).
+   issuer's tracked reserve box in that denomination, read from the node's UTXO set (`/utxo/byId`)
+   and at least `[confirmation] min_depth` blocks deep (its creating transaction's inclusion
+   height from `/blockchain/transaction/byId`; shallower: `409`, retry later).
    So it can only put the tracker where the chain is; anything else is refused (`409`, both
    digests named, nothing changed). Body: `{"tx_id"}` (the journal entry's edge,
    `reserve_tree_timestamp` and `new_already_redeemed`) or
@@ -753,11 +757,18 @@ with the tracker's reserve tree:
   contract and owner R4), at most 8 boxes, to the oldest reserve box whose R5 is the tracker's
   reserve tree. The transaction that spent it is reproduced: its context extension (from the
   indexed input's `spendingProof`, or else `/blocks/{blockId}/transactions`) must be a redemption
-  (variable 0: action 0, and the reserve output it names is the next box), with the receiver
+  (variable 0: action 0, and the reserve output it names is the next box; an empty indexed
+  extension falls back to the block, and with none from either the reserve is compared again at
+  the next pass), with the receiver
   (variable 1) and the note timestamp (variable 4); the redeemed amount is the reserve's value
   (or reserve token) delta, the cumulative amount the edge's stored amount in the tracker's tree
   plus it; and the tracker's reserve tree with that value must hash to R5 of the reserve output;
-- reproduced: it is journaled like the tracker's own redemption (`detected_on_chain: true`; the
+- reproduced, and the confirmer could apply it (the tracker holds the note, the note's
+  `amount_redeemed` equals the edge's stored amount, and the cumulative amount is within the
+  note's total), and no operator dropped it from the journal before (`POST
+  /redemption/journal/drop` remembers dropped transaction ids in partition `redemption_drops`
+  of the `tracker_boxes` store): it is journaled like the tracker's own redemption
+  (`detected_on_chain: true`; the
   spent reserve box, the data inputs, the timestamp and R5 digest), synced to disk, and logged
   (warning). From then on the reserve answers `409` ("found on chain ...; the tracker applies it
   once it is deep enough"), it never holds back a commit (mined already; not restored at startup
@@ -765,7 +776,7 @@ with the tracker's reserve tree:
   the journaled R5 (its reserve output need not be output 0). Several in a row are taken one per
   pass, oldest first;
 - not reproduced (another action changed the tree, the lineage does not reach the tracker's tree,
-  the values give another digest): logged once per reserve box and tracker digest for an operator
+  the values give another digest), not applicable, or dropped by an operator: logged once per reserve box and tracker digest for an operator
   (`POST /redemption/tree/repair`); nothing changes.
 
 **Commits wait for it (round 5, 5b).** The broadcast redemption reads the tracker box as its data
