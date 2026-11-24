@@ -4866,6 +4866,56 @@ pub async fn create_reserve_payload(
         }
     }
 
+    // Round 7 (N9 interim guard, specs/ergo/reserve_admission.md): a new reserve starts with an
+    // empty redemption tree (R5), so for an owner whose reserve tree here holds redemptions in
+    // this denomination it would pay those notes again. Refuse it (the scanner quarantines such
+    // a box made without this payload, too). The guard is off with
+    // `[server] reserve_reopen_guard = false`.
+    {
+        use basis_store::reopen_guard::{ReopenCheck, RESERVE_REOPEN_BLOCKED};
+        let guard = state.ergo_scanner.lock().await.reopen_guard.clone();
+        let owner: basis_store::PubKey = owner_pubkey_bytes
+            .as_slice()
+            .try_into()
+            .expect("33 bytes checked above");
+        let denomination_id = requested_denomination.denomination_id();
+        match guard.check(&owner, &requested_denomination) {
+            ReopenCheck::Allowed => {}
+            ReopenCheck::Unknown => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(crate::models::error_response(format!(
+                        "the tracker is starting and has not loaded its redemption history yet, \
+                         so it cannot tell whether this owner may open a reserve in {}; retry in \
+                         a minute",
+                        denomination_id
+                    ))),
+                );
+            }
+            ReopenCheck::Blocked => {
+                tracing::warn!(
+                    "Refusing /reserves/create for owner {} in {}: the tracker holds redemptions \
+                     there (N9 reopen guard)",
+                    payload.owner_pubkey,
+                    denomination_id
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    Json(crate::models::coded_error_response(
+                        RESERVE_REOPEN_BLOCKED,
+                        &format!(
+                            "this owner has redemptions in {} here. A new reserve \
+                             would start with an empty redemption tree (R5) and could pay those \
+                             notes again (N9), so the tracker does not open one; ask the tracker \
+                             operator.",
+                            denomination_id
+                        ),
+                    )),
+                );
+            }
+        }
+    }
+
     // The reserve is bound to the tracker NFT (R6). Until the tracker box holding that NFT is
     // on chain, the reserve would point at a tracker that does not exist yet and could only be
     // refunded. The tracker box updater records the box once it finds it in the blockchain

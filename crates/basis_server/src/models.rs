@@ -137,6 +137,12 @@ pub struct ApiResponse<T> {
     pub success: bool,
     pub data: Option<T>,
     pub error: Option<String>,
+    /// A machine-readable reason of a refusal, where a route gives one (round 7:
+    /// `reserve_reopen_blocked` of `POST /reserves/create`); the `error` text then starts with
+    /// it too. Left out of the JSON when absent, so every other answer is byte for byte what it
+    /// was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 // Event types for tracker events
@@ -702,6 +708,7 @@ pub fn success_response<T>(data: T) -> ApiResponse<T> {
         success: true,
         data: Some(data),
         error: None,
+        code: None,
     }
 }
 
@@ -711,5 +718,17 @@ pub fn error_response<T>(message: String) -> ApiResponse<T> {
         success: false,
         data: None,
         error: Some(message),
+        code: None,
+    }
+}
+
+/// An error response with a machine-readable `code`; `error` is `"<code>: <message>"`, in the
+/// style of the other coded refusals (`failed_not_oldest_note: ...`).
+pub fn coded_error_response<T>(code: &str, message: &str) -> ApiResponse<T> {
+    ApiResponse {
+        success: false,
+        data: None,
+        error: Some(format!("{code}: {message}")),
+        code: Some(code.to_string()),
     }
 }

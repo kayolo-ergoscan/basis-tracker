@@ -98,6 +98,13 @@ pub struct ServerConfig {
     /// `notes_max_new_edges_per_hour` (round 5).
     #[serde(default = "default_notes_max_new_edges_per_issuer_per_hour")]
     pub notes_max_new_edges_per_issuer_per_hour: u32,
+    /// Round 7 (N9 interim guard, specs/ergo/reserve_admission.md): for an owner and
+    /// denomination whose reserve tree at this tracker holds redemptions, `/reserves/create`
+    /// answers 409 `reserve_reopen_blocked` and the scanner quarantines a new root reserve box,
+    /// which would start with an empty R5 and pay those notes again. Tracked reserves and their
+    /// successors are never affected. Default: true. `false` restores the round 6f behaviour.
+    #[serde(default = "default_reserve_reopen_guard")]
+    pub reserve_reopen_guard: bool,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -122,6 +129,7 @@ impl std::fmt::Debug for ServerConfig {
             notes_max_updates_per_issuer_per_hour,
             notes_max_new_edges_per_hour,
             notes_max_new_edges_per_issuer_per_hour,
+            reserve_reopen_guard,
         } = self;
         f.debug_struct("ServerConfig")
             .field("host", host)
@@ -171,6 +179,7 @@ impl std::fmt::Debug for ServerConfig {
                 "notes_max_new_edges_per_issuer_per_hour",
                 notes_max_new_edges_per_issuer_per_hour,
             )
+            .field("reserve_reopen_guard", reserve_reopen_guard)
             .finish()
     }
 }
@@ -210,6 +219,11 @@ pub fn default_notes_max_new_edges_per_hour() -> u32 {
 
 pub fn default_notes_max_new_edges_per_issuer_per_hour() -> u32 {
     10
+}
+
+/// Default `[server] reserve_reopen_guard` (round 7, N9): on.
+pub fn default_reserve_reopen_guard() -> bool {
+    true
 }
 
 /// Default `[server] redemption_build_max_per_issuer_per_hour`.
@@ -1292,6 +1306,7 @@ mod tests {
                 notes_max_new_edges_per_hour: default_notes_max_new_edges_per_hour(),
                 notes_max_new_edges_per_issuer_per_hour:
                     default_notes_max_new_edges_per_issuer_per_hour(),
+                reserve_reopen_guard: default_reserve_reopen_guard(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1394,6 +1409,7 @@ mod tests {
                 notes_max_new_edges_per_hour: default_notes_max_new_edges_per_hour(),
                 notes_max_new_edges_per_issuer_per_hour:
                     default_notes_max_new_edges_per_issuer_per_hour(),
+                reserve_reopen_guard: default_reserve_reopen_guard(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1552,6 +1568,7 @@ mod tests {
                 notes_max_new_edges_per_hour: default_notes_max_new_edges_per_hour(),
                 notes_max_new_edges_per_issuer_per_hour:
                     default_notes_max_new_edges_per_issuer_per_hour(),
+                reserve_reopen_guard: default_reserve_reopen_guard(),
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -1953,6 +1970,28 @@ mod tests {
         ));
         assert_eq!(server.notes_max_new_edges_per_issuer_per_hour, 3);
         assert_eq!(server.notes_max_new_edges_per_hour, 1000);
+    }
+
+    /// Round 7 (N9): a config without `reserve_reopen_guard` (as in production) gets the guard
+    /// on; `false` turns it off.
+    #[test]
+    fn reserve_reopen_guard_defaults_to_on() {
+        let load = |toml: &str| {
+            config::Config::builder()
+                .add_source(config::File::from_str(toml, config::FileFormat::Toml))
+                .build()
+                .unwrap()
+                .try_deserialize::<AppConfig>()
+                .unwrap()
+                .server
+        };
+        assert!(load(VALID_TOML).reserve_reopen_guard);
+        let off = load(&VALID_TOML.replace(
+            "port = 3048",
+            "port = 3048\n        reserve_reopen_guard = false",
+        ));
+        assert!(!off.reserve_reopen_guard);
+        assert!(format!("{off:?}").contains("reserve_reopen_guard: false"));
     }
 
     #[test]

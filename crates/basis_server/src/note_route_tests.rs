@@ -105,6 +105,7 @@ pub(crate) fn state(caps: Caps) -> AppState {
             notes_max_updates_per_issuer_per_hour: caps.updates,
             notes_max_new_edges_per_hour: caps.new_edges,
             notes_max_new_edges_per_issuer_per_hour: caps.new_edges_per_issuer,
+            reserve_reopen_guard: true,
         },
         ergo: crate::config::ErgoConfig {
             scanner: basis_store::ergo_scanner::NodeConfig::default(),

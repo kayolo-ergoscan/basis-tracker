@@ -572,6 +572,7 @@ async fn start_tracker(
             notes_max_new_edges_per_hour: config::default_notes_max_new_edges_per_hour(),
             notes_max_new_edges_per_issuer_per_hour:
                 config::default_notes_max_new_edges_per_issuer_per_hour(),
+            reserve_reopen_guard: config::default_reserve_reopen_guard(),
         },
         ergo: ErgoConfig {
             scanner: basis_store::ergo_scanner::NodeConfig {

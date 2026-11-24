@@ -118,8 +118,15 @@ async fn main() {
     // Create scanner configuration with actual reserve contract P2S
     let scanner_config = config.ergo_scanner_config();
 
+    // Round 7 (N9 interim guard, specs/ergo/reserve_admission.md): shared by the scanner and
+    // `/reserves/create` (through the scanner state) and the tracker thread, which publishes the
+    // (owner, denomination) pairs with redemptions once it has rebuilt its reserve trees. Set
+    // before the scanner starts, so every clone of the scanner state shares it.
+    let reopen_guard =
+        basis_store::reopen_guard::ReopenGuard::new(config.server.reserve_reopen_guard);
+
     // Create real scanner state with configured node URL and contract template
-    let ergo_scanner = match ServerState::new(scanner_config, &data_dir) {
+    let mut ergo_scanner = match ServerState::new(scanner_config, &data_dir) {
         Ok(scanner) => scanner,
         Err(e) => {
             tracing::warn!("Failed to create Ergo scanner: {}", e);
@@ -133,6 +140,7 @@ async fn main() {
                 .unwrap_or_else(|_| panic!("Failed to create minimal scanner"))
         }
     };
+    ergo_scanner.reopen_guard = reopen_guard.clone();
 
     // Every background loop (the reserve scanner, the tracker box updater) and the HTTP server
     // stop when this is sent, once, on SIGTERM or SIGINT.
@@ -292,6 +300,7 @@ async fn main() {
     // Joined at shutdown: `TrackerCommand::Shutdown` ends the loop after the commands sent
     // before it, and the thread closes data/notes on the way out.
     let tracker_stop_tx = tx.clone();
+    let reopen_guard_for_tracker = reopen_guard.clone();
     let tracker_thread = tokio::task::spawn_blocking(move || {
         use basis_store::RedemptionManager;
 
@@ -300,6 +309,22 @@ async fn main() {
 
         // Update shared state with the rebuilt AVL root digest after initialization
         let mut tracker = tracker;
+        // Round 7 (N9): the reserve trees are rebuilt; publish the pairs with redemptions.
+        tracker.attach_reopen_guard(reopen_guard_for_tracker.clone());
+        if reopen_guard_for_tracker.is_enabled() {
+            tracing::info!(
+                "Reserve reopen guard (N9) on: {} owner/denomination pairs have redemptions; \
+                 /reserves/create refuses them and the scanner quarantines a new root reserve \
+                 of them",
+                reopen_guard_for_tracker.pair_count().unwrap_or(0)
+            );
+        } else {
+            tracing::warn!(
+                "Reserve reopen guard (N9) off ([server] reserve_reopen_guard = false): a new \
+                 reserve of an owner with redemptions starts with an empty R5 and could pay \
+                 redeemed notes again"
+            );
+        }
         let initial_root = tracker.get_state().avl_root_digest;
         shared_state_for_tracker.set_avl_root_digest(initial_root);
         tracing::info!(

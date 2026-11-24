@@ -74,6 +74,7 @@ mod create_reserve_tests {
                 notes_max_updates_per_issuer_per_hour: 120,
                 notes_max_new_edges_per_hour: 1000,
                 notes_max_new_edges_per_issuer_per_hour: 10,
+                reserve_reopen_guard: true,
                 redemption_build_max_per_issuer_per_hour: 6,
                 redemption_build_max_per_hour: 30,
             },
@@ -778,5 +779,148 @@ mod create_reserve_tests {
                 seen[0].target
             );
         }
+    }
+
+    // Round 7: the interim guard against reopening a reserve after redemptions (N9).
+
+    /// The owner of `request` as a key.
+    fn request_owner() -> basis_store::PubKey {
+        hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    /// The token `create_token_test_app_state` serves.
+    const SERVED_TOKEN: &str = "a55b8735ed1a99e46c2c89f8994aacdf4b1109bdcf682f1e5b34479c6e392669";
+
+    /// A token reserve request of the same owner in `SERVED_TOKEN`.
+    fn token_request(nft_id: &str) -> CreateReserveRequest {
+        CreateReserveRequest {
+            erg_amount: 10_000_000,
+            token_amount: 1_000,
+            token_id: SERVED_TOKEN.to_string(),
+            ..request(nft_id)
+        }
+    }
+
+    /// Put a reopen guard, on or off, into the scanner state of `state` (as `main.rs` does from
+    /// `[server] reserve_reopen_guard`), with these pairs with redemptions; `None`: the tracker
+    /// has not published them yet.
+    async fn set_reopen_guard(
+        state: &AppState,
+        enabled: bool,
+        history: Option<Vec<(basis_store::PubKey, basis_store::DenomKey)>>,
+    ) {
+        let guard = basis_store::reopen_guard::ReopenGuard::new(enabled);
+        if let Some(pairs) = history {
+            guard.load(pairs);
+        }
+        state.ergo_scanner.lock().await.reopen_guard = guard;
+    }
+
+    /// Round 7 (N9): the owner has redemptions in ERG at this tracker. An ERG reserve is
+    /// refused with 409 and a `reserve_reopen_blocked` code, in the JSON and at the start of the
+    /// error text; no payload is built.
+    #[tokio::test]
+    async fn test_create_reserve_refuses_a_reopen_after_redemptions() {
+        let nft = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let state = create_test_app_state();
+        set_reopen_guard(
+            &state,
+            true,
+            Some(vec![(request_owner(), basis_store::DenomKey::Erg)]),
+        )
+        .await;
+        let (status, body) = create_reserve_payload(State(state), Json(request(nft))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert!(!body.success);
+        assert!(body.data.is_none());
+        assert_eq!(body.code.as_deref(), Some("reserve_reopen_blocked"));
+        let error = body.error.clone().unwrap();
+        assert!(error.starts_with("reserve_reopen_blocked: "), "{error}");
+        assert!(error.contains("redemptions in erg"), "{error}");
+        assert!(error.len() <= 300, "the wallet shows 300 characters: {error}");
+        let json = serde_json::to_value(&*body).unwrap();
+        assert_eq!(json["code"], "reserve_reopen_blocked");
+        assert_eq!(json["success"], false);
+        assert_eq!(json["error"], error);
+    }
+
+    /// Round 7 (N9): the guard looks at the owner and the denomination together. Without
+    /// redemptions of the owner there (none at all, another owner's, the other denomination's),
+    /// the reserve is created as before, and the answer has no `code` key.
+    #[tokio::test]
+    async fn test_create_reserve_without_history_is_unchanged() {
+        let nft = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let token = basis_store::DenomKey::Token(hex::decode(SERVED_TOKEN).unwrap().try_into().unwrap());
+        let erg = basis_store::DenomKey::Erg;
+        for (history, in_token) in [
+            (vec![], false),
+            (vec![([0x02; 33], erg)], false),
+            (vec![(request_owner(), token)], false),
+            (vec![(request_owner(), erg)], true),
+        ] {
+            let state = create_token_test_app_state();
+            set_reopen_guard(&state, true, Some(history.clone())).await;
+            let body = if in_token { token_request(nft) } else { request(nft) };
+            let (status, response) = create_reserve_payload(State(state), Json(body)).await;
+            assert_eq!(status, StatusCode::OK, "{history:?}, token {in_token}: {response:?}");
+            assert!(response.code.is_none());
+            let json = serde_json::to_value(&*response).unwrap();
+            assert!(json.get("code").is_none(), "{json}");
+        }
+
+        // The same owner with redemptions in the token: a token reserve is refused.
+        let state = create_token_test_app_state();
+        set_reopen_guard(&state, true, Some(vec![(request_owner(), token)])).await;
+        let (status, response) =
+            create_reserve_payload(State(state), Json(token_request(nft))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response:?}");
+        let error = response.error.clone().unwrap();
+        assert!(error.contains(&format!("token:{SERVED_TOKEN}")), "{error}");
+        assert!(error.len() <= 300, "the wallet shows 300 characters: {error}");
+    }
+
+    /// Round 7 (N9): just after a start, before the tracker thread published its redemption
+    /// history, the tracker cannot tell: 503 (the wallet reads it as "restarting"), and a
+    /// payload once the history is there.
+    #[tokio::test]
+    async fn test_create_reserve_waits_for_the_redemption_history() {
+        let nft = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let state = create_test_app_state();
+        set_reopen_guard(&state, true, None).await;
+        let (status, body) =
+            create_reserve_payload(State(state.clone()), Json(request(nft))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        let error = body.error.clone().unwrap();
+        assert!(error.contains("redemption history"), "{error}");
+        state
+            .ergo_scanner
+            .lock()
+            .await
+            .reopen_guard
+            .load(Vec::<(basis_store::PubKey, basis_store::DenomKey)>::new());
+        let (status, body) = create_reserve_payload(State(state), Json(request(nft))).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+    }
+
+    /// Round 7 (N9): with the guard off (`[server] reserve_reopen_guard = false`) the owner with
+    /// redemptions gets the payload, as before round 7; so does every caller of a scanner state
+    /// built without the server's wiring (the guard is off by default there).
+    #[tokio::test]
+    async fn test_create_reserve_with_the_guard_off_is_unchanged() {
+        let nft = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let state = create_test_app_state();
+        assert!(!state.ergo_scanner.lock().await.reopen_guard.is_enabled());
+        set_reopen_guard(
+            &state,
+            false,
+            Some(vec![(request_owner(), basis_store::DenomKey::Erg)]),
+        )
+        .await;
+        let (status, body) = create_reserve_payload(State(state), Json(request(nft))).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(body.data.is_some());
     }
 }

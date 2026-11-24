@@ -370,6 +370,7 @@ async fn harness(node: Node, max_builds_per_pair: u32) -> Harness {
             notes_max_updates_per_issuer_per_hour: 120,
             notes_max_new_edges_per_hour: 1000,
             notes_max_new_edges_per_issuer_per_hour: 10,
+            reserve_reopen_guard: true,
             redemption_build_max_per_issuer_per_hour: 6,
             redemption_build_max_per_hour: 30,
         },
