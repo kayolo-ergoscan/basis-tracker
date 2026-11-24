@@ -17,6 +17,7 @@ pub mod redemption;
 pub mod redemption_blockchain_tests;
 #[cfg(test)]
 pub mod redemption_simple_tests;
+pub mod reopen_guard;
 pub mod reserve_tracker;
 #[cfg(test)]
 mod review_regression_tests;
@@ -519,6 +520,16 @@ pub struct ReserveTreeRepair {
     pub chain_digest: String,
 }
 
+/// The root digest of the empty reserve tree: R5 of a newly created reserve.
+fn empty_reserve_tree_digest() -> [u8; 33] {
+    static EMPTY: std::sync::OnceLock<[u8; 33]> = std::sync::OnceLock::new();
+    *EMPTY.get_or_init(|| {
+        basis_trees::BasisAvlTree::new()
+            .map(|tree| tree.root_digest())
+            .unwrap_or([0u8; 33])
+    })
+}
+
 pub struct TrackerStateManager {
     avl_state: basis_trees::BasisAvlTree,
     current_state: TrackerState,
@@ -571,6 +582,9 @@ pub struct TrackerStateManager {
     committed_tree: Option<CommittedTree>,
     /// Number of committed-tree rebuilds (see [`Self::committed_tree_rebuild_count`]).
     committed_tree_rebuilds: u64,
+    /// Round 7 (N9): the guard told of every (issuer, denomination) pair whose reserve tree
+    /// holds redemptions (see [`Self::attach_reopen_guard`]).
+    reopen_guard: Option<reopen_guard::ReopenGuard>,
     /// Test-only fault-injection hook: while set, `rebuild_tree_canonically`
     /// returns an error without touching the live tree (issue #20 tests).
     #[cfg(test)]
@@ -636,6 +650,7 @@ impl TrackerStateManager {
             recent_values: Vec::new(),
             committed_tree: None,
             committed_tree_rebuilds: 0,
+            reopen_guard: None,
             #[cfg(test)]
             fail_tree_rebuild: false,
         };
@@ -840,6 +855,7 @@ impl TrackerStateManager {
             recent_values: Vec::new(),
             committed_tree: None,
             committed_tree_rebuilds: 0,
+            reopen_guard: None,
             #[cfg(test)]
             fail_tree_rebuild: false,
         };
@@ -2565,6 +2581,40 @@ impl TrackerStateManager {
         }
     }
 
+    /// Round 7 (N9): the (issuer, denomination) pairs whose reserve tree is not empty, the
+    /// redemption history a new reserve of the pair would start without (its R5 is the empty
+    /// tree). The issuer is the reserve owner (R4).
+    pub fn redeemed_reserve_pairs(&self) -> Vec<(PubKey, DenomKey)> {
+        let empty = empty_reserve_tree_digest();
+        self.reserve_avl_states
+            .iter()
+            .filter(|(_, tree)| tree.root_digest() != empty)
+            .map(|(pair, _)| *pair)
+            .collect()
+    }
+
+    /// Round 7 (N9): publish the pairs with redemptions to `guard` now, and every pair whose
+    /// reserve tree changes from now on (a redemption applied, a tree repair), so the scanner
+    /// and `/reserves/create` can refuse to reopen a reserve that would start without them.
+    pub fn attach_reopen_guard(&mut self, guard: reopen_guard::ReopenGuard) {
+        guard.load(self.redeemed_reserve_pairs());
+        self.reopen_guard = Some(guard);
+    }
+
+    /// Tell the attached reopen guard that the reserve tree of a pair changed.
+    fn note_reserve_tree_change(&self, issuer_pubkey: &PubKey, denomination: &DenomKey) {
+        let Some(guard) = &self.reopen_guard else {
+            return;
+        };
+        let changed = self
+            .reserve_avl_states
+            .get(&(*issuer_pubkey, *denomination))
+            .is_some_and(|tree| tree.root_digest() != empty_reserve_tree_digest());
+        if changed {
+            guard.record(issuer_pubkey, denomination);
+        }
+    }
+
     /// Apply a reserve AVL tree update in memory without writing to the journal.
     /// Used during journal replay on startup.
     fn apply_reserve_avl_update(
@@ -2584,7 +2634,9 @@ impl TrackerStateManager {
 
         reserve_tree
             .update(key_bytes, value_bytes)
-            .map_err(|e| NoteError::StorageError(format!("Reserve AVL tree update failed: {}", e)))
+            .map_err(|e| NoteError::StorageError(format!("Reserve AVL tree update failed: {}", e)))?;
+        self.note_reserve_tree_change(issuer_pubkey, denomination);
+        Ok(())
     }
 
     /// Rebuild per-(issuer, denomination) reserve AVL trees from the persisted journal.
@@ -2720,6 +2772,7 @@ impl TrackerStateManager {
             .store_redemption(issuer_pubkey, &note, tree_timestamp, tree_value)?;
         self.reserve_avl_states
             .insert((*issuer_pubkey, *denomination), next_tree);
+        self.note_reserve_tree_change(issuer_pubkey, denomination);
         Ok(())
     }
 
@@ -2811,6 +2864,7 @@ impl TrackerStateManager {
         )?;
         self.reserve_avl_states
             .insert((*issuer_pubkey, *denomination), next_tree);
+        self.note_reserve_tree_change(issuer_pubkey, denomination);
         repair.outcome = ReserveTreeRepairOutcome::Repaired;
         Ok(repair)
     }
