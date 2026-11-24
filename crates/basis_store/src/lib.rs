@@ -585,6 +585,10 @@ pub struct TrackerStateManager {
     /// Round 7 (N9): the guard told of every (issuer, denomination) pair whose reserve tree
     /// holds redemptions (see [`Self::attach_reopen_guard`]).
     reopen_guard: Option<reopen_guard::ReopenGuard>,
+    /// Round 7b (review P2-1): why the reserve trees rebuilt at start may miss redemptions (the
+    /// journal could not be read, or entries were skipped or failed to replay); `None` when the
+    /// whole journal was replayed. The reopen guard then never opens.
+    reserve_history_gap: Option<String>,
     /// Test-only fault-injection hook: while set, `rebuild_tree_canonically`
     /// returns an error without touching the live tree (issue #20 tests).
     #[cfg(test)]
@@ -651,6 +655,7 @@ impl TrackerStateManager {
             committed_tree: None,
             committed_tree_rebuilds: 0,
             reopen_guard: None,
+            reserve_history_gap: None,
             #[cfg(test)]
             fail_tree_rebuild: false,
         };
@@ -856,6 +861,7 @@ impl TrackerStateManager {
             committed_tree: None,
             committed_tree_rebuilds: 0,
             reopen_guard: None,
+            reserve_history_gap: None,
             #[cfg(test)]
             fail_tree_rebuild: false,
         };
@@ -2596,9 +2602,31 @@ impl TrackerStateManager {
     /// Round 7 (N9): publish the pairs with redemptions to `guard` now, and every pair whose
     /// reserve tree changes from now on (a redemption applied, a tree repair), so the scanner
     /// and `/reserves/create` can refuse to reopen a reserve that would start without them.
+    ///
+    /// Round 7b (review P2-1): when the start could not replay the whole reserve AVL journal
+    /// ([`Self::reserve_history_gap`]) the pairs are not published: the trees may miss
+    /// redemptions, and a partial set would let the guard open for them. The guard stays
+    /// "unknown" (`/reserves/create` answers 503, new roots wait) and the gap is logged as an
+    /// error.
     pub fn attach_reopen_guard(&mut self, guard: reopen_guard::ReopenGuard) {
-        guard.load(self.redeemed_reserve_pairs());
+        match &self.reserve_history_gap {
+            None => guard.load(self.redeemed_reserve_pairs()),
+            Some(gap) if guard.is_enabled() => tracing::error!(
+                "Reserve reopen guard (N9) stays closed: the redemption history is incomplete \
+                 ({}). /reserves/create answers 503 and new root reserves wait until the reserve \
+                 AVL journal is repaired; [server] reserve_reopen_guard = false opens them \
+                 without the guard",
+                gap
+            ),
+            Some(_) => {}
+        }
         self.reopen_guard = Some(guard);
+    }
+
+    /// Round 7b (review P2-1): why the reserve trees may miss redemptions, `None` when the
+    /// start replayed the whole reserve AVL journal.
+    pub fn reserve_history_gap(&self) -> Option<&str> {
+        self.reserve_history_gap.as_deref()
     }
 
     /// Tell the attached reopen guard that the reserve tree of a pair changed.
@@ -2642,20 +2670,46 @@ impl TrackerStateManager {
     /// Rebuild per-(issuer, denomination) reserve AVL trees from the persisted journal.
     /// This must be called after `rebuild_avl_tree` so the note keys exist, but
     /// it only operates on the reserve trees, not the note tracker tree.
+    ///
+    /// Round 7b (review P2-1): an error, or an entry skipped (malformed, of an unknown note) or
+    /// failed, is recorded in [`Self::reserve_history_gap`], so the reopen guard stays closed.
     pub fn rebuild_reserve_avl_trees(&mut self) -> Result<(), NoteError> {
+        match self.replay_reserve_avl_journal() {
+            Ok(None) => Ok(()),
+            Ok(Some(gap)) => {
+                tracing::error!("Reserve AVL trees rebuilt with a gap: {}", gap);
+                self.reserve_history_gap = Some(gap);
+                Ok(())
+            }
+            Err(e) => {
+                self.reserve_history_gap = Some(format!(
+                    "the reserve AVL journal could not be read or replayed: {:?}",
+                    e
+                ));
+                Err(e)
+            }
+        }
+    }
+
+    /// Replay the reserve AVL journal into the reserve trees; what was skipped or failed, if
+    /// anything.
+    fn replay_reserve_avl_journal(&mut self) -> Result<Option<String>, NoteError> {
         tracing::info!("Rebuilding reserve AVL trees from journal...");
 
-        let updates = self.storage.iter_reserve_avl_updates().map_err(|e| {
+        let (updates, malformed) = self.storage.iter_reserve_avl_updates_counting_skips().map_err(|e| {
             NoteError::StorageError(format!("Failed to read reserve AVL journal: {:?}", e))
         })?;
 
-        if updates.is_empty() {
+        if updates.is_empty() && malformed == 0 {
             tracing::info!("No reserve AVL journal entries found");
-            return Ok(());
+            return Ok(None);
         }
 
         tracing::info!("Replaying {} reserve AVL journal entries...", updates.len());
 
+        let total = updates.len() + malformed;
+        let mut unknown_notes = 0usize;
+        let mut failed = 0usize;
         for (issuer_pubkey, note_key, denomination, timestamp, already_redeemed) in updates {
             // Reconstruct recipient pubkey from the note key. The note key is the
             // denomination-derived debt key, so we look up the stored note to obtain
@@ -2667,6 +2721,7 @@ impl TrackerStateManager {
                         "Reserve AVL journal references unknown note key {}; skipping",
                         hex::encode(note_key.to_bytes())
                     );
+                    unknown_notes += 1;
                     continue;
                 }
             };
@@ -2683,11 +2738,23 @@ impl TrackerStateManager {
                     hex::encode(issuer_pubkey),
                     e
                 );
+                failed += 1;
             }
         }
 
+        if malformed + unknown_notes + failed > 0 {
+            return Ok(Some(format!(
+                "{} of {} reserve AVL journal entries not replayed: {} malformed, {} of an \
+                 unknown note, {} failed",
+                malformed + unknown_notes + failed,
+                total,
+                malformed,
+                unknown_notes,
+                failed
+            )));
+        }
         tracing::info!("Reserve AVL trees rebuilt successfully");
-        Ok(())
+        Ok(None)
     }
 
     /// Update the already_redeemed amount in the (issuer, denomination) reserve AVL tree.

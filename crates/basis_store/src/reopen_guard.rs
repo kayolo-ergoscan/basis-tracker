@@ -13,8 +13,10 @@
 //! the `reserve_avl_journal` partition of `data/notes`): exactly what R5 of the pair's reserve
 //! held. Only the tracker thread opens `data/notes`, so it publishes the pairs here, and the
 //! scanner and the HTTP handlers read them. Until it has (the first moments after a start) the
-//! answer is [`ReopenCheck::Unknown`]: a root waits, `/reserves/create` answers 503. A tracked
-//! reserve and its successors never ask.
+//! answer is [`ReopenCheck::Unknown`]: a root waits, `/reserves/create` answers 503. It never
+//! publishes them when the start could not replay the whole journal (round 7b, review P2-1):
+//! the trees may miss redemptions, so the answer stays unknown. A tracked reserve and its
+//! successors never ask.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
@@ -32,7 +34,8 @@ pub enum ReopenCheck {
     Allowed,
     /// The tracker holds redemptions of the pair: a new reserve would start without them.
     Blocked,
-    /// The guard is on but the tracker has not published its redemption history yet.
+    /// The guard is on but the tracker has not published its redemption history: not yet (just
+    /// after a start), or not at all (the history is incomplete, round 7b).
     Unknown,
 }
 
@@ -191,6 +194,7 @@ mod tests {
             assert_eq!(guard.check(&recipient, &erg), ReopenCheck::Allowed);
         }
         let mut restarted = crate::TrackerStateManager::new(dir.path());
+        assert_eq!(restarted.reserve_history_gap(), None);
         assert_eq!(restarted.redeemed_reserve_pairs(), vec![(issuer, erg)]);
         let guard = ReopenGuard::new(true);
         restarted.attach_reopen_guard(guard.clone());
@@ -227,6 +231,78 @@ mod tests {
             .unwrap();
         assert_eq!(repair.outcome, crate::ReserveTreeRepairOutcome::Repaired);
         assert_eq!(guard.check(&issuer, &erg), ReopenCheck::Blocked);
+    }
+
+    /// Round 7b (review P2-1): the start cannot replay the whole reserve AVL journal (a
+    /// malformed entry, an entry of an unknown note, an entry whose denomination cannot be read
+    /// and fails the whole read). The tracker then publishes nothing: the guard stays unknown
+    /// for every pair (create answers 503, roots wait), it never opens on a partial history.
+    /// The entries it could replay are still in the trees.
+    #[test]
+    fn an_incomplete_history_keeps_the_guard_closed() {
+        let (issuer, recipient, note) = issuer_and_note();
+        let erg = DenomKey::Erg;
+        let mut full_key = u128::MAX.to_be_bytes().to_vec();
+        full_key.extend_from_slice(&issuer);
+        full_key.extend_from_slice(&[0x77; 32]);
+        let mut bad_denomination = Vec::new();
+        bad_denomination.extend_from_slice(&NOTE_TIMESTAMP.to_be_bytes());
+        bad_denomination.extend_from_slice(&5u64.to_be_bytes());
+        bad_denomination.extend_from_slice(&[0x07; 33]);
+        for (case, gap) in [
+            ("malformed", "1 malformed"),
+            ("unknown note", "1 of an unknown note"),
+            ("bad denomination", "could not be read"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let mut redemptions =
+                    crate::RedemptionManager::new(crate::TrackerStateManager::new(dir.path()));
+                redemptions.tracker.add_note(&issuer, &note).unwrap();
+                redemptions
+                    .complete_redemption_at(
+                        &issuer,
+                        &recipient,
+                        &erg,
+                        300,
+                        Some(300),
+                        Some(NOTE_TIMESTAMP),
+                    )
+                    .unwrap();
+                let storage = &redemptions.tracker.storage;
+                match case {
+                    "malformed" => storage.insert_raw_reserve_avl_journal_entry(&[0xff; 20], &[0; 5]),
+                    "unknown note" => storage
+                        .append_reserve_avl_update(&issuer, &[0x05; 33], &erg, NOTE_TIMESTAMP, 7)
+                        .unwrap(),
+                    _ => storage.insert_raw_reserve_avl_journal_entry(&full_key, &bad_denomination),
+                }
+            }
+            let mut restarted = crate::TrackerStateManager::new(dir.path());
+            let found = restarted.reserve_history_gap().map(str::to_string);
+            assert!(
+                found.as_deref().is_some_and(|found| found.contains(gap)),
+                "{case}: {found:?}"
+            );
+            if case != "bad denomination" {
+                assert_eq!(
+                    restarted.get_already_redeemed(&issuer, &recipient, &erg).unwrap(),
+                    300,
+                    "{case}"
+                );
+            }
+            let guard = ReopenGuard::new(true);
+            restarted.attach_reopen_guard(guard.clone());
+            assert_eq!(guard.pair_count(), None, "{case}");
+            assert_eq!(guard.check(&issuer, &erg), ReopenCheck::Unknown, "{case}");
+            assert_eq!(guard.check(&recipient, &erg), ReopenCheck::Unknown, "{case}");
+            // A later redemption does not open it either.
+            guard.record(&issuer, &erg);
+            assert_eq!(guard.pair_count(), None, "{case}");
+            let off = ReopenGuard::new(false);
+            restarted.attach_reopen_guard(off.clone());
+            assert_eq!(off.check(&issuer, &erg), ReopenCheck::Allowed, "{case}");
+        }
     }
 
     #[test]

@@ -1488,7 +1488,17 @@ impl NoteStorage {
     pub fn iter_reserve_avl_updates(
         &self,
     ) -> Result<Vec<(PubKey, NoteKey, DenomKey, u64, u64)>, NoteError> {
+        Ok(self.iter_reserve_avl_updates_counting_skips()?.0)
+    }
+
+    /// [`Self::iter_reserve_avl_updates`], and the number of malformed entries it skipped
+    /// (round 7b: a skipped entry means the rebuilt reserve trees may miss redemptions).
+    #[allow(clippy::type_complexity)]
+    pub fn iter_reserve_avl_updates_counting_skips(
+        &self,
+    ) -> Result<(Vec<(PubKey, NoteKey, DenomKey, u64, u64)>, usize), NoteError> {
         let mut updates = Vec::new();
+        let mut malformed = 0usize;
 
         for item in self.reserve_avl_journal_partition.iter() {
             let (key, value) = item.map_err(|e| {
@@ -1501,6 +1511,7 @@ impl NoteStorage {
                     key.len(),
                     value.len()
                 );
+                malformed += 1;
                 continue;
             }
 
@@ -1529,7 +1540,15 @@ impl NoteStorage {
             ));
         }
 
-        Ok(updates)
+        Ok((updates, malformed))
+    }
+
+    /// Test hook (round 7b): write a raw reserve AVL journal entry, a damaged one say.
+    #[cfg(test)]
+    pub(crate) fn insert_raw_reserve_avl_journal_entry(&self, key: &[u8], value: &[u8]) {
+        self.reserve_avl_journal_partition
+            .insert(key, value)
+            .expect("raw journal entry");
     }
 }
 
