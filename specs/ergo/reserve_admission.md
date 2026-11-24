@@ -173,7 +173,7 @@ height), read from the start of its body, so a transaction over the body cap sti
 tells it; it is compared with the index height of the cycle, else `/info`
 `fullHeight`. A scan with no valid box at all (manually inserted reserves on a local
 test node, round 6c) removes nothing the chain does not show spent. A removed box is
-remembered (its record and NFT) for a day, about 720 blocks: when a reorg brings it back
+remembered (its record and NFT) for about 720 blocks (round 6f-2: index blocks, below): when a reorg brings it back
 to the scan, it is restored as the tracked box instead of being judged as a root
 (unless a tracked box of the owner in the denomination is in the scan too).
 
@@ -189,6 +189,20 @@ box that the index shows spent is gone (asked only when another tracked box of t
 holds its NFT, or the cycle already read it spent), so the owner's new box waits for the
 root check instead of being quarantined, and the spent box leaves next to its successor
 in the same cycle. The scan list is deduplicated by box id across the re-read.
+
+**Round 6f-2.** The rules for a box the index does not know (the 10-block rule, the
+pending override and the immediate rule next to a sibling) apply only in a cycle whose
+index height is known (`GET /blockchain/indexedHeight` answered with both heights), and
+both the first-unknown height and the current one are index heights, never `/info`
+`fullHeight`: a lagging or rebuilding index does not know boxes that exist, so while
+its height is unknown such a box is kept. The first-unknown height of a box is dropped
+when the box is listed in the scan again, so it starts anew when the box is next
+missing. A removed record expires `REMEMBER_REMOVED_BLOCKS = 720` index blocks after the
+removal (the record stores that height, `removed_height`; a record without one counts
+from the first cycle with a known index height, and that height is stored), never by
+wall-clock: nothing expires in cycles skipped for lag or while the index height is
+unknown. A restored box's removed record is forgotten only once the box is stored again
+in the reserve database.
 
 **Operator release (round 6c).** `POST /reserves/quarantined/release` (Admin; body
 `box_id`, `note`) moves a quarantine record to a journal (`quarantine_releases`,
