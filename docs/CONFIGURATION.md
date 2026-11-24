@@ -43,6 +43,7 @@ notes_max_recipients_per_issuer = 50              # distinct recipients of one i
 notes_max_updates_per_issuer_per_hour = 120       # accepted notes (new or raised) of one issuer
 notes_max_new_edges_per_issuer_per_hour = 10     # new edges of one issuer
 notes_max_new_edges_per_hour = 1000               # new (issuer, recipient, denomination) edges, all issuers
+reserve_reopen_guard = true                       # no new reserve for an owner with redemptions here (N9)
 ```
 
 All windows roll over one hour and answer `429` when reached. `/redemption/build` counts a
@@ -66,6 +67,16 @@ existing edge is not a new edge). With 10 per issuer against 1000 in total, it t
 issuers, each with an active reserve, to use up the total. Only
 accepted notes count: a note the tracker refuses (bad signature, old timestamp, lower debt)
 gives its slot back. The hourly windows live in memory and start empty after a restart.
+
+`reserve_reopen_guard` (round 7, default `true`) is the interim guard against reopening a
+reserve after redemptions (follow-up review N9). A new reserve starts with an empty redemption
+tree in R5, so for an owner whose redemptions in a denomination this tracker holds it would pay
+those notes again. With the guard on, `POST /reserves/create` answers `409` with
+`code: reserve_reopen_blocked` for such an owner and denomination (`503` in the first moments
+after a start, before the history is loaded), and the scanner quarantines a new root reserve box
+of the pair until an operator releases it (`POST /reserves/quarantined/release`). Tracked
+reserves and their successors are never affected. `false` restores the round 6f behaviour. See
+`specs/ergo/reserve_admission.md`.
 
 ### Server Authentication & TLS
 

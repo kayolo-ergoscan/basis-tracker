@@ -227,6 +227,90 @@ spent deep and no successor check is pending (round 6d: the only exception is a 
 the tracked NFTs while none of the tracked boxes is in the scan, which waits instead of
 being quarantined).
 
+## Round 7: reopening after redemptions (N9), interim guard
+
+**The hole (follow-up review N9).** The reserve contract learns which notes were
+redeemed, and for how much, only from R5 of the reserve box being spent. A root reserve
+must start with the empty tree in R5 (the C4 rule above). So when an owner completes a
+refund (#3) and opens a new reserve in the same denomination, with the same NFT or a
+new one, every note of that owner redeemed before has `already_redeemed = 0` against
+the new box and can be redeemed from it again.
+
+**Interim guard (operator's choice "b").** Until a new reserve can carry the history in
+R5 (upstream PR #27 does that in aea7589 with an R5 built from the tracker's digest and
+a `pending_reserve_roots` record per create; not taken here), this tracker refuses to
+open a reserve for an (owner, denomination) pair whose redemption history it holds:
+
+- `POST /reserves/create` answers **409** with `code: "reserve_reopen_blocked"` and an
+  `error` that starts with `reserve_reopen_blocked: ` (the style of the other coded
+  refusals), checked right after the "an active reserve already exists" 409. No
+  payload is built.
+- The scanner quarantines a new **root** reserve box of such a pair with a reason that
+  starts with `reserve_reopen_blocked:`. This is the last root rule in `admit_root`,
+  after the C4 checks, the singleton check and the P2PK proof, so it covers all three
+  ways a box is judged as a root: an owner with no tracked reserve, a box whose lineage
+  from a removed box starts anew, and a box holding the tracked NFT after a completed
+  refund. A box another rule quarantines keeps that reason.
+
+**Never touched.** The tracked box (refresh), its successors (top-up, redemption,
+refund start: the NFT lineage), a box a reorg brought back (restore) and a box already
+in quarantine (sticky) never reach the root rules, so the guard never sees them. A
+top-up is a successor, not a root. A restart on the current data keeps every tracked
+reserve: the boxes are tracked, and the guard asks nothing of them.
+
+**History source: the tracker's reserve trees.** A pair has history when its reserve
+tree in `TrackerStateManager` (per owner = issuer and denomination, the tree whose
+digest a reserve's R5 holds) is not the empty tree. Why this one:
+
+- it is exactly what R5 of the pair's reserve held, so "history" means the same thing
+  the contract would lose;
+- it is persistent: rebuilt at every start from the `reserve_avl_journal` partition of
+  `data/notes`, and it survives the reserve's removal from the reserve database;
+- it covers every way history gets there: a redemption applied by the tracker
+  (`complete_redemption_at` from `/redeem/complete` and the redemption confirmer, via
+  `apply_redemption`), the tree repair towards the chain's R5
+  (`repair_reserve_tree_value`) and the journal replay at start.
+
+Not used: `amount_redeemed` of the notes (also moved by off-chain `/redeem/complete`
+and repairs, and gone with a note), the pending redemption registry (in memory), the
+removed boxes (`removed_reserves` expire after 720 blocks).
+
+Only the tracker thread opens `data/notes`, so it publishes the pairs (`ReopenGuard`,
+`crates/basis_store/src/reopen_guard.rs`) once it has rebuilt its trees, and records a
+pair at every later tree change; the scanner and `/reserves/create` read it. The guard
+is shared through the scanner state (`ServerState::reopen_guard`), set in `main.rs`
+before the scanner starts.
+
+**Startup.** The scanner starts before the tracker thread has rebuilt its trees. Until
+the pairs are published the answer is "unknown": a root waits (`Retry`, or `Deferred`
+for a capped root, as when a node check fails), and `/reserves/create` answers **503**
+("the tracker is starting ..."). Nothing is quarantined on a guess. If the tracker
+thread never publishes (it failed at start), roots keep waiting and creation keeps
+answering 503: the guard fails closed.
+
+**Fresh resync.** A tracker with no reserve trees (new data) has no pairs, so the guard
+blocks nothing beyond the rules above. If only the reserve database is wiped and the
+notes are kept, a reserve that was already reopened after redemptions is a root again
+and is quarantined with this reason; release it (below). The resync caveat below
+applies as before.
+
+**Release.** `POST /reserves/quarantined/release` works as for every reason: the next
+cycle judges the box again. The guard lets a root through only when the release
+journal (`quarantine_releases`) holds a release of **this box** whose record has the
+`reserve_reopen_blocked` reason, so an operator decides about the N9 risk explicitly:
+a box released from another reason that still has history is quarantined again, now
+with this reason, and needs a release of its own. Releasing a reserve accepts that the
+owner's earlier notes could be redeemed from it again.
+
+**Switch.** `[server] reserve_reopen_guard` (bool, default `true`; a config without
+the key gets `true`). `false` is the round 6f behaviour: no 409, no 503 for the history,
+no quarantine. The tracker logs the switch and the number of pairs at start.
+
+**Storage.** Unchanged: no new partition, no new key format. The quarantine records
+use the existing partition with a new reason text. Rollback to round 6f: the binary
+alone; a box quarantined with this reason stays quarantined there (sticky), and
+`POST /reserves/quarantined/release` on 6f releases it as any other.
+
 ## Why the P2PK proof closes the front-run
 
 The v1 lineage-only rule left one residual attack: creating a C4-clean dust reserve
@@ -275,7 +359,8 @@ backing up.
   - `parse_reserve_box` — per-box structural validation only.
   - `admit_reserve_box` — admission decision (lineage for successors, quarantine
     stickiness, restoring a removed box a reorg brought back; round 6d).
-  - `admit_root` — the root rules: C4 checks, singleton, P2PK proof, the per-cycle cap.
+  - `admit_root` — the root rules: C4 checks, singleton, P2PK proof, the per-cycle cap,
+    and last the reopen guard (`reopen_verdict`, round 7).
   - `begin_cycle` — per-cycle state, the tracked NFTs, and the order of the checks
     (round 6d); `index_height` — the index lag guard (round 6e).
   - `spent_deep` / `fetch_tx_inclusion_height` — the removal depth (rounds 6d/6e), and
@@ -291,6 +376,11 @@ backing up.
 - `crates/basis_store/src/persistence.rs` — `QuarantinedReserve`,
   `quarantined_reserves` partition on `ReserveStorage`; `RemovedReserve`,
   `removed_reserves` partition (round 6f).
+- `crates/basis_store/src/reopen_guard.rs` — `ReopenGuard`, `ReopenCheck`,
+  `RESERVE_REOPEN_BLOCKED` (round 7); `TrackerStateManager::redeemed_reserve_pairs` /
+  `attach_reopen_guard` in `crates/basis_store/src/lib.rs` publish the pairs.
+- `crates/basis_server/src/api.rs` — `create_reserve_payload`: the 409/503 of the
+  reopen guard (round 7); `crates/basis_server/src/main.rs` wires the guard.
 - `crates/basis_server/src/reserve_api.rs` — `GET /reserves/quarantined`,
   `POST /reserves/quarantined/release`, `GET /reserves/quarantined/releases`.
 - `crates/basis_cli/src/api.rs` — `submit_reserve_to_node` and helpers

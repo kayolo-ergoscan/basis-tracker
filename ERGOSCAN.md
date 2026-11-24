@@ -5,7 +5,9 @@ https://basis.ergoscan.me/wallet/mainnet; the wallet's code is at https://github
 an official Better Money Labs release.
 
 **Branch:** `ergoscan`. It is upstream `43e2173` plus upstream PR #25 (note trees in debt-key order, fixes #24) plus our
-commits.
+commits. Round 7 adds three commits of upstream PR #27: N15 (`ab75d2d`, crates.io `ergo_avltree_rust` with
+`InsertOrUpdate` in the journal replay), N16 (`2a5284f`, `NoPendingRefund` in the default client policy) and N11
+(`5fef2be`, the previous token reserve script is no longer shipped).
 
 **License:** CC0, the same as upstream. Any of these changes may be taken back upstream.
 
@@ -55,7 +57,10 @@ commits.
 
 **Reserves:**
 - `/reserves` reports the notes' outstanding debt, the ratio and `pending_redemption_amount`;
-- `/reserves/create` writes canonical registers (R7 = `0500`).
+- `/reserves/create` writes canonical registers (R7 = `0500`);
+- round 7, N9 interim guard (`[server] reserve_reopen_guard`, on by default): for an owner whose redemptions in a
+  denomination this tracker holds, `/reserves/create` answers 409 `reserve_reopen_blocked` and the scanner quarantines a
+  new root reserve, since it would start with an empty R5 (specs/ergo/reserve_admission.md).
 
 **New crates:**
 - `basis_bootstrap` mints the tracker NFT and creates the first tracker box;

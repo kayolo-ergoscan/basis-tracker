@@ -513,7 +513,9 @@ paths:
         for their (owner, denomination), or roots that failed setup validation.
         Quarantined boxes are never tracked, so they cannot block an issuer.
         A quarantine lasts until an operator releases the box
-        (`POST /reserves/quarantined/release`).
+        (`POST /reserves/quarantined/release`). Round 7: a reason that starts
+        with `reserve_reopen_blocked:` is a new root reserve of an owner whose
+        redemptions in that denomination this tracker holds (N9 interim guard).
       operationId: getQuarantinedReserves
       tags:
         - Reserves
@@ -542,6 +544,13 @@ paths:
         that still fails them is quarantined again. Meant for boxes an older
         rule quarantined, or a new reserve that appeared while the owner's
         withdrawn one was still tracked. Admin only; not for the front.
+
+        Round 7 (N9): a box quarantined with a `reserve_reopen_blocked` reason
+        is admitted after its release (the other rules permitting), so that
+        release accepts that the owner's earlier notes could be redeemed from it
+        again. A box released from another reason that has the same history is
+        quarantined again with `reserve_reopen_blocked` and needs a release of
+        its own.
       operationId: releaseQuarantinedReserve
       tags:
         - Reserves
@@ -648,6 +657,13 @@ paths:
         a pre-deployment 0.001 ERG UTXO when the wallet has no owner P2PK box),
         while a manual /wallet/payment/send submission is only safe when every
         wallet box belongs to the owner key.
+
+        Round 7 (N9 interim guard, `[server] reserve_reopen_guard`, default on):
+        a new reserve starts with an empty redemption tree (R5), so for an owner
+        whose redemptions in the denomination this tracker holds it would pay
+        those notes again. Such a request gets 409 with
+        `code: reserve_reopen_blocked`; the scanner quarantines such a box made
+        without this route too.
       operationId: createReservePayload
       tags:
         - Reserves
@@ -674,11 +690,23 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
+        '409':
+          description: >-
+            The owner already has an active reserve in the denomination (one per owner and
+            denomination), or, round 7, the owner has redemptions in the denomination at this
+            tracker: `code` is `reserve_reopen_blocked` and `error` starts with
+            `reserve_reopen_blocked: ` (N9 interim guard).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiResponseError'
         '503':
           description: >-
             The tracker box for the configured tracker NFT is not confirmed on chain yet (not
             minted, or not seen in a block by the tracker). A reserve bound to a tracker that
-            does not exist could only be refunded, so no payload is built until it is.
+            does not exist could only be refunded, so no payload is built until it is. Round 7:
+            also just after a start, while the tracker has not loaded its redemption history
+            (with `reserve_reopen_guard` on); retry in a minute.
           content:
             application/json:
               schema:
@@ -2071,6 +2099,12 @@ components:
           type: string
           nullable: true
           description: Error message (null for successful responses)
+        code:
+          type: string
+          description: >-
+            Machine-readable reason of a refusal, present only where a route gives one
+            (round 7: `reserve_reopen_blocked` from `POST /reserves/create`); the `error`
+            text then starts with it. Absent from every other answer.
 
     ApiResponseEmpty:
       allOf:

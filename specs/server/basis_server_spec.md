@@ -312,6 +312,12 @@ The server provides an endpoint to generate reserve creation payloads for Ergo n
   tracker that does not exist and could only be refunded.
 - The server itself refuses to start with an `ergo.tracker_nft_id` that is not 32 bytes of hex
   or is all zeros (a placeholder, never a minted token).
+- HTTP 409 when the owner already has an active reserve in the denomination, or (round 7, N9
+  interim guard, `server.reserve_reopen_guard`, default true) when this tracker holds
+  redemptions of the owner in the denomination: a new reserve would start with an empty R5 and
+  pay those notes again. The answer has `code: "reserve_reopen_blocked"` and an `error` that
+  starts with it. HTTP 503 while the tracker has not loaded that history just after a start.
+  See `specs/ergo/reserve_admission.md`.
 
 - Returns a JSON response compatible with Ergo's `/wallet/payment/send` API:
   - `requests`: Array of payment requests
