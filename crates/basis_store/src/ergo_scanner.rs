@@ -2313,11 +2313,13 @@ impl ServerState {
 
         let tracked = self.reserve_tracker.get_all_reserves();
         {
+            // Round 6f-2 (LOW-1): only tracked boxes missing from this scan; a
+            // box listed again starts counting anew when it is next missing.
             let tracked_ids: std::collections::HashSet<&String> =
                 tracked.iter().map(|r| &r.box_id).collect();
             self.nft_cache()
                 .unknown_since
-                .retain(|box_id, _| tracked_ids.contains(box_id));
+                .retain(|box_id, _| tracked_ids.contains(box_id) && !scanned.contains(box_id));
         }
         for reserve in &tracked {
             if self.nft_cache().box_nft.contains_key(&reserve.box_id) {
@@ -6853,6 +6855,54 @@ mod tests {
                     stored(&uncounted),
                     Some(seen_known.then_some(1_500)),
                     "at {index:?}"
+                );
+            }
+        }
+    }
+
+    /// Round 6f-2 (LOW-1): a tracked box that was missing and unknown to the
+    /// index once, then listed again, starts counting anew when it is missing
+    /// again: its old `since` does not remove it early.
+    #[tokio::test]
+    async fn test_a_box_listed_again_counts_its_unknown_height_anew() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let listed = serde_json::json!([scanned_box_json(
+            &tracked_box,
+            "c0c0",
+            1_000_000_000,
+            &[(TEST_RESERVE_NFT, 1)],
+            None
+        )])
+        .to_string();
+        let mut state = mock_state(spawn_mock_node("[]".to_string(), Default::default()).await);
+        insert_tracked_reserve(&state, &tracked_box, owner);
+        state.remember_nft(&tracked_box, Some(TEST_RESERVE_NFT.to_string()));
+        for (height, is_listed, kept, since) in [
+            (1_000, false, true, Some(1_000)),
+            (1_005, true, true, None),
+            (1_000 + SPENT_REMOVAL_DEPTH + 2, false, true, Some(1_012)),
+            (1_012 + SPENT_REMOVAL_DEPTH - 1, false, true, Some(1_012)),
+            (1_012 + SPENT_REMOVAL_DEPTH, false, false, None),
+        ] {
+            let body = if is_listed {
+                listed.clone()
+            } else {
+                "[]".to_string()
+            };
+            let routes = HashMap::from([indexed_route(height, height)]);
+            state = on_node(state, body, routes).await.0;
+            state.process_scan_boxes().await.unwrap();
+            assert_eq!(
+                state.reserve_tracker.get_reserve(&tracked_box).is_ok(),
+                kept,
+                "height {height}"
+            );
+            if kept {
+                assert_eq!(
+                    state.nft_cache().unknown_since.get(&tracked_box).copied(),
+                    since,
+                    "height {height}"
                 );
             }
         }
