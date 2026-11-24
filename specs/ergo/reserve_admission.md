@@ -68,9 +68,15 @@ holds:
    it. When the walk gives no verdict (depth used up, a transaction over the 2 MiB body
    cap, a node error), a singleton NFT decides: with the tracked box spent, no other box
    can hold it. Round 6d: so it does when the index does not know the tracked box (a
-   reorg dropped the transaction that made it) or still shows it unspent, so a
-   successor a reorg dropped never strands the reserve. Otherwise the box is pending
-   (retried), never quarantined for that.
+   reorg dropped the transaction that made it), so a successor a reorg dropped never
+   strands the reserve. Otherwise the box is pending (retried), never quarantined for
+   that. Round 6e: a tracked box the index does not know is not on chain, so its R7
+   says nothing: the walk goes back to a box removed lately (an earlier box of the
+   lineage, on chain) and judges each step from there; an NFT that entered the box from
+   outside any reserve box makes it a root; otherwise the singleton decides only when R7
+   equals the tracked box's, and the box is pending when it does not. When the index
+   shows the tracked box unspent, it lags or the box is an earlier one: only a box the
+   walk leads back to the tracked box follows it; otherwise it is pending.
 
    **Round 6d: a completed refund starts anew.** Every step from the tracked box to the
    box (the direct spend, each walked input, the singleton decision) must keep a
@@ -111,6 +117,11 @@ once quarantined is never re-evaluated, so an attacker cannot regain admission b
 timing a box against a legitimate successor in a later scan cycle. Only an operator
 release (below) lifts it.
 
+**Round 6e: a removed box anchors its successor.** A removed box is remembered with its
+record and NFT for a day (below). A box holding that NFT, of the same owner and
+denomination, is checked as a successor of the removed box (it goes first in the cycle):
+the successor of a box the scan missed for a while is followed, not judged as a root.
+
 If the proof fetch is inconclusive (node error fetching the creating transaction), the
 box is **pending**: it is neither admitted nor quarantined, and the tracked box for
 the same `(owner, denomination)` is not removed as spent that cycle — a transient
@@ -118,9 +129,11 @@ node error must not orphan the lineage and brick the issuer. Round 6c: only whil
 tracked box is the owner's only reserve there; once a successor holding its NFT is
 tracked, a pending check never keeps the spent box next to it. Round 6d: only a box that
 holds (or may hold) the tracked box's NFT keeps it; a root candidate that is retried
-keeps nothing. The lineage and ownership checks share a budget of 512 node requests per
-scan cycle; past it a check is pending (a successor with a singleton NFT is still
-followed).
+keeps nothing. Round 6e: not past the refund either: a tracked box with a pending
+refund (`R7 != 0`) whose 43,200 blocks have passed, and whose spend is deep (below), is
+removed even while a check is pending. The lineage and ownership checks share a budget
+of 512 node requests per scan cycle; past it a check is pending (a successor with a
+singleton NFT is still followed).
 
 **Node requests per cycle (round 6d).** A scan cycle starts by learning the NFT of every
 tracked reserve (from the scan, else one `GET /blockchain/box/byId`) and checks first
@@ -132,19 +145,31 @@ candidates are capped at `MAX_ROOT_CHECKS_PER_CYCLE = 128` per cycle (never-chec
 first, then the least recently checked; past the cap they wait for the next cycle). A
 transaction or box read once in a cycle is reused by every check of that cycle (errors
 too, up to 64 MiB of transaction inputs), so one transaction over the 2 MiB body cap that
-makes 512 junk roots costs one request per cycle.
+makes 512 junk roots costs one request per cycle. Round 6e: a cycle is skipped when
+`GET /blockchain/indexedHeight` gives an `indexedHeight` more than `MAX_INDEX_LAG = 2`
+blocks behind its `fullHeight` (a lagging index shows spent boxes as unspent; a node
+that does not answer it is scanned anyway). The checks on the shared budget stop after
+120 s of a cycle (pending). The cached singleton answers are kept only for the NFTs in
+the scan and of the tracked and removed boxes.
 
-**Spent reserves (round 6c).** A tracked reserve absent from the scan is spent and
-removed. When the scan lists no valid box at all, the snapshot is not taken as
-authoritative (manually inserted reserves on a local test node), so an absent reserve
-is removed only when `GET /blockchain/box/byId` shows it spent: the last reserve, withdrawn
-by refund completion, no longer stays tracked for good (which made the owner's next
-reserve a quarantined newcomer). Round 6d: and only once that spend is at least
-`SPENT_REMOVAL_DEPTH = 10` blocks deep (`spendingHeight` of the box, else the spending
-transaction's `inclusionHeight`, against `/info` `fullHeight`). A removed box is
-remembered (box id and NFT) for a day, about 720 blocks: when a reorg brings it back to
-the scan, it is restored as the tracked box instead of being judged as a root (unless a
-tracked box of the owner in the denomination is in the scan too).
+**Spent reserves (rounds 6c–6e).** A tracked reserve absent from the scan is removed
+only when a box holding its NFT is tracked in the same cycle (its successor), or when
+`GET /blockchain/box/byId` shows it spent and the spend is at least
+`SPENT_REMOVAL_DEPTH = 10` blocks deep. Round 6e: this holds for every scan. The scan
+is read page by page (100 boxes, newest first), so an unspent box can be missing from
+it: anyone can push the tracked box past page 0 with 100 boxes at the contract address
+and top it up between two page reads, and the address may simply hold more than 100
+boxes; before round 6e such a box was removed at once and its successor then judged as
+a root (quarantined for good once R5 was used). The scan also reads page 0 again after
+the last page, so a box made meanwhile is seen in the same cycle. The spend height is
+the spending transaction's `inclusionHeight` (`/blockchain/box/byId` has no spend
+height), read from the start of its body, so a transaction over the body cap still
+tells it; it is compared with the index height of the cycle, else `/info`
+`fullHeight`. A scan with no valid box at all (manually inserted reserves on a local
+test node, round 6c) removes nothing the chain does not show spent. A removed box is
+remembered (its record and NFT) for a day, about 720 blocks: when a reorg brings it back
+to the scan, it is restored as the tracked box instead of being judged as a root
+(unless a tracked box of the owner in the denomination is in the scan too).
 
 **Operator release (round 6c).** `POST /reserves/quarantined/release` (Admin; body
 `box_id`, `note`) moves a quarantine record to a journal (`quarantine_releases`,
@@ -164,8 +189,8 @@ error as defense in depth; with admission control it should be unreachable.
 
 A newcomer never displaces a tracked reserve: while the owner has one tracked in a
 denomination, every other box of that owner and denomination goes through the successor
-rule, and the tracked box leaves the tracker only when the scan no longer lists it (spent)
-and no successor check is pending (round 6d: the only exception is a box holding none of
+rule, and the tracked box leaves the tracker only when its successor is tracked, or it is
+spent deep and no successor check is pending (round 6d: the only exception is a box holding none of
 the tracked NFTs while none of the tracked boxes is in the scan, which waits instead of
 being quarantined).
 
@@ -219,7 +244,8 @@ backing up.
     stickiness, restoring a removed box a reorg brought back; round 6d).
   - `admit_root` — the root rules: C4 checks, singleton, P2PK proof, the per-cycle cap.
   - `begin_cycle` — per-cycle state, the tracked NFTs, and the order of the checks
-    (round 6d).
+    (round 6d); `index_height` — the index lag guard (round 6e).
+  - `spent_deep` / `fetch_tx_inclusion_height` — the removal depth (rounds 6d/6e).
   - `p2pk_ergo_tree` / `has_owner_p2pk_input` — the `0008cd || pubkey` proof check.
   - `is_lineage_successor` — the tracked box's spender first, then a bounded backwards
     walk over `/blockchain/transaction/byId` following the reserve NFT (round 6b), with
