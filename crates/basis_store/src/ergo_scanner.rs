@@ -68,6 +68,7 @@ impl From<IndexedErgoBox> for ScanBox {
 
 use crate::{
     persistence::{QuarantinedReserve, RemovedReserve, ReserveStorage, ScannerMetadataStorage},
+    reopen_guard::{ReopenCheck, ReopenGuard, RESERVE_REOPEN_BLOCKED},
     ExtendedReserveInfo, ReserveTracker,
 };
 
@@ -527,6 +528,11 @@ pub struct ServerState {
     pub nft_cache: Arc<std::sync::Mutex<NftCache>>,
     /// What the current scan cycle has asked the node (round 6d).
     pub cycle: Arc<std::sync::Mutex<CycleState>>,
+    /// Round 7 (N9): the interim guard against reopening a reserve after redemptions, shared
+    /// with the tracker thread and `/reserves/create`. Off unless the server sets it from
+    /// `[server] reserve_reopen_guard` (`main.rs`), so a scanner built here alone behaves as
+    /// before round 7.
+    pub reopen_guard: ReopenGuard,
 }
 
 impl ServerState {
@@ -635,6 +641,7 @@ impl ServerState {
             reserve_storage,
             nft_cache: Arc::new(std::sync::Mutex::new(nft_cache)),
             cycle: Arc::default(),
+            reopen_guard: ReopenGuard::default(),
         })
     }
 
@@ -2033,7 +2040,7 @@ impl ServerState {
             .has_owner_root(scan_box, &nft, &reserve_info.owner_pubkey, contract_address)
             .await
         {
-            Ok(true) => ReserveAdmission::Admitted,
+            Ok(true) => self.reopen_verdict(reserve_info, capped),
             Ok(false) => ReserveAdmission::Quarantined {
                 reason: format!(
                     "reserve root {} for owner {} was created by a transaction spending no P2PK input of the R4 key, \
@@ -2043,6 +2050,79 @@ impl ServerState {
                 ),
             },
             Err(e) => retry("Ownership check", e),
+        }
+    }
+
+    /// Round 7 (N9 interim guard): the last root rule. A root that passes all the
+    /// others is still not admitted when the tracker holds redemptions of its owner
+    /// in its denomination: it starts with an empty R5, so the contract would pay
+    /// those notes again. It is quarantined with a `reserve_reopen_blocked` reason,
+    /// unless an operator released it from such a quarantine
+    /// (`POST /reserves/quarantined/release`). Until the tracker has published its
+    /// history (just after a start) the root waits, like a root without a verdict.
+    /// Only roots get here: the tracked box, its successors and a restored box
+    /// never do.
+    fn reopen_verdict(&self, reserve_info: &ExtendedReserveInfo, capped: bool) -> ReserveAdmission {
+        let wait = if capped {
+            ReserveAdmission::Deferred
+        } else {
+            ReserveAdmission::Retry
+        };
+        // A parsed box has a 33-byte owner key and, being parsed, a denomination; a pair
+        // that cannot be keyed has no reserve tree at the tracker either.
+        let owner: Option<crate::PubKey> = hex::decode(&reserve_info.owner_pubkey)
+            .ok()
+            .and_then(|bytes| bytes.as_slice().try_into().ok());
+        let (Some(owner), Some(denomination)) = (owner, reserve_info.denomination()) else {
+            return ReserveAdmission::Admitted;
+        };
+        let box_id = &reserve_info.box_id;
+        match self.reopen_guard.check(&owner, &denomination) {
+            ReopenCheck::Allowed => ReserveAdmission::Admitted,
+            ReopenCheck::Unknown => {
+                info!(
+                    "Reserve root {} waits: the tracker has not published its redemption history yet",
+                    box_id
+                );
+                wait
+            }
+            ReopenCheck::Blocked => match self.reserve_storage.quarantine_releases() {
+                Ok(releases)
+                    if releases.iter().any(|release| {
+                        release.record.box_id == *box_id
+                            && release.record.reason.starts_with(RESERVE_REOPEN_BLOCKED)
+                    }) =>
+                {
+                    warn!(
+                        "Admitting reserve root {} of {} in {}: the tracker holds redemptions there, \
+                         but an operator released this box from the reopen guard",
+                        box_id,
+                        reserve_info.owner_pubkey,
+                        denomination.denomination_id()
+                    );
+                    ReserveAdmission::Admitted
+                }
+                Ok(_) => ReserveAdmission::Quarantined {
+                    reason: format!(
+                        "{}: reserve root {} of owner {} in denomination {} starts with an empty \
+                         redemption tree (R5), while this tracker holds redemptions of that owner \
+                         there, so notes redeemed before could be redeemed again from it (N9). \
+                         Round 7 interim guard; an operator who checked it can release it with \
+                         POST /reserves/quarantined/release",
+                        RESERVE_REOPEN_BLOCKED,
+                        box_id,
+                        reserve_info.owner_pubkey,
+                        denomination.denomination_id()
+                    ),
+                },
+                Err(e) => {
+                    warn!(
+                        "Reading the quarantine releases for reserve root {} failed ({:?}); retrying next cycle",
+                        box_id, e
+                    );
+                    wait
+                }
+            },
         }
     }
 
@@ -6965,5 +7045,395 @@ mod tests {
                 .iter()
                 .any(|removed| removed.record.box_id == box_id && stored));
         }
+    }
+
+    // Round 7: the interim guard against reopening a reserve after redemptions (N9).
+
+    /// The owner of the test reserve boxes (`VALID_PREFIXED_PUBKEY`) as a key.
+    fn test_owner() -> crate::PubKey {
+        hex::decode(&VALID_PREFIXED_PUBKEY[2..])
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    /// `state` with the reopen guard on and these (owner, denomination) pairs with
+    /// redemptions at the tracker; `None`: the tracker has not published them yet.
+    fn with_reopen_guard(
+        state: ServerState,
+        history: Option<Vec<(crate::PubKey, crate::DenomKey)>>,
+    ) -> ServerState {
+        let guard = ReopenGuard::new(true);
+        if let Some(pairs) = history {
+            guard.load(pairs);
+        }
+        ServerState {
+            reopen_guard: guard,
+            ..state
+        }
+    }
+
+    /// A clean ERG root of the test owner, made by a transaction that spends the
+    /// owner's P2PK input, on a node that serves that transaction.
+    async fn owner_root() -> (ServerState, TaggedScanBox) {
+        let mut scan_box = c4_test_box();
+        scan_box.box_id = "31".repeat(32);
+        scan_box.transaction_id = "e7".repeat(32);
+        let routes = HashMap::from([owner_root_tx(&scan_box.transaction_id)]);
+        let state = mock_state(spawn_mock_node("[]".to_string(), std::sync::Arc::new(routes)).await);
+        (state, tagged_erg(scan_box))
+    }
+
+    /// Round 7 (N9): the tracker holds redemptions of the owner in ERG, so a new
+    /// clean root of the owner in ERG is quarantined with the reopen reason (and
+    /// stays so); an operator release lets the next check admit it. Redemptions in
+    /// another denomination, or of another owner, block nothing; with no history
+    /// (a fresh tracker) the root is admitted as before.
+    #[tokio::test]
+    async fn test_reopen_guard_quarantines_a_new_root_until_released() {
+        let owner = test_owner();
+        let box_id = "31".repeat(32);
+        let token = crate::DenomKey::Token([0x99; 32]);
+        for (history, blocked) in [
+            (vec![(owner, crate::DenomKey::Erg)], true),
+            (vec![(owner, token)], false),
+            (vec![([0x02; 33], crate::DenomKey::Erg)], false),
+            (vec![], false),
+        ] {
+            let (state, tagged) = owner_root().await;
+            let state = with_reopen_guard(state, Some(history.clone()));
+            let case = format!("history {history:?}");
+            if !blocked {
+                assert_eq!(
+                    state.ingest_scan_box(&tagged).await,
+                    ScanBoxIngest::Tracked(box_id.clone()),
+                    "{case}"
+                );
+                continue;
+            }
+            for _ in 0..2 {
+                assert_eq!(
+                    state.ingest_scan_box(&tagged).await,
+                    ScanBoxIngest::Rejected(box_id.clone()),
+                    "{case}"
+                );
+            }
+            let record = state
+                .reserve_storage
+                .get_quarantined(&box_id)
+                .unwrap()
+                .expect("quarantined");
+            assert!(
+                record.reason.starts_with(RESERVE_REOPEN_BLOCKED),
+                "{}",
+                record.reason
+            );
+            assert!(state.reserve_tracker.get_reserve(&box_id).is_err());
+
+            let release = state
+                .reserve_storage
+                .release_quarantined(&box_id, "the owner's reserve; creditors told", 1)
+                .unwrap()
+                .expect("released");
+            assert!(release.record.reason.starts_with(RESERVE_REOPEN_BLOCKED));
+            assert_eq!(
+                state.ingest_scan_box(&tagged).await,
+                ScanBoxIngest::Tracked(box_id.clone()),
+                "{case}"
+            );
+            assert!(state.reserve_storage.get_quarantined(&box_id).unwrap().is_none());
+        }
+    }
+
+    /// Round 7 (N9): a release from another quarantine is no release from the
+    /// reopen guard: a box once quarantined for another reason, released, and now
+    /// held only by the guard, is quarantined again with the reopen reason, and a
+    /// release of that admits it.
+    #[tokio::test]
+    async fn test_reopen_guard_needs_a_release_of_its_own() {
+        let (state, tagged) = owner_root().await;
+        let state = with_reopen_guard(state, Some(vec![(test_owner(), crate::DenomKey::Erg)]));
+        let box_id = "31".repeat(32);
+        state
+            .reserve_storage
+            .store_quarantined(&QuarantinedReserve {
+                box_id: box_id.clone(),
+                owner_pubkey: VALID_PREFIXED_PUBKEY[2..].to_string(),
+                denomination: "erg".to_string(),
+                reason: "an older rule".to_string(),
+                quarantined_at: 0,
+            })
+            .unwrap();
+        state
+            .reserve_storage
+            .release_quarantined(&box_id, "older rule", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.ingest_scan_box(&tagged).await,
+            ScanBoxIngest::Rejected(box_id.clone())
+        );
+        let record = state.reserve_storage.get_quarantined(&box_id).unwrap().unwrap();
+        assert!(record.reason.starts_with(RESERVE_REOPEN_BLOCKED), "{}", record.reason);
+        state
+            .reserve_storage
+            .release_quarantined(&box_id, "reopen checked", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.ingest_scan_box(&tagged).await,
+            ScanBoxIngest::Tracked(box_id)
+        );
+    }
+
+    /// Round 7 (N9): until the tracker publishes its redemption history (the first
+    /// moments after a start) a root waits: deferred, not quarantined, not tracked.
+    #[tokio::test]
+    async fn test_reopen_guard_defers_a_root_until_the_history_is_known() {
+        let (state, tagged) = owner_root().await;
+        let state = with_reopen_guard(state, None);
+        let box_id = "31".repeat(32);
+        assert_eq!(
+            state.ingest_scan_box(&tagged).await,
+            ScanBoxIngest::Deferred(box_id.clone())
+        );
+        assert!(state.reserve_storage.get_quarantined(&box_id).unwrap().is_none());
+        state
+            .reopen_guard
+            .load(Vec::<(crate::PubKey, crate::DenomKey)>::new());
+        assert_eq!(
+            state.ingest_scan_box(&tagged).await,
+            ScanBoxIngest::Tracked(box_id)
+        );
+    }
+
+    /// Round 7 (N9): with the guard off (`[server] reserve_reopen_guard = false`)
+    /// the root is admitted whatever the history, as before round 7.
+    #[tokio::test]
+    async fn test_reopen_guard_off_admits_the_root() {
+        let (state, tagged) = owner_root().await;
+        let guard = ReopenGuard::new(false);
+        guard.load(vec![(test_owner(), crate::DenomKey::Erg)]);
+        let state = ServerState {
+            reopen_guard: guard,
+            ..state
+        };
+        assert_eq!(
+            state.ingest_scan_box(&tagged).await,
+            ScanBoxIngest::Tracked("31".repeat(32))
+        );
+    }
+
+    /// Round 7 (N9): the owner completes the refund of the tracked reserve into a
+    /// clean box holding the same NFT (judged as a root since round 6d). With
+    /// redemptions at the tracker it is quarantined with the reopen reason, not
+    /// tracked, and the refunding box is not touched by it.
+    #[tokio::test]
+    async fn test_reopen_guard_quarantines_a_refund_completion_root() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let recreated = "13".repeat(32);
+        let spend_tx = "e1".repeat(32);
+        let mut refunding = reserve_input(&tracked_box, "c0c0", &[(TEST_RESERVE_NFT, 1)]);
+        refunding["additionalRegisters"]["R5"] = serde_json::Value::from(used_tree_register());
+        refunding["additionalRegisters"]["R7"] = serde_json::Value::from(R7_REFUND_1000);
+        let routes = HashMap::from([
+            tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&spend_tx)),
+            (spend_tx.clone(), tx_json_inputs(&spend_tx, vec![refunding])),
+        ]);
+        let box_r = scanned_box_json(
+            &recreated,
+            &spend_tx,
+            1_000_000_000,
+            &[(TEST_RESERVE_NFT, 1)],
+            Some("0500"),
+        );
+        for history in [true, false] {
+            let state = mock_state(
+                spawn_mock_node(
+                    serde_json::json!([box_r.clone()]).to_string(),
+                    std::sync::Arc::new(routes.clone()),
+                )
+                .await,
+            );
+            let pairs = if history {
+                vec![(test_owner(), crate::DenomKey::Erg)]
+            } else {
+                vec![]
+            };
+            let state = with_reopen_guard(state, Some(pairs));
+            insert_tracked_reserve(&state, &tracked_box, owner);
+            let mut info = state.reserve_tracker.get_reserve(&tracked_box).unwrap();
+            info.base_info.refund_initiation_height = 1000;
+            state.reserve_tracker.update_reserve(info).unwrap();
+            state.process_scan_boxes().await.unwrap();
+            assert_eq!(
+                state.reserve_tracker.get_reserve(&recreated).is_ok(),
+                !history,
+                "history {history}"
+            );
+            let quarantined = state.reserve_storage.get_quarantined(&recreated).unwrap();
+            assert_eq!(quarantined.is_some(), history, "history {history}");
+            if let Some(record) = quarantined {
+                assert!(
+                    record.reason.starts_with(RESERVE_REOPEN_BLOCKED),
+                    "{}",
+                    record.reason
+                );
+            }
+        }
+    }
+
+    /// Round 7 (N9): the guard never touches a tracked reserve or its successors.
+    /// With redemptions of the owner at the tracker, and also before the tracker
+    /// published them, the tracked box is refreshed, and a successor made by a
+    /// top-up (R5 as it was), a redemption (R5 used) or a refund start (R7 set) is
+    /// followed; nothing is quarantined.
+    #[tokio::test]
+    async fn test_reopen_guard_leaves_tracked_reserves_and_successors_alone() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let successor_box = "55".repeat(32);
+        let successor_tx = "bb".repeat(32);
+        let routes = std::sync::Arc::new(HashMap::from([
+            (
+                successor_tx.clone(),
+                tx_json_inputs(
+                    &successor_tx,
+                    vec![
+                        plain_input(&"cd".repeat(32), "some_address", &"ce".repeat(32), "0008cd02"),
+                        reserve_input(&tracked_box, &"cc".repeat(32), &[(TEST_RESERVE_NFT, 1)]),
+                    ],
+                ),
+            ),
+            tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&successor_tx)),
+        ]));
+        for history in [Some(vec![(test_owner(), crate::DenomKey::Erg)]), None] {
+            for (action, r5, r7) in [
+                ("top-up", empty_reserve_tree_register(), None),
+                ("redemption", used_tree_register(), None),
+                ("refund start", used_tree_register(), Some(R7_REFUND_1000)),
+            ] {
+                let case = format!("{action}, history {history:?}");
+                let state = with_reopen_guard(
+                    mock_state(spawn_mock_node("[]".to_string(), routes.clone()).await),
+                    history.clone(),
+                );
+                insert_tracked_reserve(&state, &tracked_box, owner);
+
+                let mut tracked = c4_test_box();
+                tracked.box_id = tracked_box.clone();
+                assert_eq!(
+                    state.ingest_scan_box(&tagged_erg(tracked)).await,
+                    ScanBoxIngest::Tracked(tracked_box.clone()),
+                    "{case}"
+                );
+
+                let mut successor = c4_test_box();
+                successor.box_id = successor_box.clone();
+                successor.transaction_id = successor_tx.clone();
+                successor.additional_registers.insert("R5".to_string(), r5);
+                if let Some(r7) = r7 {
+                    successor
+                        .additional_registers
+                        .insert("R7".to_string(), r7.to_string());
+                }
+                assert_eq!(
+                    state.ingest_scan_box(&tagged_erg(successor)).await,
+                    ScanBoxIngest::Tracked(successor_box.clone()),
+                    "{case}"
+                );
+                assert!(
+                    state.reserve_storage.get_all_quarantined().unwrap().is_empty(),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// Round 7 (N9): a restart on live data. Three reserves are tracked and
+    /// persisted (fresh, after redemptions, with a refund started), their owners
+    /// all have redemptions at the tracker. A new scanner on the same data dir with
+    /// the guard on (history published or not yet) lists the three boxes: all stay
+    /// tracked, nothing is quarantined.
+    #[tokio::test]
+    async fn test_reopen_guard_restart_on_live_data_quarantines_nothing() {
+        let owners: Vec<String> = (0..3).map(test_owner_key).collect();
+        let boxes: Vec<String> = ["a1", "a2", "a3"].iter().map(|b| b.repeat(32)).collect();
+        let data_dir = std::env::temp_dir().join(format!(
+            "basis_scanner_reopen_restart_test_{}_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        ));
+        let listed: Vec<serde_json::Value> = boxes
+            .iter()
+            .zip(&owners)
+            .enumerate()
+            .map(|(i, (box_id, owner))| {
+                let nft = format!("{:064x}", 0x4e00 + i);
+                let mut listed = scanned_box_json(
+                    box_id,
+                    &"c0".repeat(32),
+                    1_000_000_000,
+                    &[(nft.as_str(), 1)],
+                    (i == 2).then_some(R7_REFUND_1000),
+                );
+                listed["additionalRegisters"]["R4"] = serde_json::Value::from(format!("07{owner}"));
+                if i > 0 {
+                    listed["additionalRegisters"]["R5"] =
+                        serde_json::Value::from(used_tree_register());
+                }
+                listed
+            })
+            .collect();
+        let history: Vec<(crate::PubKey, crate::DenomKey)> = owners
+            .iter()
+            .map(|owner| {
+                (
+                    hex::decode(owner).unwrap().try_into().unwrap(),
+                    crate::DenomKey::Erg,
+                )
+            })
+            .collect();
+        let open = |addr: std::net::SocketAddr| {
+            ServerState::new(
+                NodeConfig {
+                    node_url: format!("http://{}", addr),
+                    reserve_contract_p2s: Some("test_p2s".to_string()),
+                    ..Default::default()
+                },
+                &data_dir,
+            )
+            .unwrap()
+        };
+        let body = serde_json::Value::from(listed).to_string();
+        {
+            let state = open(spawn_mock_node(body.clone(), Default::default()).await);
+            for (box_id, owner) in boxes.iter().zip(&owners) {
+                insert_tracked_reserve(&state, box_id, owner);
+            }
+        }
+        for published in [false, true] {
+            let state = with_reopen_guard(
+                open(spawn_mock_node(body.clone(), Default::default()).await),
+                published.then(|| history.clone()),
+            );
+            assert_eq!(state.reserve_tracker.get_all_reserves().len(), 3);
+            state.process_scan_boxes().await.unwrap();
+            for box_id in &boxes {
+                assert!(
+                    state.reserve_tracker.get_reserve(box_id).is_ok(),
+                    "published {published}: {box_id}"
+                );
+            }
+            assert!(
+                state.reserve_storage.get_all_quarantined().unwrap().is_empty(),
+                "published {published}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
