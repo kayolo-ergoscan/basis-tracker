@@ -138,6 +138,10 @@ pub struct RemovedReserve {
     pub nft: Option<String>,
     /// Unix timestamp (millis) of the removal.
     pub removed_at: u64,
+    /// The index height the removal is counted from (set at the first cycle
+    /// with a known index height; the record expires 720 blocks later).
+    #[serde(default)]
+    pub removed_height: Option<u64>,
 }
 
 /// Database storage for reserve information
@@ -2765,12 +2769,24 @@ mod removed_reserve_tests {
             },
             nft: Some("4e".repeat(32)),
             removed_at,
+            removed_height: None,
         }
     }
 
     /// Round 6f: removed reserve boxes are kept across a reopen and forgotten
     /// one by one; the reserves and quarantine partitions are untouched, and a
     /// reserve dir from before round 6f opens unchanged.
+    /// Round 6f-2: a record stored before `removed_height` existed loads,
+    /// without a removal height.
+    #[test]
+    fn test_a_record_without_removed_height_loads() {
+        let mut value = serde_json::to_value(removed(&"5a".repeat(32), 7)).unwrap();
+        value.as_object_mut().unwrap().remove("removed_height");
+        let loaded: RemovedReserve = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.removed_at, 7);
+        assert_eq!(loaded.removed_height, None);
+    }
+
     #[test]
     fn removed_reserves_survive_a_reopen_and_are_forgotten() {
         let dir = tempfile::tempdir().unwrap();

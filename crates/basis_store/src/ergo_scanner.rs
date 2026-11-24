@@ -140,10 +140,12 @@ const CYCLE_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(120
 /// (contract action #3, `basis.es`).
 const REFUND_DELAY_BLOCKS: u64 = 43_200;
 
-/// How long a removed reserve box is remembered (round 6d, P2-3): about 720
-/// blocks. A box a reorg brings back within that time is restored as the
+/// How long a removed reserve box is remembered (round 6d, P2-3): 720 blocks,
+/// about a day, counted in index height (round 6f-2: not wall-clock, so the
+/// records do not expire while cycles are skipped or the index height is
+/// unknown). A box a reorg brings back within that time is restored as the
 /// tracked box instead of being judged as a root.
-const REMEMBER_REMOVED_MS: u64 = 24 * 60 * 60 * 1000;
+const REMEMBER_REMOVED_BLOCKS: u64 = 720;
 
 /// What the scanner knows about reserve NFTs (round 6c, P1-2), in memory only:
 /// it is read back from the node after a restart.
@@ -153,10 +155,11 @@ pub struct NftCache {
     box_nft: std::collections::HashMap<String, Option<String>>,
     /// NFT id -> whether its emission is 1.
     singleton: std::collections::HashMap<String, bool>,
-    /// Round 6d (P2-3): removed reserve box id -> (its record, its NFT, when,
-    /// in ms). Round 6e: the record anchors the lineage of a box holding its
-    /// NFT, so the successor of a removed box is followed, not judged as a root.
-    removed: std::collections::HashMap<String, (ExtendedReserveInfo, Option<String>, u64)>,
+    /// Round 6d (P2-3): removed reserve box id -> its record, its NFT, when
+    /// (ms) and, round 6f-2, at which index height. Round 6e: the record
+    /// anchors the lineage of a box holding its NFT, so the successor of a
+    /// removed box is followed, not judged as a root.
+    removed: std::collections::HashMap<String, RemovedReserve>,
     /// Round 6d (P1): root candidate box id -> the cycle it was last checked in.
     root_checked: std::collections::HashMap<String, u64>,
     /// Scan cycles run so far.
@@ -610,10 +613,7 @@ impl ServerState {
         match reserve_storage.removed_reserves() {
             Ok(removed) => {
                 for entry in removed {
-                    nft_cache.removed.insert(
-                        entry.record.box_id.clone(),
-                        (entry.record, entry.nft, entry.removed_at),
-                    );
+                    nft_cache.removed.insert(entry.record.box_id.clone(), entry);
                 }
             }
             Err(e) => warn!("Failed to load removed reserves: {:?}", e),
@@ -1832,14 +1832,14 @@ impl ServerState {
             self.nft_cache()
                 .removed
                 .values()
-                .filter(|(record, removed_nft, _)| {
-                    removed_nft.as_deref() == Some(nft.as_str())
-                        && record.owner_pubkey == reserve_info.owner_pubkey
-                        && record.denomination() == denomination
+                .filter(|removed| {
+                    removed.nft.as_deref() == Some(nft.as_str())
+                        && removed.record.owner_pubkey == reserve_info.owner_pubkey
+                        && removed.record.denomination() == denomination
                 })
                 // Round 6f: the one removed last.
-                .max_by_key(|(_, _, removed_at)| *removed_at)
-                .map(|(record, _, _)| (record.clone(), nft))
+                .max_by_key(|removed| removed.removed_at)
+                .map(|removed| (removed.record.clone(), nft))
         });
 
         if tracked.is_empty() {
@@ -2196,7 +2196,14 @@ impl ServerState {
                 // a reorg (or never existed on the winning fork): gone once the
                 // index is SPENT_REMOVAL_DEPTH blocks past the height where it
                 // was first unknown. A reorg bringing it back restores it.
-                let Some(height) = self.removal_height(heights).await else {
+                // Round 6f-2 (P2-A): only by the index height of this cycle,
+                // never the node's fullHeight: a lagging or rebuilding index
+                // does not know boxes that exist.
+                let Some(height) = self.cycle_state().height else {
+                    info!(
+                        "Keeping reserve {}: unknown to the index, whose height is unknown",
+                        reserve.box_id
+                    );
                     return false;
                 };
                 let since = *self
@@ -2256,10 +2263,6 @@ impl ServerState {
             .iter()
             .map(|tagged| normalized_box_id(&tagged.scan_box.box_id))
             .collect();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
         {
             let mut cycle = self.cycle_state();
             *cycle = CycleState::default();
@@ -2270,14 +2273,33 @@ impl ServerState {
         {
             let mut cache = self.nft_cache();
             cache.cycles += 1;
-            let expired: Vec<String> = cache
-                .removed
-                .iter()
-                .filter(|(_, (_, _, removed_at))| {
-                    now.saturating_sub(*removed_at) >= REMEMBER_REMOVED_MS
-                })
-                .map(|(box_id, _)| box_id.clone())
-                .collect();
+            // Round 6f-2: expiry by index height, only in a cycle that knows
+            // it; a record removed without one starts counting now.
+            let mut expired: Vec<String> = Vec::new();
+            let mut counted: Vec<RemovedReserve> = Vec::new();
+            if let Some(height) = index_height {
+                for (box_id, removed) in cache.removed.iter_mut() {
+                    let since = match removed.removed_height {
+                        Some(since) => since,
+                        None => {
+                            removed.removed_height = Some(height);
+                            counted.push(removed.clone());
+                            height
+                        }
+                    };
+                    if height >= since + REMEMBER_REMOVED_BLOCKS {
+                        expired.push(box_id.clone());
+                    }
+                }
+            }
+            for removed in counted {
+                if let Err(e) = self.reserve_storage.store_removed(&removed) {
+                    warn!(
+                        "Failed to remember removed reserve {}: {:?}",
+                        removed.record.box_id, e
+                    );
+                }
+            }
             for box_id in expired {
                 cache.removed.remove(&box_id);
                 if let Err(e) = self.reserve_storage.forget_removed(&box_id) {
@@ -2324,7 +2346,12 @@ impl ServerState {
             let nfts: std::collections::HashSet<String> = tracked
                 .iter()
                 .filter_map(|r| cache.box_nft.get(&r.box_id).cloned().flatten())
-                .chain(cache.removed.values().filter_map(|(_, nft, _)| nft.clone()))
+                .chain(
+                    cache
+                        .removed
+                        .values()
+                        .filter_map(|removed| removed.nft.clone()),
+                )
                 .collect();
             (ids, nfts, cache.root_checked.clone())
         };
@@ -2443,6 +2470,9 @@ impl ServerState {
         // test node, round 6c) removes nothing the chain does not show spent.
         let mut removal_height: Option<Option<u64>> = None;
         let mut tracked_now = TrackedThisCycle::new();
+        // Round 6f-2 (P2-A): the rules for boxes unknown to the index need the
+        // index height of this cycle.
+        let index_known = self.cycle_state().height.is_some();
         {
             let cache = self.nft_cache();
             for reserve in &all_reserves {
@@ -2486,6 +2516,7 @@ impl ServerState {
             // next to another tracked box of its owner and denomination is
             // gone at once, its NFT known or not (after a restart).
             if !followed
+                && index_known
                 && !current_box_ids.contains(&reserve.box_id)
                 && tracked_now
                     .get(&owner_key)
@@ -2554,6 +2585,8 @@ impl ServerState {
                     self.cycle_state().boxes.get(&reserve.box_id),
                     Some(Ok(None))
                 );
+                // Round 6f-2 (P2-A): `spent_deep` counts an unknown box only
+                // in a cycle that knows the index height.
                 if !((refund_due || unknown)
                     && self.spent_deep(&reserve, &mut removal_height).await)
                 {
@@ -2583,18 +2616,19 @@ impl ServerState {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
+                let removed_height = self.cycle_state().height;
                 let mut cache = self.nft_cache();
-                let nft = cache.box_nft.remove(&reserve.box_id).flatten();
-                cache.removed.insert(
-                    reserve.box_id.clone(),
-                    (reserve.clone(), nft.clone(), removed_at),
-                );
-                drop(cache);
-                if let Err(e) = self.reserve_storage.store_removed(&RemovedReserve {
+                let removed = RemovedReserve {
                     record: reserve.clone(),
-                    nft,
+                    nft: cache.box_nft.remove(&reserve.box_id).flatten(),
                     removed_at,
-                }) {
+                    removed_height,
+                };
+                cache
+                    .removed
+                    .insert(reserve.box_id.clone(), removed.clone());
+                drop(cache);
+                if let Err(e) = self.reserve_storage.store_removed(&removed) {
                     warn!(
                         "Failed to remember removed reserve {}: {:?}",
                         reserve.box_id, e
@@ -6559,16 +6593,12 @@ mod tests {
             state.reserve_tracker.remove_reserve(box_id).unwrap();
             state.nft_cache().removed.insert(
                 record.box_id.clone(),
-                (
+                RemovedReserve {
                     record,
-                    Some(TEST_RESERVE_NFT.to_string()),
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64
-                        - 1_000
-                        + removed_at,
-                ),
+                    nft: Some(TEST_RESERVE_NFT.to_string()),
+                    removed_at,
+                    removed_height: None,
+                },
             );
         }
         state.process_scan_boxes().await.unwrap();
@@ -6599,6 +6629,11 @@ mod tests {
                 ),
             ),
             tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&spend_tx)),
+            // Round 6f-2: the immediate rule needs the index height.
+            indexed_route(
+                TEST_SPENT_AT + SPENT_REMOVAL_DEPTH,
+                TEST_SPENT_AT + SPENT_REMOVAL_DEPTH,
+            ),
         ]));
         let data_dir = std::env::temp_dir().join(format!(
             "basis_scanner_restart_test_{}_{}",
@@ -6651,5 +6686,175 @@ mod tests {
             .unwrap()
             .is_empty());
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Round 6f-2 (P2-A): while the index height is unknown (indexedHeight
+    /// fails or says nothing) a tracked box the index does not know is kept,
+    /// however far the node's fullHeight moves: the 10-block rule, the pending
+    /// override and the immediate rule next to a sibling count only in index
+    /// height. Once the index height is known again, counting starts there, and
+    /// the removed record carries that height.
+    #[tokio::test]
+    async fn test_unknown_to_an_index_of_unknown_height_is_kept() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let phantom = "51".repeat(32);
+        let new_box = "66".repeat(32);
+        let create_tx = "e6".repeat(32);
+        let r2 = scanned_box_json(
+            &new_box,
+            &create_tx,
+            1_000_000_000,
+            &[(&"67".repeat(32), 1)],
+            None,
+        );
+        let no_index = || ("/blockchain/indexedHeight".to_string(), "{}".to_string());
+        for nft_known in [true, false] {
+            let mut state = mock_state(spawn_mock_node("[]".to_string(), Default::default()).await);
+            insert_tracked_reserve(&state, &phantom, owner);
+            if nft_known {
+                state.remember_nft(&phantom, Some(TEST_RESERVE_NFT.to_string()));
+            }
+            for (index, full, kept) in [
+                (None, 1_000, true),
+                (None, 1_000 + SPENT_REMOVAL_DEPTH, true),
+                (None, 1_000 + 3 * SPENT_REMOVAL_DEPTH, true),
+                (Some(2_000), 2_000, true),
+                (
+                    Some(2_000 + SPENT_REMOVAL_DEPTH - 1),
+                    2_000 + SPENT_REMOVAL_DEPTH - 1,
+                    true,
+                ),
+                (
+                    Some(2_000 + SPENT_REMOVAL_DEPTH),
+                    2_000 + SPENT_REMOVAL_DEPTH,
+                    false,
+                ),
+            ] {
+                let mut routes = HashMap::from([owner_root_tx(&create_tx), info_route(full)]);
+                let (path, body) = match index {
+                    Some(height) => indexed_route(height, height),
+                    None => no_index(),
+                };
+                routes.insert(path, body);
+                state = on_node(state, serde_json::json!([r2.clone()]).to_string(), routes)
+                    .await
+                    .0;
+                state.process_scan_boxes().await.unwrap();
+                assert_eq!(
+                    state.reserve_tracker.get_reserve(&phantom).is_ok(),
+                    kept,
+                    "index {index:?}, full {full}, NFT known {nft_known}"
+                );
+                if index.is_none() {
+                    assert!(!state.nft_cache().unknown_since.contains_key(&phantom));
+                }
+                assert!(state
+                    .reserve_storage
+                    .get_all_quarantined()
+                    .unwrap()
+                    .is_empty());
+            }
+            assert_eq!(
+                state
+                    .nft_cache()
+                    .removed
+                    .get(&phantom)
+                    .and_then(|removed| removed.removed_height),
+                Some(2_000 + SPENT_REMOVAL_DEPTH)
+            );
+        }
+
+        // The immediate rule: a sibling of the owner is tracked and listed.
+        let sibling = "52".repeat(32);
+        let listed = serde_json::json!([scanned_box_json(
+            &sibling,
+            "c0c0",
+            1_000_000_000,
+            &[(&"68".repeat(32), 1)],
+            None
+        )])
+        .to_string();
+        let mut state = mock_state(spawn_mock_node("[]".to_string(), Default::default()).await);
+        insert_tracked_reserve(&state, &phantom, owner);
+        insert_tracked_reserve(&state, &sibling, owner);
+        for (index, kept) in [(None, true), (Some(3_000), false)] {
+            let mut routes = HashMap::from([info_route(3_000)]);
+            let (path, body) = match index {
+                Some(height) => indexed_route(height, height),
+                None => no_index(),
+            };
+            routes.insert(path, body);
+            state = on_node(state, listed.clone(), routes).await.0;
+            state.process_scan_boxes().await.unwrap();
+            assert_eq!(
+                state.reserve_tracker.get_reserve(&phantom).is_ok(),
+                kept,
+                "index {index:?}"
+            );
+            assert!(state.reserve_tracker.get_reserve(&sibling).is_ok());
+        }
+    }
+
+    /// Round 6f-2 (P2-A): removed records expire by index height
+    /// (REMEMBER_REMOVED_BLOCKS), only in cycles that know it, never by
+    /// wall-clock; a record without a removal height starts counting at the
+    /// first such cycle, and that height is stored.
+    #[tokio::test]
+    async fn test_removed_records_expire_by_index_height() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let state = mock_state(spawn_mock_node("[]".to_string(), Default::default()).await);
+        let counted = "71".repeat(32);
+        let uncounted = "72".repeat(32);
+        for (box_id, removed_height) in [(&counted, Some(1_000)), (&uncounted, None)] {
+            insert_tracked_reserve(&state, box_id, owner);
+            let record = state.reserve_tracker.get_reserve(box_id).unwrap();
+            state.reserve_tracker.remove_reserve(box_id).unwrap();
+            let removed = RemovedReserve {
+                record,
+                nft: None,
+                // Long past by wall-clock.
+                removed_at: 0,
+                removed_height,
+            };
+            state.reserve_storage.store_removed(&removed).unwrap();
+            state.nft_cache().removed.insert(box_id.clone(), removed);
+        }
+        let stored = |box_id: &String| {
+            state
+                .reserve_storage
+                .removed_reserves()
+                .unwrap()
+                .into_iter()
+                .find(|removed| removed.record.box_id == *box_id)
+                .map(|removed| removed.removed_height)
+        };
+        let mut seen_known = false;
+        for (index, counted_kept, uncounted_kept) in [
+            (None, true, true),
+            (Some(1_500), true, true),
+            (None, true, true),
+            (Some(1_000 + REMEMBER_REMOVED_BLOCKS - 1), true, true),
+            (Some(1_000 + REMEMBER_REMOVED_BLOCKS), false, true),
+            (Some(1_500 + REMEMBER_REMOVED_BLOCKS - 1), false, true),
+            (Some(1_500 + REMEMBER_REMOVED_BLOCKS), false, false),
+        ] {
+            state.begin_cycle(Vec::new(), index).await;
+            for (box_id, kept) in [(&counted, counted_kept), (&uncounted, uncounted_kept)] {
+                assert_eq!(
+                    state.nft_cache().removed.contains_key(box_id),
+                    kept,
+                    "{box_id} at {index:?}"
+                );
+                assert_eq!(stored(box_id).is_some(), kept, "{box_id} at {index:?}");
+            }
+            seen_known |= index.is_some();
+            if uncounted_kept {
+                assert_eq!(
+                    stored(&uncounted),
+                    Some(seen_known.then_some(1_500)),
+                    "at {index:?}"
+                );
+            }
+        }
     }
 }
