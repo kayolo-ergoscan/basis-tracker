@@ -316,7 +316,8 @@ The server provides an endpoint to generate reserve creation payloads for Ergo n
   interim guard, `server.reserve_reopen_guard`, default true) when this tracker holds
   redemptions of the owner in the denomination: a new reserve would start with an empty R5 and
   pay those notes again. The answer has `code: "reserve_reopen_blocked"` and an `error` that
-  starts with it. HTTP 503 while the tracker has not loaded that history just after a start.
+  starts with it. HTTP 503 while the tracker has not loaded that history just after a start,
+  and (round 7b) for as long as it runs when its start could not replay the whole history.
   See `specs/ergo/reserve_admission.md`.
 
 - Returns a JSON response compatible with Ergo's `/wallet/payment/send` API:

@@ -73,9 +73,13 @@ reserve after redemptions (follow-up review N9). A new reserve starts with an em
 tree in R5, so for an owner whose redemptions in a denomination this tracker holds it would pay
 those notes again. With the guard on, `POST /reserves/create` answers `409` with
 `code: reserve_reopen_blocked` for such an owner and denomination (`503` in the first moments
-after a start, before the history is loaded), and the scanner quarantines a new root reserve box
-of the pair until an operator releases it (`POST /reserves/quarantined/release`). Tracked
-reserves and their successors are never affected. `false` restores the round 6f behaviour. See
+after a start, before the history is loaded, and for as long as the tracker runs when the start
+could not replay the whole reserve AVL journal: an error in the log says so), and the scanner
+quarantines a new root reserve box of the pair. Tracked reserves and their successors are never
+affected. A release of such a box (`POST /reserves/quarantined/release`) tracks it, but the
+tracker cannot build redemptions from it (its R5 is not the tracker's tree of the pair); the way
+for the owner is a new key. `false` restores the round 6f behaviour for new boxes; boxes the
+guard already quarantined stay quarantined until released. See
 `specs/ergo/reserve_admission.md`.
 
 ### Server Authentication & TLS

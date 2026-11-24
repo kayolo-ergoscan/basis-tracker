@@ -546,11 +546,14 @@ paths:
         withdrawn one was still tracked. Admin only; not for the front.
 
         Round 7 (N9): a box quarantined with a `reserve_reopen_blocked` reason
-        is admitted after its release (the other rules permitting), so that
-        release accepts that the owner's earlier notes could be redeemed from it
-        again. A box released from another reason that has the same history is
-        quarantined again with `reserve_reopen_blocked` and needs a release of
-        its own.
+        is admitted after its release (the other rules permitting). That is the
+        round 6f behaviour, not a way to let the owner go on: the box counts as
+        collateral and takes notes, but `/redemption/build` answers 400 for
+        every note of the owner in that denomination (the box's empty R5 is not
+        the tracker's tree of the pair, and no repair removes the history). The
+        way for the owner is a new key. A box released from another reason that
+        has the same history is quarantined again with `reserve_reopen_blocked`
+        and needs a release of its own.
       operationId: releaseQuarantinedReserve
       tags:
         - Reserves
@@ -706,7 +709,9 @@ paths:
             minted, or not seen in a block by the tracker). A reserve bound to a tracker that
             does not exist could only be refunded, so no payload is built until it is. Round 7:
             also just after a start, while the tracker has not loaded its redemption history
-            (with `reserve_reopen_guard` on); retry in a minute.
+            (with `reserve_reopen_guard` on); retry in a minute. Round 7b: for as long as the
+            tracker runs when its start could not replay the whole history (an error in its
+            log); the guard never opens on a partial history.
           content:
             application/json:
               schema:

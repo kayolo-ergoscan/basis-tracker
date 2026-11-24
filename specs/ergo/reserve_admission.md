@@ -284,27 +284,67 @@ before the scanner starts.
 **Startup.** The scanner starts before the tracker thread has rebuilt its trees. Until
 the pairs are published the answer is "unknown": a root waits (`Retry`, or `Deferred`
 for a capped root, as when a node check fails), and `/reserves/create` answers **503**
-("the tracker is starting ..."). Nothing is quarantined on a guess. If the tracker
-thread never publishes (it failed at start), roots keep waiting and creation keeps
-answering 503: the guard fails closed.
+("the tracker has not loaded its redemption history ..."). Nothing is quarantined on a
+guess. If the tracker thread never publishes (it failed at start, or the history is
+incomplete, below), roots keep waiting and creation keeps answering 503: the guard fails
+closed.
+
+**Incomplete history (round 7b, review P2-1).** The pairs are published only when the
+start replayed the whole `reserve_avl_journal`. If the journal cannot be read, or an
+entry is skipped (malformed, of a note the store does not hold) or fails to replay, the
+trees may miss redemptions, and a partial set would open the guard for exactly those
+pairs. The tracker then logs an error (`Reserve reopen guard (N9) stays closed: the
+redemption history is incomplete (...)`, after `Reserve AVL trees rebuilt with a gap` or
+`Failed to rebuild reserve AVL trees`) and publishes nothing: the guard stays "unknown"
+for every pair, creation answers 503 and new roots wait, until the journal is repaired
+and the tracker restarted, or `reserve_reopen_guard = false`. Such a gap also breaks
+the redemption builds of the pairs concerned (the tracker's tree no longer equals R5).
 
 **Fresh resync.** A tracker with no reserve trees (new data) has no pairs, so the guard
 blocks nothing beyond the rules above. If only the reserve database is wiped and the
 notes are kept, a reserve that was already reopened after redemptions is a root again
-and is quarantined with this reason; release it (below). The resync caveat below
+and is quarantined with this reason; a release (below) puts it back where it was before
+the wipe, a tracked reserve the tracker cannot redeem from. The resync caveat below
 applies as before.
 
 **Release.** `POST /reserves/quarantined/release` works as for every reason: the next
 cycle judges the box again. The guard lets a root through only when the release
 journal (`quarantine_releases`) holds a release of **this box** whose record has the
-`reserve_reopen_blocked` reason, so an operator decides about the N9 risk explicitly:
-a box released from another reason that still has history is quarantined again, now
-with this reason, and needs a release of its own. Releasing a reserve accepts that the
-owner's earlier notes could be redeemed from it again.
+`reserve_reopen_blocked` reason; a box released from another reason that still has
+history is quarantined again, now with this reason, and needs a release of its own.
+
+A release from this quarantine is **not a way to let the owner go on** (review P2-2).
+It brings back the round 6f behaviour for that box, which is the trap the guard
+exists to avoid:
+
+- the box is tracked: it counts as collateral in `/reserves` and on the site, and the
+  owner can write notes on it again (`POST /notes`);
+- `/redemption/build` picks only a reserve box whose R5 equals the tracker's tree of the
+  pair. The new box has the empty tree in R5 and the tracker's tree holds the history,
+  so every build for the owner in that denomination, old notes and new, answers 400
+  ("no unspent reserve ... with a reserve tree matching the tracker");
+- the tree repair only changes the values of keys, it cannot remove the history, so
+  nothing on the tracker side brings the tree back to the empty R5.
+
+New creditors would then accept notes the tracker cannot redeem. The way for the owner
+is a **new owner key**: a new key is a new pair without history, so its reserve is
+created and tracked as any other. Release from this quarantine only after deciding to
+accept all of the above (an operator's own test reserve, say).
+
+**What the guard does not close.** The hole is in the contract and stays there: a note's
+tracker signature (`key ‖ totalDebt ‖ timestamp ‖ trackerNftId`) does not name the
+reserve box or its NFT. A box made on chain without this tracker (not through
+`/reserves/create`) still exists with an empty R5, and an old creditor holding a valid
+tracker signature could try to build a redemption of an already redeemed note from it
+without the tracker, which also needs a lookup proof against the tracker's current tree
+(not verified whether that is practical). The guard keeps such a reserve out of our
+wallet, out of the collateral the tracker reports and out of our builds.
 
 **Switch.** `[server] reserve_reopen_guard` (bool, default `true`; a config without
-the key gets `true`). `false` is the round 6f behaviour: no 409, no 503 for the history,
-no quarantine. The tracker logs the switch and the number of pairs at start.
+the key gets `true`). `false` is the round 6f behaviour for new boxes: no 409, no 503 for
+the history, no new quarantine. A box the guard already quarantined stays quarantined
+(the quarantine is sticky, checked before the root rules); only a release lifts it. The
+tracker logs the switch and the number of pairs at start.
 
 **Storage.** Unchanged: no new partition, no new key format. The quarantine records
 use the existing partition with a new reason text. Rollback to round 6f: the binary
