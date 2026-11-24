@@ -4885,9 +4885,9 @@ pub async fn create_reserve_payload(
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(crate::models::error_response(format!(
-                        "the tracker is starting and has not loaded its redemption history yet, \
-                         so it cannot tell whether this owner may open a reserve in {}; retry in \
-                         a minute",
+                        "the tracker has not loaded its redemption history (it is starting, or \
+                         its log reports the history incomplete), so it cannot tell whether this \
+                         owner may open a reserve in {}; retry in a minute",
                         denomination_id
                     ))),
                 );

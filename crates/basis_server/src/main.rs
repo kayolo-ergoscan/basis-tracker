@@ -310,14 +310,18 @@ async fn main() {
         // Update shared state with the rebuilt AVL root digest after initialization
         let mut tracker = tracker;
         // Round 7 (N9): the reserve trees are rebuilt; publish the pairs with redemptions.
+        // Round 7b: with an incomplete history the pairs are not published (the guard stays
+        // closed) and `attach_reopen_guard` logs the error.
         tracker.attach_reopen_guard(reopen_guard_for_tracker.clone());
         if reopen_guard_for_tracker.is_enabled() {
-            tracing::info!(
-                "Reserve reopen guard (N9) on: {} owner/denomination pairs have redemptions; \
-                 /reserves/create refuses them and the scanner quarantines a new root reserve \
-                 of them",
-                reopen_guard_for_tracker.pair_count().unwrap_or(0)
-            );
+            if let Some(pairs) = reopen_guard_for_tracker.pair_count() {
+                tracing::info!(
+                    "Reserve reopen guard (N9) on: {} owner/denomination pairs have redemptions; \
+                     /reserves/create refuses them and the scanner quarantines a new root \
+                     reserve of them",
+                    pairs
+                );
+            }
         } else {
             tracing::warn!(
                 "Reserve reopen guard (N9) off ([server] reserve_reopen_guard = false): a new \

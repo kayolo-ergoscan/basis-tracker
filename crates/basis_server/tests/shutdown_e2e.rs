@@ -2,7 +2,9 @@
 //! fresh data directory, a tracker NFT that is not minted yet, a mock node on 127.0.0.1, then
 //! SIGTERM. The process must exit 0 within the shutdown deadline (20 s from the signal), with
 //! the note store closed, also when a client holds a connection open. The same harness checks
-//! that the binary refuses to start with an all-zero tracker NFT id.
+//! that the binary refuses to start with an all-zero tracker NFT id, and (round 7b) that the
+//! reserve reopen guard of `main.rs` is the one the tracker thread publishes to and
+//! `/reserves/create` reads.
 
 #![cfg(unix)]
 
@@ -383,4 +385,102 @@ fn an_update_interval_of_zero_is_refused_at_startup() {
         "{log}"
     );
     assert!(!get_root(port), "nothing may listen");
+}
+
+/// `POST /reserves/create` for the generator key in ERG; the whole HTTP response.
+fn post_create_reserve(port: u16) -> String {
+    let body = format!(
+        r#"{{"nft_id":"{}","owner_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","erg_amount":1000000000,"token_amount":0,"token_id":""}}"#,
+        "12".repeat(32)
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    write!(
+        stream,
+        "POST /reserves/create HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap();
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    response
+}
+
+impl Server {
+    /// Wait until the log holds `line`.
+    fn wait_for_log(&mut self, line: &str) -> String {
+        let started = Instant::now();
+        loop {
+            let log = self.log();
+            if log.contains(line) {
+                return log;
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!("server exited: {status}\n{log}");
+            }
+            if started.elapsed() > STARTUP_TIMEOUT {
+                let _ = self.child.kill();
+                panic!("no {line:?} in the log\n{log}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn stop(&mut self) {
+        self.sigterm();
+        let status = self.wait_exit(SHUTDOWN_DEADLINE + Duration::from_secs(10));
+        assert_eq!(status.and_then(|s| s.code()), Some(0), "{}", self.log());
+    }
+}
+
+/// Round 7 (N9) wiring: on a fresh tracker the tracker thread publishes an empty history to the
+/// guard `/reserves/create` reads, so a request passes the guard and stops at the next check
+/// (the tracker NFT is not minted in this harness: 503 "not confirmed on chain yet").
+#[test]
+fn reserves_create_passes_the_reopen_guard_once_the_tracker_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = MockNode::start();
+    let mut server = Server::start(dir.path(), &node);
+    server.wait_for_log("Reserve reopen guard (N9) on: 0 owner/denomination pairs");
+    let response = post_create_reserve(server.port);
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(response.contains("not confirmed on chain yet"), "{response}");
+    assert!(!response.contains("redemption history"), "{response}");
+    server.stop();
+}
+
+/// Round 7b (review P2-1) wiring: a reserve AVL journal entry the start cannot replay (its note
+/// is unknown) leaves the history incomplete. The tracker logs an error and publishes nothing,
+/// so the guard `/reserves/create` reads stays closed: 503 "redemption history", never a
+/// payload, for as long as the tracker runs.
+#[test]
+fn a_damaged_reserve_journal_keeps_reserves_create_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let notes = basis_store::persistence::NoteStorage::open(dir.path().join("data/notes"))
+            .expect("open the note store");
+        notes
+            .append_reserve_avl_update(
+                &[0x02; 33],
+                &[0x03; 33],
+                &basis_store::DenomKey::Erg,
+                1_700_000_000_000,
+                5,
+            )
+            .unwrap();
+    }
+    let node = MockNode::start();
+    let mut server = Server::start(dir.path(), &node);
+    let log = server.wait_for_log("Reserve reopen guard (N9) stays closed");
+    assert!(log.contains("1 of an unknown note"), "{log}");
+    assert!(!log.contains("Reserve reopen guard (N9) on:"), "{log}");
+    for _ in 0..2 {
+        let response = post_create_reserve(server.port);
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("redemption history"), "{response}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    server.stop();
 }
