@@ -1961,6 +1961,54 @@ mod tests {
         let _ = fs::remove_dir_all(&storage_path);
     }
 
+    /// N15 (round 7): the crates.io `ergo_avltree_rust` fails a strict `Insert` of a key the tree
+    /// holds, like the JVM. A pair's reserve tree journal repeats the edge's key once per
+    /// redemption, and the insert proof replays that journal. After two redemptions of one edge
+    /// and a restart (the journal replayed from storage), the insert proof of a third redemption
+    /// is still made, and the tree reaches its digest once the redemption is applied.
+    #[test]
+    fn test_insert_proof_after_a_restart_replays_a_repeated_key() {
+        let secp = secp256k1::Secp256k1::new();
+        let issuer_secret = secp256k1::SecretKey::from_slice(&[0x31u8; 32]).unwrap();
+        let issuer = secp256k1::PublicKey::from_secret_key(&secp, &issuer_secret).serialize();
+        let recipient = [0x03u8; 33];
+        let erg = crate::DenomKey::Erg;
+        let timestamp = 1_700_000_000_000u64;
+        let note = IouNote::create_and_sign(
+            recipient,
+            1_000,
+            timestamp,
+            &issuer_secret.secret_bytes(),
+            &[0x42; 32],
+            erg,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut manager = TrackerStateManager::new(dir.path());
+            manager.add_note(&issuer, &note).unwrap();
+            for redeemed in [100, 300] {
+                manager
+                    .update_already_redeemed(&issuer, &recipient, &erg, timestamp, redeemed)
+                    .unwrap();
+            }
+        }
+        let mut restarted = TrackerStateManager::new(dir.path());
+        assert_eq!(
+            restarted.get_already_redeemed(&issuer, &recipient, &erg).unwrap(),
+            300
+        );
+        let (proof, digest_after) = restarted
+            .generate_reserve_insert_proof(&issuer, &recipient, &erg, timestamp, 600)
+            .expect("the journal with a repeated key replays");
+        assert!(!proof.is_empty());
+        assert_ne!(digest_after, restarted.reserve_state_digest(&issuer, &erg));
+        restarted
+            .update_already_redeemed(&issuer, &recipient, &erg, timestamp, 600)
+            .unwrap();
+        assert_eq!(restarted.reserve_state_digest(&issuer, &erg), digest_after);
+    }
+
     /// Emergency redemption must encode context var #6 (tracker signature) as an
     /// EMPTY Coll[Byte] (`0e00`): the contract branches on
     /// `trackerSigBytes.size > 0`, so a 65-byte zero placeholder would be
