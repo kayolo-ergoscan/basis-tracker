@@ -72,9 +72,11 @@ holds:
    strands the reserve. Otherwise the box is pending (retried), never quarantined for
    that. Round 6e: a tracked box the index does not know is not on chain, so its R7
    says nothing: the walk goes back to a box removed lately (an earlier box of the
-   lineage, on chain) and judges each step from there; an NFT that entered the box from
-   outside any reserve box makes it a root; otherwise the singleton decides only when R7
-   equals the tracked box's, and the box is pending when it does not. When the index
+   lineage, on chain) and judges each step from there; an NFT that entered the box itself
+   from outside any reserve box (at its own creating transaction) makes it a root (round
+   6f: deeper, the walk has only reached the lineage's own root creation, which says
+   nothing); otherwise the singleton decides only when R7 equals the tracked box's, and
+   the box is pending when it does not. When the index
    shows the tracked box unspent, it lags or the box is an earlier one: only a box the
    walk leads back to the tracked box follows it; otherwise it is pending.
 
@@ -119,8 +121,9 @@ release (below) lifts it.
 
 **Round 6e: a removed box anchors its successor.** A removed box is remembered with its
 record and NFT for a day (below). A box holding that NFT, of the same owner and
-denomination, is checked as a successor of the removed box (it goes first in the cycle):
-the successor of a box the scan missed for a while is followed, not judged as a root.
+denomination, is checked as a successor of the removed box (it goes first in the cycle;
+round 6f: of several, the one removed last): the successor of a box the scan missed for a
+while is followed, not judged as a root.
 
 If the proof fetch is inconclusive (node error fetching the creating transaction), the
 box is **pending**: it is neither admitted nor quarantined, and the tracked box for
@@ -131,7 +134,8 @@ tracked, a pending check never keeps the spent box next to it. Round 6d: only a 
 holds (or may hold) the tracked box's NFT keeps it; a root candidate that is retried
 keeps nothing. Round 6e: not past the refund either: a tracked box with a pending
 refund (`R7 != 0`) whose 43,200 blocks have passed, and whose spend is deep (below), is
-removed even while a check is pending. The lineage and ownership checks share a budget
+removed even while a check is pending; round 6f: so is a tracked box the index has not
+known for `SPENT_REMOVAL_DEPTH` blocks (below). The lineage and ownership checks share a budget
 of 512 node requests per scan cycle; past it a check is pending (a successor with a
 singleton NFT is still followed).
 
@@ -150,7 +154,9 @@ makes 512 junk roots costs one request per cycle. Round 6e: a cycle is skipped w
 blocks behind its `fullHeight` (a lagging index shows spent boxes as unspent; a node
 that does not answer it is scanned anyway). The checks on the shared budget stop after
 120 s of a cycle (pending). The cached singleton answers are kept only for the NFTs in
-the scan and of the tracked and removed boxes.
+the scan and of the tracked and removed boxes. Round 6f: a skipped cycle is logged as a
+warning on the first skip and every 30 in a row (the count is `skipped_cycles()`; the
+server has no status route to show it on).
 
 **Spent reserves (rounds 6c–6e).** A tracked reserve absent from the scan is removed
 only when a box holding its NFT is tracked in the same cycle (its successor), or when
@@ -170,6 +176,19 @@ test node, round 6c) removes nothing the chain does not show spent. A removed bo
 remembered (its record and NFT) for a day, about 720 blocks: when a reorg brings it back
 to the scan, it is restored as the tracked box instead of being judged as a root
 (unless a tracked box of the owner in the denomination is in the scan too).
+
+**Round 6f.** The removed boxes are kept in the `removed_reserves` partition (box id ->
+record, NFT, time), so they survive a restart; nothing else in the reserve database
+changes. A tracked box the index does not know (its block orphaned, its input
+double-spent on the winning fork, so it never exists and nothing holds its NFT) is
+removed once the index is `SPENT_REMOVAL_DEPTH` blocks past the height where it was
+first unknown, and at once when another box of its owner and denomination is tracked
+in the cycle. With page 0 read again, one scan can list the spent tracked box (from the
+first read) next to its successor or the owner's new box (from the re-read): a listed
+box that the index shows spent is gone (asked only when another tracked box of the owner
+holds its NFT, or the cycle already read it spent), so the owner's new box waits for the
+root check instead of being quarantined, and the spent box leaves next to its successor
+in the same cycle. The scan list is deduplicated by box id across the re-read.
 
 **Operator release (round 6c).** `POST /reserves/quarantined/release` (Admin; body
 `box_id`, `note`) moves a quarantine record to a journal (`quarantine_releases`,
@@ -245,7 +264,8 @@ backing up.
   - `admit_root` — the root rules: C4 checks, singleton, P2PK proof, the per-cycle cap.
   - `begin_cycle` — per-cycle state, the tracked NFTs, and the order of the checks
     (round 6d); `index_height` — the index lag guard (round 6e).
-  - `spent_deep` / `fetch_tx_inclusion_height` — the removal depth (rounds 6d/6e).
+  - `spent_deep` / `fetch_tx_inclusion_height` — the removal depth (rounds 6d/6e), and
+    the depth of a box the index does not know (round 6f); `tracked_all_gone` (round 6f).
   - `p2pk_ergo_tree` / `has_owner_p2pk_input` — the `0008cd || pubkey` proof check.
   - `is_lineage_successor` — the tracked box's spender first, then a bounded backwards
     walk over `/blockchain/transaction/byId` following the reserve NFT (round 6b), with
@@ -255,7 +275,8 @@ backing up.
   - `ingest_scan_box` — parse + admit + track/persist + quarantine persistence.
   - `process_scan_boxes` — removal loop keeps boxes whose proof/lineage check is pending.
 - `crates/basis_store/src/persistence.rs` — `QuarantinedReserve`,
-  `quarantined_reserves` partition on `ReserveStorage`.
+  `quarantined_reserves` partition on `ReserveStorage`; `RemovedReserve`,
+  `removed_reserves` partition (round 6f).
 - `crates/basis_server/src/reserve_api.rs` — `GET /reserves/quarantined`,
   `POST /reserves/quarantined/release`, `GET /reserves/quarantined/releases`.
 - `crates/basis_cli/src/api.rs` — `submit_reserve_to_node` and helpers
