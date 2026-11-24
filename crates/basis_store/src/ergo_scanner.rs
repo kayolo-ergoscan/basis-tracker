@@ -1781,10 +1781,8 @@ impl ServerState {
                     .any(|r| r.denomination() == denomination && scanned.contains(&r.box_id))
             });
             if !tracked_in_scan {
-                self.nft_cache().removed.remove(&box_id);
-                if let Err(e) = self.reserve_storage.forget_removed(&box_id) {
-                    warn!("Failed to forget removed reserve {}: {:?}", box_id, e);
-                }
+                // The record is forgotten once the box is stored again
+                // (`ingest_scan_box`, round 6f-2).
                 info!(
                     "Restoring reserve box {}: it was removed as spent and is unspent again (reorg)",
                     box_id
@@ -2085,6 +2083,21 @@ impl ServerState {
                     );
                 } else {
                     info!("Updated and persisted reserve: {}", scan_box.box_id);
+                    // Round 6f-2 (LOW-4): a restored box's removed record goes
+                    // only now that the box is stored again.
+                    if self
+                        .nft_cache()
+                        .removed
+                        .remove(&reserve_info.box_id)
+                        .is_some()
+                    {
+                        if let Err(e) = self.reserve_storage.forget_removed(&reserve_info.box_id) {
+                            warn!(
+                                "Failed to forget removed reserve {}: {:?}",
+                                reserve_info.box_id, e
+                            );
+                        }
+                    }
                 }
                 ScanBoxIngest::Tracked(reserve_info.box_id)
             }
@@ -6905,6 +6918,52 @@ mod tests {
                     "height {height}"
                 );
             }
+        }
+    }
+
+    /// Round 6f-2 (LOW-4): a removed box a reorg brings back keeps its removed
+    /// record until it is stored again; when the store fails (here: a box id
+    /// too long for a key) the record stays, so the box is still restored next
+    /// time instead of being judged anew.
+    #[tokio::test]
+    async fn test_a_restored_box_is_forgotten_only_once_stored() {
+        let state = mock_state(spawn_mock_node("[]".to_string(), Default::default()).await);
+        for (box_id, stored) in [("ab".repeat(40_000), false), ("11".repeat(32), true)] {
+            let mut scan_box = c4_test_box();
+            scan_box.box_id = box_id.clone();
+            let tagged = tagged_erg(scan_box);
+            let record = state
+                .parse_reserve_box(&tagged.scan_box, tagged.kind, &tagged.contract_address)
+                .unwrap();
+            let removed = RemovedReserve {
+                record,
+                nft: None,
+                removed_at: 1,
+                removed_height: Some(1_000),
+            };
+            if stored {
+                state.reserve_storage.store_removed(&removed).unwrap();
+            }
+            state.nft_cache().removed.insert(box_id.clone(), removed);
+            assert_eq!(
+                state.ingest_scan_box(&tagged).await,
+                ScanBoxIngest::Tracked(box_id.clone())
+            );
+            assert_eq!(
+                state
+                    .reserve_storage
+                    .get_reserve(&box_id)
+                    .unwrap()
+                    .is_some(),
+                stored
+            );
+            assert_eq!(state.nft_cache().removed.contains_key(&box_id), !stored);
+            assert!(!state
+                .reserve_storage
+                .removed_reserves()
+                .unwrap()
+                .iter()
+                .any(|removed| removed.record.box_id == box_id && stored));
         }
     }
 }
