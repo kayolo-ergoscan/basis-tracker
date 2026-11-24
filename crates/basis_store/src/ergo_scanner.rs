@@ -7227,7 +7227,10 @@ mod tests {
     /// Round 7 (N9): the owner completes the refund of the tracked reserve into a
     /// clean box holding the same NFT (judged as a root since round 6d). With
     /// redemptions at the tracker it is quarantined with the reopen reason, not
-    /// tracked, and the refunding box is not touched by it.
+    /// tracked, and the refunding box is not touched by it. Round 7b: before the
+    /// history is known (an uncapped root: `Retry`) the box is neither tracked nor
+    /// quarantined and the refunding box stays tracked; once the history is
+    /// published (empty) the next cycle tracks it.
     #[tokio::test]
     async fn test_reopen_guard_quarantines_a_refund_completion_root() {
         let owner = &VALID_PREFIXED_PUBKEY[2..];
@@ -7261,11 +7264,25 @@ mod tests {
             } else {
                 vec![]
             };
-            let state = with_reopen_guard(state, Some(pairs));
+            let mut state = with_reopen_guard(state, Some(pairs));
             insert_tracked_reserve(&state, &tracked_box, owner);
             let mut info = state.reserve_tracker.get_reserve(&tracked_box).unwrap();
             info.base_info.refund_initiation_height = 1000;
             state.reserve_tracker.update_reserve(info).unwrap();
+            if !history {
+                // Round 7b: the same cycle before the tracker published the history.
+                state.reopen_guard = ReopenGuard::new(true);
+                state.process_scan_boxes().await.unwrap();
+                assert!(state.reserve_tracker.get_reserve(&recreated).is_err());
+                assert!(state.reserve_storage.get_quarantined(&recreated).unwrap().is_none());
+                assert!(
+                    state.reserve_tracker.get_reserve(&tracked_box).is_ok(),
+                    "the refunding box stays tracked while the root waits"
+                );
+                state
+                    .reopen_guard
+                    .load(Vec::<(crate::PubKey, crate::DenomKey)>::new());
+            }
             state.process_scan_boxes().await.unwrap();
             assert_eq!(
                 state.reserve_tracker.get_reserve(&recreated).is_ok(),
@@ -7278,6 +7295,44 @@ mod tests {
                 assert!(
                     record.reason.starts_with(RESERVE_REOPEN_BLOCKED),
                     "{}",
+                    record.reason
+                );
+            }
+        }
+    }
+
+    /// Round 7b: the C4 setup checks come before the reopen guard. A root with a
+    /// non-empty tree (R5) or a pending refund (R7) of an owner with redemptions
+    /// keeps its C4 quarantine reason, also before the history is known.
+    #[tokio::test]
+    async fn test_c4_comes_before_the_reopen_guard() {
+        let box_id = "31".repeat(32);
+        for (register, value, reason) in [
+            ("R5", used_tree_register(), "non-empty AVL tree"),
+            ("R7", R7_REFUND_1000.to_string(), "pending refund"),
+        ] {
+            for history in [Some(vec![(test_owner(), crate::DenomKey::Erg)]), None] {
+                let case = format!("{register}, history {history:?}");
+                let (state, mut tagged) = owner_root().await;
+                let state = with_reopen_guard(state, history);
+                tagged
+                    .scan_box
+                    .additional_registers
+                    .insert(register.to_string(), value.clone());
+                assert_eq!(
+                    state.ingest_scan_box(&tagged).await,
+                    ScanBoxIngest::Rejected(box_id.clone()),
+                    "{case}"
+                );
+                let record = state
+                    .reserve_storage
+                    .get_quarantined(&box_id)
+                    .unwrap()
+                    .expect("quarantined");
+                assert!(record.reason.contains(reason), "{case}: {}", record.reason);
+                assert!(
+                    !record.reason.starts_with(RESERVE_REOPEN_BLOCKED),
+                    "{case}: {}",
                     record.reason
                 );
             }
