@@ -127,6 +127,19 @@ pub struct QuarantineRelease {
     pub released_at: u64,
 }
 
+/// A reserve box the scanner removed lately (round 6f), kept for about a day
+/// so that, after a restart too, a reorg bringing the box back restores it and
+/// a box holding its NFT is checked as its successor.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemovedReserve {
+    /// The reserve as it was tracked.
+    pub record: ExtendedReserveInfo,
+    /// Its reserve NFT, when known.
+    pub nft: Option<String>,
+    /// Unix timestamp (millis) of the removal.
+    pub removed_at: u64,
+}
+
 /// Database storage for reserve information
 #[derive(Clone)]
 pub struct ReserveStorage {
@@ -137,6 +150,8 @@ pub struct ReserveStorage {
     quarantine_partition: fjall::Partition,
     /// Round 6c: journal of quarantine releases, keyed `released_at (20 digits) : box id`.
     release_partition: fjall::Partition,
+    /// Round 6f: reserve boxes removed lately, keyed by box id.
+    removed_partition: fjall::Partition,
 }
 
 /// Database storage for tracker information
@@ -1541,12 +1556,57 @@ impl ReserveStorage {
                 ))
             })?;
 
+        let removed_partition = keyspace
+            .open_partition("removed_reserves", PartitionCreateOptions::default())
+            .map_err(|e| {
+                NoteError::StorageError(format!("Failed to open removed reserve partition: {}", e))
+            })?;
+
         Ok(Self {
             keyspace,
             partition,
             quarantine_partition,
             release_partition,
+            removed_partition,
         })
+    }
+
+    /// Remember a removed reserve box (round 6f).
+    pub fn store_removed(&self, removed: &RemovedReserve) -> Result<(), NoteError> {
+        let key = storable_key("reserve box id", removed.record.box_id.as_bytes())?;
+        let value = serde_json::to_vec(removed).map_err(|e| {
+            NoteError::StorageError(format!("Failed to serialize removed reserve: {}", e))
+        })?;
+        self.removed_partition
+            .insert(key, &value)
+            .map_err(|e| NoteError::StorageError(format!("Failed to store removed reserve: {}", e)))
+    }
+
+    /// Forget a removed reserve box (round 6f).
+    pub fn forget_removed(&self, box_id: &str) -> Result<(), NoteError> {
+        if !is_storable_key(box_id.as_bytes()) {
+            return Ok(());
+        }
+        self.removed_partition
+            .remove(box_id.as_bytes())
+            .map_err(|e| {
+                NoteError::StorageError(format!("Failed to forget removed reserve: {}", e))
+            })
+    }
+
+    /// The removed reserve boxes remembered (round 6f).
+    pub fn removed_reserves(&self) -> Result<Vec<RemovedReserve>, NoteError> {
+        self.removed_partition
+            .iter()
+            .map(|item| {
+                let (_key, value) = item.map_err(|e| {
+                    NoteError::StorageError(format!("Failed to iterate removed reserves: {}", e))
+                })?;
+                serde_json::from_slice(&value).map_err(|e| {
+                    NoteError::StorageError(format!("Failed to deserialize removed reserve: {}", e))
+                })
+            })
+            .collect()
     }
 
     /// Store a reserve in the database
@@ -2679,6 +2739,65 @@ mod quarantine_release_tests {
                 ("checked on chain: owner's top-up", 2_000)
             ]
         );
+        assert!(storage.get_all_quarantined().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod removed_reserve_tests {
+    use super::*;
+
+    fn removed(box_id: &str, removed_at: u64) -> RemovedReserve {
+        RemovedReserve {
+            record: ExtendedReserveInfo {
+                base_info: crate::ReserveInfo {
+                    collateral_amount: 1_000_000_000,
+                    last_updated_height: 0,
+                    contract_address: "test_p2s".to_string(),
+                    tracker_nft_id: "1f".repeat(32),
+                    refund_initiation_height: 0,
+                    reserve_token_id: String::new(),
+                },
+                total_debt: 0,
+                box_id: box_id.to_string(),
+                owner_pubkey: "02".repeat(33),
+                last_updated_timestamp: 0,
+            },
+            nft: Some("4e".repeat(32)),
+            removed_at,
+        }
+    }
+
+    /// Round 6f: removed reserve boxes are kept across a reopen and forgotten
+    /// one by one; the reserves and quarantine partitions are untouched, and a
+    /// reserve dir from before round 6f opens unchanged.
+    #[test]
+    fn removed_reserves_survive_a_reopen_and_are_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracked = removed(&"cc".repeat(32), 0).record;
+        {
+            let storage = ReserveStorage::open(dir.path()).unwrap();
+            storage.store_reserve(&tracked).unwrap();
+            assert!(storage.removed_reserves().unwrap().is_empty());
+            storage
+                .store_removed(&removed(&"aa".repeat(32), 1))
+                .unwrap();
+            storage
+                .store_removed(&removed(&"bb".repeat(32), 2))
+                .unwrap();
+        }
+        let storage = ReserveStorage::open(dir.path()).unwrap();
+        let kept = storage.removed_reserves().unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].record.box_id, "aa".repeat(32));
+        assert_eq!(kept[0].nft.as_deref(), Some("4e".repeat(32).as_str()));
+        assert_eq!(kept[1].removed_at, 2);
+        storage.forget_removed(&"aa".repeat(32)).unwrap();
+        storage.forget_removed(&"dd".repeat(32)).unwrap();
+        let kept = storage.removed_reserves().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].record.box_id, "bb".repeat(32));
+        assert_eq!(storage.get_all_reserves().unwrap().len(), 1);
         assert!(storage.get_all_quarantined().unwrap().is_empty());
     }
 }
