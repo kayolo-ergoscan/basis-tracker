@@ -151,8 +151,8 @@ transaction or box read once in a cycle is reused by every check of that cycle (
 too, up to 64 MiB of transaction inputs), so one transaction over the 2 MiB body cap that
 makes 512 junk roots costs one request per cycle. Round 6e: a cycle is skipped when
 `GET /blockchain/indexedHeight` gives an `indexedHeight` more than `MAX_INDEX_LAG = 2`
-blocks behind its `fullHeight` (a lagging index shows spent boxes as unspent; a node
-that does not answer it is scanned anyway). The checks on the shared budget stop after
+blocks behind its `fullHeight` (a lagging index shows spent boxes as unspent; until
+round 8 a node that did not answer it was scanned anyway, see «Round 8» below). The checks on the shared budget stop after
 120 s of a cycle (pending). The cached singleton answers are kept only for the NFTs in
 the scan and of the tracked and removed boxes. Round 6f: a skipped cycle is logged as a
 warning on the first skip and every 30 in a row (the count is `skipped_cycles()`; the
@@ -170,8 +170,8 @@ a root (quarantined for good once R5 was used). The scan also reads page 0 again
 the last page, so a box made meanwhile is seen in the same cycle. The spend height is
 the spending transaction's `inclusionHeight` (`/blockchain/box/byId` has no spend
 height), read from the start of its body, so a transaction over the body cap still
-tells it; it is compared with the index height of the cycle, else `/info`
-`fullHeight`. A scan with no valid box at all (manually inserted reserves on a local
+tells it; it is compared with the index height of the cycle (round 8: never `/info`
+`fullHeight`). A scan with no valid box at all (manually inserted reserves on a local
 test node, round 6c) removes nothing the chain does not show spent. A removed box is
 remembered (its record and NFT) for about 720 blocks (round 6f-2: index blocks, below): when a reorg brings it back
 to the scan, it is restored as the tracked box instead of being judged as a root
@@ -203,6 +203,20 @@ from the first cycle with a known index height, and that height is stored), neve
 wall-clock: nothing expires in cycles skipped for lag or while the index height is
 unknown. A restored box's removed record is forgotten only once the box is stored again
 in the reserve database.
+
+**Round 8: no cycle without a usable index height.** A cycle runs only with an index
+height from `GET /blockchain/indexedHeight`; otherwise it is skipped before the box list
+is read (nothing is tracked, removed or quarantined, no clock starts or moves, no record
+expires) and retried at the next block, with the lag skip's log line and count. Skipped:
+the request fails or times out (the client's 15 s), the status is not a success, the body
+is not JSON or lacks either height as a whole number, `indexedHeight` is above
+`fullHeight`, the index lags more than `MAX_INDEX_LAG` blocks, or `indexedHeight` is below
+the highest index height a cycle ran with since the start (a rollback, or a node that is
+behind: the cycles wait until the index is there again; the highest height is kept in
+memory only, so a restart forgets it). Removal depths are counted only in the cycle's
+index height, never in `/info` `fullHeight`. Heights near `u64::MAX` cannot overflow the
+checks. A node without the endpoint is therefore never scanned: the node must run with
+`extraIndex = true` anyway.
 
 **Operator release (round 6c).** `POST /reserves/quarantined/release` (Admin; body
 `box_id`, `note`) moves a quarantine record to a journal (`quarantine_releases`,

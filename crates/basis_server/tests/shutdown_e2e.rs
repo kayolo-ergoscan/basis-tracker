@@ -91,6 +91,11 @@ fn answer(mut stream: TcpStream, seen: &Mutex<Vec<String>>) {
             200,
             r#"{"fullHeight":1000,"headersHeight":1000}"#.to_string(),
         ),
+        // Round 8: a scan cycle needs the index height.
+        ("GET", "/blockchain/indexedHeight") => (
+            200,
+            r#"{"indexedHeight":1000,"fullHeight":1000}"#.to_string(),
+        ),
         // No reserves and no tracker box: the NFT is not minted yet.
         (_, p) if p.starts_with("/blockchain/box/unspent/") => (200, "[]".to_string()),
         _ => (

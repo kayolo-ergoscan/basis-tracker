@@ -133,6 +133,13 @@ const MAX_INDEX_LAG: u64 = 2;
 /// A skipped cycle is logged as a warning once per this many in a row (round 6f).
 const LAG_WARN_EVERY: u64 = 30;
 
+/// How long `GET /blockchain/indexedHeight` may take before the cycle is
+/// skipped (round 8): the client's request timeout; short in tests.
+#[cfg(not(test))]
+const INDEX_HEIGHT_TIMEOUT: Duration = crate::http::REQUEST_TIMEOUT;
+#[cfg(test)]
+const INDEX_HEIGHT_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Wall-clock time the shared-lane checks of one scan cycle may take (round 6e,
 /// LOW-5); past it they give no verdict and are retried next cycle.
 const CYCLE_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -168,9 +175,14 @@ pub struct NftCache {
     /// Round 6f (P2-1): tracked box id -> the index height when the index
     /// first did not know it.
     unknown_since: std::collections::HashMap<String, u64>,
-    /// Round 6f: scan cycles skipped for a lagging index, in a row and in all.
+    /// Round 6f: scan cycles skipped for a lagging index, in a row and in all;
+    /// round 8: or for no usable index height.
     lag_skips_in_a_row: u64,
     lag_skips: u64,
+    /// Round 8: the highest index height a cycle ran with since the start; a
+    /// cycle is skipped while the index is below it (in memory only, so a
+    /// restart forgets it).
+    index_height_seen: Option<u64>,
 }
 
 /// Bytes of a transaction read for its inclusion height (round 6e).
@@ -2219,58 +2231,84 @@ impl ServerState {
     }
 
     /// `GET /blockchain/indexedHeight` (round 6e): the index height when it is
-    /// within `MAX_INDEX_LAG` blocks of `fullHeight`, `None` when the node does
-    /// not tell, an error when the index lags further (the cycle is skipped).
-    async fn index_height(&self) -> Result<Option<u64>, ScannerError> {
+    /// within `MAX_INDEX_LAG` blocks of `fullHeight`; an error, and the cycle
+    /// is skipped, when the index lags further.
+    ///
+    /// Round 8: an error too, so the cycle is skipped and nothing acts on a
+    /// guessed height (removal depths, the unknown-to-the-index clocks, the
+    /// expiry of removed records, admission against a stale index), when the
+    /// node gives no usable answer: the request fails or times out, the status
+    /// is not a success, the body is not JSON or lacks either height, the
+    /// index is above `fullHeight`, or the index is below the highest height a
+    /// cycle ran with since the start (it went back: a rollback or another
+    /// node; the cycles wait until it is there again).
+    async fn index_height(&self) -> Result<u64, ScannerError> {
         let url = format!("{}/blockchain/indexedHeight", self.config.node_url);
-        let answer = match self
+        let unusable = |why: String| {
+            ScannerError::NodeError(format!(
+                "no usable index height: GET /blockchain/indexedHeight {}",
+                why
+            ))
+        };
+        let response = self
             .request_builder(reqwest::Method::GET, &url)
+            .timeout(INDEX_HEIGHT_TIMEOUT)
             .send()
             .await
-        {
-            Ok(response) if response.status().is_success() => {
-                crate::http::read_json_capped(response).await.ok()
-            }
-            _ => None,
-        };
-        let field = |name: &str| answer.as_ref()?.get(name)?.as_u64();
-        match (field("indexedHeight"), field("fullHeight")) {
-            (Some(indexed), Some(full)) if full > indexed + MAX_INDEX_LAG => {
-                Err(ScannerError::NodeError(format!(
-                    "the blockchain index is at height {} while the node is at {} (more than {} blocks behind)",
-                    indexed, full, MAX_INDEX_LAG
-                )))
-            }
-            (Some(indexed), Some(_)) => Ok(Some(indexed)),
-            _ => {
-                debug!("The node does not tell its index height; scanning anyway");
-                Ok(None)
-            }
+            .map_err(|e| {
+                unusable(if e.is_timeout() {
+                    format!("timed out after {} ms", INDEX_HEIGHT_TIMEOUT.as_millis())
+                } else {
+                    format!("failed ({})", e)
+                })
+            })?;
+        if !response.status().is_success() {
+            return Err(unusable(format!("answered HTTP {}", response.status())));
         }
+        let answer = crate::http::read_json_capped(response)
+            .await
+            .map_err(|e| unusable(format!("gave an unreadable answer ({})", e)))?;
+        let field = |name: &str| answer.get(name).and_then(|v| v.as_u64());
+        let (Some(indexed), Some(full)) = (field("indexedHeight"), field("fullHeight")) else {
+            return Err(unusable(
+                "gave no indexedHeight and fullHeight (both whole numbers)".to_string(),
+            ));
+        };
+        if indexed > full {
+            return Err(unusable(format!(
+                "gave indexedHeight {} above fullHeight {}",
+                indexed, full
+            )));
+        }
+        if full > indexed.saturating_add(MAX_INDEX_LAG) {
+            return Err(ScannerError::NodeError(format!(
+                "the blockchain index is at height {} while the node is at {} (more than {} blocks behind)",
+                indexed, full, MAX_INDEX_LAG
+            )));
+        }
+        let mut cache = self.nft_cache();
+        if let Some(seen) = cache.index_height_seen.filter(|seen| indexed < *seen) {
+            return Err(ScannerError::NodeError(format!(
+                "the blockchain index is at height {} below {}, where an earlier cycle saw it; \
+                 waiting until it is there again (a restart forgets {})",
+                indexed, seen, seen
+            )));
+        }
+        cache.index_height_seen = Some(indexed);
+        Ok(indexed)
     }
 
     /// The height spends are measured against in this cycle's removals: the
-    /// index height, else the node's `fullHeight`; read once per cycle.
-    async fn removal_height(&self, known: &mut Option<Option<u64>>) -> Option<u64> {
-        if known.is_none() {
-            let index_height = self.cycle_state().height;
-            let height = match index_height {
-                Some(height) => Some(height),
-                None => self.fetch_current_height().await.ok(),
-            };
-            *known = Some(height);
-        }
-        known.flatten()
+    /// index height of the cycle. Round 8: never the node's `fullHeight`; with
+    /// no index height (outside a scan cycle) no spend is deep.
+    fn removal_height(&self) -> Option<u64> {
+        self.cycle_state().height
     }
 
     /// Whether the index shows tracked reserve `reserve` spent at least
     /// `SPENT_REMOVAL_DEPTH` blocks deep (rounds 6d/6e). The spend height is
     /// the spending transaction's `inclusionHeight` (box/byId has none).
-    async fn spent_deep(
-        &self,
-        reserve: &ExtendedReserveInfo,
-        heights: &mut Option<Option<u64>>,
-    ) -> bool {
+    async fn spent_deep(&self, reserve: &ExtendedReserveInfo) -> bool {
         let spent_at = match self.fetch_indexed_box(&reserve.box_id, Lane::Tracked).await {
             Ok(Some(chain_box)) if !chain_box.spent_tx.is_empty() => {
                 self.nft_cache().unknown_since.remove(&reserve.box_id);
@@ -2304,7 +2342,7 @@ impl ServerState {
                     .unknown_since
                     .entry(reserve.box_id.clone())
                     .or_insert(height);
-                if height >= since + SPENT_REMOVAL_DEPTH {
+                if height >= since.saturating_add(SPENT_REMOVAL_DEPTH) {
                     warn!(
                         "Reserve {} has been unknown to the index since height {} (now {}): removing it",
                         reserve.box_id, since, height
@@ -2325,7 +2363,7 @@ impl ServerState {
                 return false;
             }
         };
-        let height = self.removal_height(heights).await;
+        let height = self.removal_height();
         let deep = match (spent_at, height) {
             (Some(spent_at), Some(height)) => {
                 height.saturating_sub(spent_at) + 1 >= SPENT_REMOVAL_DEPTH
@@ -2380,7 +2418,7 @@ impl ServerState {
                             height
                         }
                     };
-                    if height >= since + REMEMBER_REMOVED_BLOCKS {
+                    if height >= since.saturating_add(REMEMBER_REMOVED_BLOCKS) {
                         expired.push(box_id.clone());
                     }
                 }
@@ -2478,7 +2516,9 @@ impl ServerState {
     pub async fn process_scan_boxes(&self) -> Result<(), ScannerError> {
         info!("Starting to process scan boxes...");
         // Round 6e (P2-1): a lagging blockchain index shows boxes spent since
-        // as unspent; skip the cycle rather than judge by it.
+        // as unspent; skip the cycle rather than judge by it. Round 8: so is a
+        // cycle without a usable index height (no answer, a malformed one, or
+        // an index that went back): a no-op, retried at the next block.
         let index_height = match self.index_height().await {
             Ok(height) => {
                 self.nft_cache().lag_skips_in_a_row = 0;
@@ -2508,7 +2548,7 @@ impl ServerState {
         };
         let scan_boxes = self.get_scan_boxes().await?;
         info!("Retrieved {} scan boxes to process", scan_boxes.len());
-        let scan_boxes = self.begin_cycle(scan_boxes, index_height).await;
+        let scan_boxes = self.begin_cycle(scan_boxes, Some(index_height)).await;
 
         let mut current_box_ids = Vec::new();
         // Box IDs that failed admission, normalized the same way
@@ -2563,7 +2603,6 @@ impl ServerState {
         // it (moved to a page already read), with or without an attacker; and a
         // scan with no valid box at all (manually inserted reserves on a local
         // test node, round 6c) removes nothing the chain does not show spent.
-        let mut removal_height: Option<Option<u64>> = None;
         let mut tracked_now = TrackedThisCycle::new();
         // Round 6f-2 (P2-A): the rules for boxes unknown to the index need the
         // index height of this cycle.
@@ -2666,10 +2705,7 @@ impl ServerState {
                 // (R7 + 43,200 blocks have passed) and its spend is deep: then
                 // the reserve is gone, whatever the pending box turns out to be.
                 let refund_due = reserve.base_info.refund_initiation_height != 0
-                    && self
-                        .removal_height(&mut removal_height)
-                        .await
-                        .is_some_and(|height| {
+                    && self.removal_height().is_some_and(|height| {
                             height
                                 >= reserve.base_info.refund_initiation_height + REFUND_DELAY_BLOCKS
                         });
@@ -2683,7 +2719,7 @@ impl ServerState {
                 // Round 6f-2 (P2-A): `spent_deep` counts an unknown box only
                 // in a cycle that knows the index height.
                 if !((refund_due || unknown)
-                    && self.spent_deep(&reserve, &mut removal_height).await)
+                    && self.spent_deep(&reserve).await)
                 {
                     info!(
                         "Keeping reserve {} (successor lineage check pending)",
@@ -2695,7 +2731,7 @@ impl ServerState {
                     "Reserve {} is spent deep and its refund was due: a pending check no longer keeps it",
                     reserve.box_id
                 );
-            } else if !followed && !self.spent_deep(&reserve, &mut removal_height).await {
+            } else if !followed && !self.spent_deep(&reserve).await {
                 continue;
             }
             info!(
@@ -3412,10 +3448,17 @@ mod tests {
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                let body = body.to_string();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
-                    let _ = socket.read(&mut buf).await;
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    // Round 8: a cycle needs the index height.
+                    let body = if String::from_utf8_lossy(&buf[..n])
+                        .starts_with("GET /blockchain/indexedHeight")
+                    {
+                        r#"{"indexedHeight":1000,"fullHeight":1000}"#
+                    } else {
+                        body
+                    };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                         body.len(), body
@@ -3697,8 +3740,11 @@ mod tests {
                             None => ("404 Not Found", "{}".to_string()),
                         })
                     } else if path.starts_with("/blockchain/indexedHeight") {
-                        // Round 6e: this node does not tell its index height.
-                        Some(("404 Not Found", "{}".to_string()))
+                        // Round 8: a cycle needs the index height.
+                        Some((
+                            "200 OK",
+                            r#"{"indexedHeight":1000,"fullHeight":1000}"#.to_string(),
+                        ))
                     } else {
                         path.strip_prefix("/blockchain/token/byId/").map(|token| {
                             (
@@ -4155,6 +4201,9 @@ mod tests {
     /// Mock node route key: the box list the scan gets after its first request.
     const SCAN_AFTER_FIRST_READ: &str = "scan-after-first-read";
 
+    /// Mock node route body: the request is never answered (round 8).
+    const MOCK_HANG: &str = "!hang";
+
     /// `spawn_mock_node`, also counting the requests by path. The scan answer
     /// is paged by the `offset` and `limit` of the query.
     async fn spawn_counting_mock_node(
@@ -4192,10 +4241,40 @@ mod tests {
                         *count += 1;
                         *count
                     };
+                    // Round 8: a route `MOCK_HANG` never answers, one
+                    // starting with `!` answers its status (`!500 body`).
+                    if txs.get(path).is_some_and(|body| body == MOCK_HANG) {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        return;
+                    }
                     // `txs` keys are transaction ids, or full paths for the
                     // box and token index (404 when absent).
                     let (status, body) = if let Some(body) = txs.get(path) {
-                        ("200 OK", body.clone())
+                        match body.strip_prefix('!').and_then(|rest| rest.split_once(' ')) {
+                            Some((code, rest)) => (
+                                match code {
+                                    "500" => "500 Internal Server Error",
+                                    "503" => "503 Service Unavailable",
+                                    _ => "404 Not Found",
+                                },
+                                rest.to_string(),
+                            ),
+                            None => ("200 OK", body.clone()),
+                        }
+                    } else if path == "/blockchain/indexedHeight" {
+                        // Round 8: a cycle needs the index height. Unless a
+                        // test gives one, the index is at the node's height
+                        // (the `/info` route), else at TEST_SPENT_AT.
+                        let height = txs
+                            .get("/info")
+                            .and_then(|info| serde_json::from_str::<serde_json::Value>(info).ok())
+                            .and_then(|info| info["fullHeight"].as_u64())
+                            .unwrap_or(TEST_SPENT_AT);
+                        (
+                            "200 OK",
+                            serde_json::json!({ "indexedHeight": height, "fullHeight": height })
+                                .to_string(),
+                        )
                     } else if let Some(tx_id) = path.strip_prefix("/blockchain/transaction/byId/") {
                         match txs.get(tx_id) {
                             Some(body) => ("200 OK", body.clone()),
@@ -6299,6 +6378,181 @@ mod tests {
         }
     }
 
+    /// Round 8: the scene of the index-height tests. The tracked box T was spent
+    /// by `top_up_tx`, which made its successor S; the scan lists S. A cycle
+    /// that runs tracks S and removes T.
+    fn index_height_scene(index_route: Option<(String, String)>) -> (HashMap<String, String>, String) {
+        let tracked_box = "11".repeat(32);
+        let top_up_tx = "e1".repeat(32);
+        let mut routes = HashMap::from([
+            tracked_box_route(&tracked_box, &[(TEST_RESERVE_NFT, 1)], Some(&top_up_tx)),
+            spend_tx_route(&top_up_tx),
+        ]);
+        routes.extend(index_route);
+        let scanned = serde_json::json!([scanned_box_json(
+            &"55".repeat(32),
+            &top_up_tx,
+            1_100_000_000,
+            &[(TEST_RESERVE_NFT, 1)],
+            None
+        )]);
+        (routes, scanned.to_string())
+    }
+
+    /// Round 8 (item 1): without a usable `GET /blockchain/indexedHeight`
+    /// answer a cycle is a no-op: an HTTP error, a timeout, a body that is not
+    /// JSON, a missing or non-numeric field, or an index above `fullHeight`.
+    /// The box list is not read, nothing is tracked, removed or quarantined, no
+    /// clock starts, and the skip is counted; the next cycle with a good answer
+    /// runs as usual. An index at the largest height does not overflow.
+    #[tokio::test]
+    async fn test_no_usable_index_height_skips_the_cycle() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let successor = "55".repeat(32);
+        let path = "/blockchain/indexedHeight".to_string();
+        for (case, body) in [
+            ("HTTP 500", "!500 {}".to_string()),
+            ("HTTP 503", "!503 {\"error\":503}".to_string()),
+            ("HTTP 404", "!404 {}".to_string()),
+            ("timeout", MOCK_HANG.to_string()),
+            ("not JSON", "<html>bad gateway</html>".to_string()),
+            ("empty object", "{}".to_string()),
+            ("no fullHeight", r#"{"indexedHeight":1000}"#.to_string()),
+            ("no indexedHeight", r#"{"fullHeight":1000}"#.to_string()),
+            (
+                "heights as strings",
+                r#"{"indexedHeight":"1000","fullHeight":"1000"}"#.to_string(),
+            ),
+            (
+                "negative height",
+                r#"{"indexedHeight":-1,"fullHeight":1000}"#.to_string(),
+            ),
+            (
+                "index above fullHeight",
+                r#"{"indexedHeight":1001,"fullHeight":1000}"#.to_string(),
+            ),
+            (
+                "index far above fullHeight",
+                format!(r#"{{"indexedHeight":{},"fullHeight":1000}}"#, u64::MAX),
+            ),
+            (
+                "index far below fullHeight",
+                format!(r#"{{"indexedHeight":5,"fullHeight":{}}}"#, u64::MAX),
+            ),
+        ] {
+            let (routes, scanned) = index_height_scene(Some((path.clone(), body)));
+            let (addr, hits) =
+                spawn_counting_mock_node(scanned.clone(), std::sync::Arc::new(routes)).await;
+            let state = mock_state(addr);
+            insert_tracked_reserve(&state, &tracked_box, owner);
+            state.process_scan_boxes().await.unwrap();
+            let hits = hits.lock().unwrap().clone();
+            assert_eq!(hits.get("/blockchain/indexedHeight"), Some(&1), "{case}");
+            assert_eq!(
+                hits.len(),
+                1,
+                "{case}: only the index height is asked, got {hits:?}"
+            );
+            assert_eq!(state.skipped_cycles(), 1, "{case}");
+            assert_eq!(state.nft_cache().cycles, 0, "{case}");
+            assert!(state.reserve_tracker.get_reserve(&tracked_box).is_ok(), "{case}");
+            assert!(state.reserve_tracker.get_reserve(&successor).is_err(), "{case}");
+            assert!(state.nft_cache().unknown_since.is_empty(), "{case}");
+            assert!(state.nft_cache().removed.is_empty(), "{case}");
+            assert!(
+                state.reserve_storage.get_all_quarantined().unwrap().is_empty(),
+                "{case}"
+            );
+
+            // A retry with a usable answer runs the cycle.
+            let (routes, scanned) =
+                index_height_scene(Some(indexed_route(TEST_SPENT_AT, TEST_SPENT_AT)));
+            let (state, _) = on_node(state, scanned, routes).await;
+            state.process_scan_boxes().await.unwrap();
+            assert_eq!(state.skipped_cycles(), 1, "{case}");
+            assert!(state.reserve_tracker.get_reserve(&successor).is_ok(), "{case}");
+            assert!(state.reserve_tracker.get_reserve(&tracked_box).is_err(), "{case}");
+        }
+
+        // The largest heights pass the checks without an overflow.
+        let (routes, scanned) = index_height_scene(Some(indexed_route(u64::MAX, u64::MAX)));
+        let state = mock_state(spawn_mock_node(scanned, std::sync::Arc::new(routes)).await);
+        insert_tracked_reserve(&state, &tracked_box, owner);
+        state.process_scan_boxes().await.unwrap();
+        assert_eq!(state.skipped_cycles(), 0);
+        assert!(state.reserve_tracker.get_reserve(&successor).is_ok());
+    }
+
+    /// Round 8 (item 1): an index height below the highest one a cycle ran
+    /// with since the start (a rollback, or another node behind) skips the
+    /// cycle until the index is back there, within the lag limit or not; a
+    /// restart forgets the highest height.
+    #[tokio::test]
+    async fn test_an_index_going_back_skips_the_cycle() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let listed = serde_json::json!([scanned_box_json(
+            &tracked_box,
+            "c0c0",
+            1_000_000_000,
+            &[(TEST_RESERVE_NFT, 1)],
+            None
+        )])
+        .to_string();
+        let mut state = mock_state(spawn_mock_node("[]".to_string(), Default::default()).await);
+        insert_tracked_reserve(&state, &tracked_box, owner);
+        for (indexed, full, runs) in [
+            (1_000, 1_000, true),
+            (999, 999, false),
+            (999, 1_001, false),
+            (998, 998, false),
+            (1_000, 1_001, true),
+            (1_001, 1_001, true),
+            (1_000, 1_000, false),
+        ] {
+            let (addr, hits) = spawn_counting_mock_node(
+                listed.clone(),
+                std::sync::Arc::new(HashMap::from([indexed_route(indexed, full)])),
+            )
+            .await;
+            let skipped = state.skipped_cycles();
+            state = on_node_at(state, addr);
+            state.process_scan_boxes().await.unwrap();
+            let scans = hits
+                .lock()
+                .unwrap()
+                .get("/blockchain/box/unspent/byAddress")
+                .copied()
+                .unwrap_or(0);
+            assert_eq!(scans > 0, runs, "index {indexed}, full {full}");
+            assert_eq!(
+                state.skipped_cycles() - skipped,
+                u64::from(!runs),
+                "index {indexed}, full {full}"
+            );
+            assert!(state.reserve_tracker.get_reserve(&tracked_box).is_ok());
+        }
+        assert_eq!(state.nft_cache().index_height_seen, Some(1_001));
+        // A new process starts without it (`index_height_seen` is in memory).
+        state.nft_cache().index_height_seen = None;
+        let (addr, hits) = spawn_counting_mock_node(
+            listed,
+            std::sync::Arc::new(HashMap::from([indexed_route(999, 999)])),
+        )
+        .await;
+        let state = on_node_at(state, addr);
+        state.process_scan_boxes().await.unwrap();
+        assert!(hits.lock().unwrap().contains_key("/blockchain/box/unspent/byAddress"));
+    }
+
+    /// `state` on the node at `addr`.
+    fn on_node_at(state: ServerState, addr: std::net::SocketAddr) -> ServerState {
+        let mut config = state.config.clone();
+        config.node_url = format!("http://{}", addr);
+        ServerState { config, ..state }
+    }
+
     /// Round 6e (LOW-5): past the cycle's time limit a walk reads nothing more
     /// and the check is retried; and the singleton answers kept are those of
     /// the NFTs in the scan and of the tracked boxes.
@@ -6788,7 +7042,8 @@ mod tests {
     /// however far the node's fullHeight moves: the 10-block rule, the pending
     /// override and the immediate rule next to a sibling count only in index
     /// height. Once the index height is known again, counting starts there, and
-    /// the removed record carries that height.
+    /// the removed record carries that height. Round 8: such a cycle is now
+    /// skipped altogether (`test_no_usable_index_height_skips_the_cycle`).
     #[tokio::test]
     async fn test_unknown_to_an_index_of_unknown_height_is_kept() {
         let owner = &VALID_PREFIXED_PUBKEY[2..];
