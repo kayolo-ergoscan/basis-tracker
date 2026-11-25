@@ -8410,4 +8410,90 @@ mod tests {
             HashMap::from([(t.clone(), TEST_RESERVE_NFT.to_string())])
         );
     }
+
+    /// Round 8 (review 5): the removal clocks saturate. A tracked box unknown
+    /// to the index and a removed record, both counting from 5 below
+    /// u64::MAX: the cycle there keeps both (with plain additions it would
+    /// panic: tests and release builds check overflow), and the clocks run
+    /// out at u64::MAX itself.
+    #[tokio::test]
+    async fn test_removal_clocks_saturate_at_the_top() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let removed_box = "71".repeat(32);
+        let mut state = mock_state(spawn_mock_node("[]".to_string(), Default::default()).await);
+        insert_tracked_reserve(&state, &tracked_box, owner);
+        state.remember_nft(&tracked_box, Some(TEST_RESERVE_NFT.to_string()));
+        insert_tracked_reserve(&state, &removed_box, owner);
+        let record = state.reserve_tracker.get_reserve(&removed_box).unwrap();
+        state.reserve_tracker.remove_reserve(&removed_box).unwrap();
+        state.reserve_storage.remove_reserve(&removed_box).unwrap();
+        let removed = RemovedReserve {
+            record,
+            nft: Some("2f".repeat(32)),
+            removed_at: 0,
+            removed_height: Some(u64::MAX - 5),
+        };
+        state.reserve_storage.store_removed(&removed).unwrap();
+        state.nft_cache().removed.insert(removed_box.clone(), removed);
+        for (height, kept) in [(u64::MAX - 5, true), (u64::MAX - 1, true), (u64::MAX, false)] {
+            let routes = HashMap::from([indexed_route(height, height)]);
+            state = on_node(state, "[]".to_string(), routes).await.0;
+            state.process_scan_boxes().await.unwrap();
+            assert_eq!(state.skipped_cycles(), 0, "height {height}");
+            assert_eq!(
+                state.reserve_tracker.get_reserve(&tracked_box).is_ok(),
+                kept,
+                "height {height}"
+            );
+            assert_eq!(
+                state.nft_cache().removed.contains_key(&removed_box),
+                kept,
+                "height {height}"
+            );
+            if kept {
+                assert_eq!(
+                    state.nft_cache().unknown_since.get(&tracked_box).copied(),
+                    Some(u64::MAX - 5)
+                );
+            }
+        }
+    }
+
+    /// Round 8 (review 6): the singleton verdict of a root candidate's NFT is
+    /// cached but not stored: here a junk root whose NFT has emission 1 and
+    /// whose creating transaction spends no input of the R4 key is
+    /// quarantined, and `reserve_nft_emissions` stays empty.
+    #[tokio::test]
+    async fn test_a_junk_roots_singleton_is_not_stored() {
+        let scan_box = c4_test_box();
+        let other_key = hex::encode(basis_core::impls::generate_keypair().1);
+        let routes = HashMap::from([
+            (
+                scan_box.transaction_id.clone(),
+                tx_json(
+                    &scan_box.transaction_id,
+                    &[(
+                        &"33".repeat(32),
+                        "some_address",
+                        &"44".repeat(32),
+                        &p2pk_ergo_tree(&other_key),
+                    )],
+                ),
+            ),
+            token_route(TEST_RESERVE_NFT, 1),
+        ]);
+        let state = mock_state(spawn_mock_node("[]".to_string(), std::sync::Arc::new(routes)).await);
+        let info = state
+            .parse_reserve_box(&scan_box, ReserveContractKind::Erg, "test_p2s")
+            .unwrap();
+        assert!(matches!(
+            state.admit_reserve_box(&scan_box, &info, "test_p2s").await,
+            ReserveAdmission::Quarantined { .. }
+        ));
+        assert_eq!(state.nft_cache().singleton.get(TEST_RESERVE_NFT), Some(&true));
+        let facts = state.reserve_storage.nft_facts().unwrap();
+        assert!(facts.emission.is_empty(), "{facts:?}");
+        assert!(facts.box_nft.is_empty(), "{facts:?}");
+    }
 }
