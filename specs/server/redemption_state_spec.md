@@ -657,7 +657,16 @@ Now:
      redemption reads; once it is `min_depth` deep the redemption can never be mined and is
      dropped as above, usually within a quarter of an hour of the tenth missing check. A
      redemption seen in a mempool or on chain again is never released: its request is forgotten
-     and it is followed as before; one that lands before the release commit is applied;
+     and it is followed as before; one that lands before the release commit is applied.
+     Round 8: kept as it is. The lifetime is bounded by the release commit, not by a block
+     count: about 10 one-minute checks (some 5 blocks), the commit's block, then `min_depth`
+     blocks. While no commit can be made (no fee funds, a tracker box the key cannot spend, a
+     node refusing it) the entry stays and its reserve answers `409`, however long; the
+     release request is in memory and asked again by a new process at the entry's next slow
+     check. Dropping such an entry after a number of blocks without the commit is not done:
+     the redemption could still be mined, and its reserve would build on a tree one
+     redemption behind the chain (pinned by
+     `without_a_release_commit_the_reserve_stays_blocked`);
    - a node error: kept, not counted;
    - applying fails (the tracker's state no longer matches the build): kept with the error,
      logged once and tried again at every check. An operator repair (`/redeem/complete` below,
@@ -718,6 +727,11 @@ Now:
    `reserve_tree_repairs` of the `tracker_boxes` store, listed oldest first by
    `GET /redemption/tree/repairs`. A repair changes values of existing or new edges only; a tree
    that differs from the chain in its shape (an edge the chain lacks) cannot be repaired this way.
+   Round 8: one edge per repair, and the tree must equal R5 after it, so a reserve with two
+   edges out of step (say one applied with another timestamp and one redemption never applied)
+   cannot be repaired by the route: each single repair is refused and nothing changes (pinned by
+   `two_edges_out_of_step_are_not_repaired_one_at_a_time`). A repair of several edges at once is
+   left for later.
 
 **Reserve debt while a redemption is journaled (round 5b, F11).** `total_debt` of `/reserves`,
 `/reserves/issuer/{pubkey}` and `/reserves/{box_id}` is the owner's outstanding debt on the notes
@@ -780,6 +794,11 @@ with the tracker's reserve tree:
 - not reproduced (another action changed the tree, the lineage does not reach the tracker's tree,
   the values give another digest), not applicable, or dropped by an operator: logged once per reserve box and tracker digest for an operator
   (`POST /redemption/tree/repair`); nothing changes.
+
+Round 8: kept as it is. The walk's limit of 8 boxes is reached only by that many reserve actions
+(top-ups, redemptions) between two passes, that is while the tracker is down: a redemption with 7
+top-ups after it is journaled, with 8 it is left to an operator (pinned by
+`a_redemption_more_than_eight_boxes_back_is_left_to_an_operator`).
 
 **Commits wait for it (round 5, 5b).** The broadcast redemption reads the tracker box as its data
 input, and a tracker commit spends that box. The submit records the redemption's tx id and data

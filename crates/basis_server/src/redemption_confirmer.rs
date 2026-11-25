@@ -1587,6 +1587,52 @@ mod tests {
         assert!(fx.shared.get_release_requests().is_empty());
     }
 
+    /// Round 8 (risk 3 kept as it is): the release commit is the only way a long-missing
+    /// redemption that reads the current tracker box is dropped. While no commit comes (no fee
+    /// funds, a tracker box the key cannot spend, a node refusing it) the redemption stays
+    /// journaled through any number of slow checks: never dropped or applied, its reserve
+    /// refused for builds (`waiting_redemption`), one release request, asked again by a new
+    /// process (the requests are in memory).
+    #[tokio::test]
+    async fn without_a_release_commit_the_reserve_stays_blocked() {
+        let fx = fixture(true).await;
+        fx.journal(TX);
+        fx.shared.set_confirmed([0x11; 33], tracker_box(), 900);
+        for _ in 0..MAX_REDEMPTION_MISSING_CHECKS {
+            fx.check().await;
+        }
+        assert_eq!(fx.shared.get_release_requests().len(), 1);
+        for _ in 0..30 {
+            fx.make_due(TX);
+            let outcome = fx.check().await;
+            assert_eq!(outcome.waiting, vec![TX.to_string()]);
+            assert!(outcome.dropped.is_empty() && outcome.applied.is_empty());
+        }
+        assert_eq!(fx.shared.get_release_requests().len(), 1);
+        assert_eq!(fx.journaled().len(), 1);
+        assert_eq!(
+            fx.journaled()[0].missing_checks,
+            MAX_REDEMPTION_MISSING_CHECKS + 30
+        );
+        assert_eq!(fx.applied.load(Ordering::SeqCst), 0);
+        assert!(
+            waiting_redemption(&fx.storage, &hex::encode(fx.issuer), &DenomKey::Erg)
+                .unwrap()
+                .is_some()
+        );
+
+        // A new process: the journal is read again, the request is made again at its next
+        // slow check.
+        let restarted = SharedTrackerState::new();
+        restore_submitted_redemptions(&fx.storage, &restarted);
+        restarted.set_confirmed([0x11; 33], tracker_box(), 900);
+        assert!(restarted.get_release_requests().is_empty());
+        fx.make_due(TX);
+        check_journal(&fx.config, &fx.storage, &restarted, &fx.cmd_tx).await;
+        assert_eq!(restarted.get_release_requests().len(), 1);
+        assert_eq!(fx.journaled().len(), 1);
+    }
+
     /// A node error is not a missing check: the redemption stays, uncounted.
     #[tokio::test]
     async fn a_node_error_keeps_the_redemption_uncounted() {
@@ -1854,6 +1900,76 @@ mod tests {
 
             fn requests(&self) -> usize {
                 self.node.lock().unwrap().requests.len()
+            }
+
+            /// On the node: `tx` (in a block at 990) tops up reserve box `from` into `to_id`
+            /// by `add`, the tree unchanged (`digest`, hex).
+            fn top_up(
+                &self,
+                tx: &str,
+                from: &serde_json::Value,
+                to_id: &str,
+                add: u64,
+                digest: &str,
+            ) -> serde_json::Value {
+                let value = from["value"].as_u64().unwrap() + add;
+                let to = self.reserve_box(to_id, tx, value, digest);
+                let mut input = from.clone();
+                input["spentTransactionId"] = serde_json::json!(tx);
+                let indexed = serde_json::json!({
+                    "id": tx,
+                    "inclusionHeight": 990,
+                    "inputs": [input],
+                    "dataInputs": [],
+                    "outputs": [to.clone()],
+                });
+                let mut node = self.node.lock().unwrap();
+                let from_id = from["boxId"].as_str().unwrap().to_string();
+                node.unspent.remove(&from_id);
+                node.spent_by.insert(from_id, tx.to_string());
+                node.unspent.insert(to_id.to_string());
+                node.boxes.insert(to_id.to_string(), to.clone());
+                node.indexed_txs.insert(tx.to_string(), indexed);
+                to
+            }
+        }
+
+        /// Round 8 (risk 2 kept as it is): the lineage is followed at most
+        /// [`crate::reserve_reconciler::MAX_TRACE_STEPS`] (8) boxes back. A redemption
+        /// broadcast elsewhere and then 7 top-ups (the redemption's input is 8 boxes back) is
+        /// journaled, with the amount of the redemption alone; with 8 top-ups (9 back) the
+        /// reserve is reported for an operator, nothing journaled, and its builds stay refused
+        /// until a repair (`POST /redemption/tree/repair`, one edge: enough here). Each pass
+        /// runs before a journal pass (every minute), so only that many reserve actions while
+        /// the tracker is down or between two passes reach this.
+        #[tokio::test]
+        async fn a_redemption_more_than_eight_boxes_back_is_left_to_an_operator() {
+            for top_ups in [7u8, 8] {
+                let fx = fixture(true).await;
+                let empty = fx.tracker_reserve_digest().await;
+                let origin = fx.reserve_box(&box_id(1), &tx_id(0), VALUE, &empty);
+                let mut last = fx.redeem_out_of_band(&tx_id(1), &"b1".repeat(32), &origin, &box_id(2), 300, BUILT_AT, &fx.built_r5, false);
+                for i in 0..top_ups {
+                    last = fx.top_up(&tx_id(2 + i), &last, &box_id(3 + i), 1_000, &fx.built_r5);
+                }
+                let current = box_id(2 + top_ups);
+                assert_eq!(last["boxId"].as_str(), Some(current.as_str()));
+                let reserves = fx.reserves(&current);
+                let mut cache = ReconcileCache::default();
+                let outcome = fx.reconcile(&reserves, &mut cache).await;
+                if top_ups == 7 {
+                    assert_eq!(outcome.journaled, vec![tx_id(1)]);
+                    let entry = fx.storage.journaled_redemption(&tx_id(1)).unwrap().unwrap();
+                    assert_eq!((entry.redeemed_amount, entry.new_already_redeemed), (300, 300));
+                    assert_eq!(fx.check().await.applied, vec![tx_id(1)]);
+                    assert_eq!(fx.tracker_reserve_digest().await, fx.built_r5);
+                } else {
+                    assert_eq!(outcome.unexplained, vec![current.clone()]);
+                    assert!(outcome.journaled.is_empty());
+                    assert!(fx.journaled().is_empty());
+                    assert_eq!(fx.tracker_reserve_digest().await, empty);
+                    assert_eq!(fx.applied.load(Ordering::SeqCst), 0);
+                }
             }
         }
 

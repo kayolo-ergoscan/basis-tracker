@@ -617,3 +617,102 @@ async fn a_dropped_entry_is_remembered_and_its_release_request_forgotten() {
     assert_eq!(dropped.entry, entry);
     assert!(shared.get_release_requests().is_empty());
 }
+
+/// Round 8 (risk 1 kept as it is): the route repairs one edge, and only when the reserve tree
+/// then hashes to R5 of the reserve box. With two edges out of step (here: one applied with
+/// another timestamp, and a redemption to another recipient the tracker never applied) neither
+/// single repair gives R5: both are refused (409) and nothing changes, so the reserve stays
+/// blocked until a repair of several edges at once exists (not built: see the round 8 report).
+#[tokio::test]
+async fn two_edges_out_of_step_are_not_repaired_one_at_a_time() {
+    let fx = fixture().await;
+    let other = basis_store::schnorr::generate_keypair().1;
+    let other_note = IouNote::create_and_sign(
+        other,
+        1_000,
+        BUILT_AT,
+        &fx.issuer_secret,
+        &TRACKER_NFT,
+        DenomKey::Erg,
+    )
+    .unwrap();
+    let issuer = fx.issuer;
+    fx.ask(|response_tx| TrackerCommand::AddNote {
+        issuer_pubkey: issuer,
+        note: other_note,
+        response_tx,
+    })
+    .await
+    .unwrap();
+    let recipient = fx.recipient;
+    fx.ask(|response_tx| TrackerCommand::CompleteRedemption {
+        issuer_pubkey: issuer,
+        recipient_pubkey: recipient,
+        denomination: DenomKey::Erg,
+        redeemed_amount: 300,
+        new_already_redeemed: Some(300),
+        reserve_tree_timestamp: Some(BUILT_AT),
+        response_tx,
+    })
+    .await
+    .unwrap();
+    // The chain: the first edge at BUILT_AT ‖ 300 and the other at BUILT_AT ‖ 200.
+    let insert_proof_digest = |recipient: PubKey, timestamp: u64, already: u64| {
+        let fx = &fx;
+        async move {
+            hex::encode(
+                fx.ask(|response_tx| TrackerCommand::GetReserveInsertProof {
+                    issuer_pubkey: issuer,
+                    recipient_pubkey: recipient,
+                    denomination: DenomKey::Erg,
+                    timestamp,
+                    new_already_redeemed: already,
+                    response_tx,
+                })
+                .await
+                .unwrap()
+                .1,
+            )
+        }
+    };
+    let chain = insert_proof_digest(other, BUILT_AT, 200).await;
+    fx.chain_holds(&chain);
+    // The tracker: the first edge at RE_SIGNED_AT ‖ 300 (as the legacy apply after a re-sign
+    // leaves it), the other edge missing.
+    let off = insert_proof_digest(recipient, RE_SIGNED_AT, 300).await;
+    let mut off_digest = [0u8; 33];
+    off_digest.copy_from_slice(&hex::decode(&off).unwrap());
+    let forced = fx
+        .ask(|response_tx| TrackerCommand::RepairReserveTreeValue {
+            issuer_pubkey: issuer,
+            recipient_pubkey: recipient,
+            denomination: DenomKey::Erg,
+            value: basis_store::ReserveTreeValue {
+                timestamp: RE_SIGNED_AT,
+                already_redeemed: 300,
+            },
+            chain_digest: off_digest,
+            dry_run: false,
+            response_tx,
+        })
+        .await
+        .unwrap();
+    assert_eq!(forced.outcome, ReserveTreeRepairOutcome::Repaired);
+    let before = fx.tracker_digest().await;
+    assert_eq!(before, off);
+
+    let (status, body) = fx.repair(fx.explicit(BUILT_AT, 300)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{:?}", body.data);
+    assert!(body.error.unwrap().contains("nothing changed"));
+    let (status, body) = fx
+        .repair(TreeRepairRequest {
+            recipient_pubkey: Some(hex::encode(other)),
+            ..fx.explicit(BUILT_AT, 200)
+        })
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{:?}", body.data);
+    assert!(body.error.unwrap().contains("nothing changed"));
+    assert_eq!(fx.tracker_digest().await, before);
+    assert_eq!(fx.note_redeemed().await, 300);
+    assert!(fx.repairs().await.is_empty());
+}
