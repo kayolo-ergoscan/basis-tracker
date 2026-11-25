@@ -230,9 +230,10 @@ it) and the singleton verdict of the NFTs of tracked boxes (`reserve_nft_emissio
 NFT id -> `{"emission": 1}`; only singletons, written when a tracked box holds the NFT,
 so root candidates' NFTs never fill it). A box's entry goes when the box is removed, only once its removed
 record is written (review LOW-3; the record keeps the NFT); at start, entries of boxes no
-longer tracked and emissions of NFTs no tracked or removed box holds are removed, but only
-when the tracked reserves (for box entries) and also the removed reserves (for emissions)
-loaded without an error (review LOW-2: else they are kept as they are, with a warning).
+longer tracked and emissions of NFTs no tracked or removed box holds are removed; emissions
+only when the removed reserves loaded without an error (review LOW-2: else they are kept,
+with a warning). The tracked reserves always loaded completely: else the tracker does not
+start (below).
 A write that fails is tried again the next time the box is seen (review LOW-4). An entry that does not
 read back is removed and the node is asked again; a store that cannot be read starts
 with an empty cache (as before round 8). A known NFT is not replaced by "none" (a box
@@ -245,6 +246,29 @@ that input minted it anew; the in-memory cache trusted the verdict for the proce
 lifetime already, the store extends that across restarts, for tracked NFTs only. A
 data dir from round 7b opens with both partitions empty; round 7b opens a dir with them
 (the keyspace keeps partitions it does not open).
+
+**Round 8: no start without every tracked reserve (operator decision).** At start the scanner
+state reads the whole `reserves` partition. If it cannot be read, or any record does not
+decode, there is no scanner state: `ServerState::new` fails with
+`ScannerError::ReservesUnreadable`, and `basis_server` logs one ERROR line and exits 1,
+before the reserve scanner, the tracker box updater or the HTTP server starts and before
+any request to the node; `main.rs` never replaces it by a scanner state without them (the
+"minimal scanner" fallback refuses it too). Before, the scanner started with no tracked
+reserves (the error was not even logged), so their live boxes would be judged as new roots
+(quarantined by the N9 guard for owners with redemptions) and their NFT facts pruned. The
+line names every record that does not decode by its key (the box id; a key that is not
+printable as `0x` + hex), never its contents, and the recovery:
+
+    Refusing to start: N tracked reserve record(s) in <data dir>/reserves (partition
+    "reserves") do not decode, keys: <key>, <key>. Started without them, the scanner would
+    judge their live reserve boxes as new roots. To recover, restore the data directory from
+    the latest backup in /var/backups/basis-tracker, or remove the record(s) with these keys
+    by hand, then start the tracker again.
+
+(on one line; at most 100 keys, then "and M more"). Nothing is written before the exit, so
+the stored NFT facts are there for the start after the repair. Runtime readers of the
+partition (`/reserves`, the build routes) are unchanged, and removed reserve records that
+do not decode are still skipped with a warning (round 6f above).
 
 **Operator release (round 6c).** `POST /reserves/quarantined/release` (Admin; body
 `box_id`, `note`) moves a quarantine record to a journal (`quarantine_releases`,

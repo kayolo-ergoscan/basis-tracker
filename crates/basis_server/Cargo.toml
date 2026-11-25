@@ -38,6 +38,8 @@ features = ["toml"]
 
 # Test dependencies
 [dev-dependencies]
+# Round 8: the binary's tests write a damaged reserve record.
+basis_store = { path = "../basis_store", features = ["test-support"] }
 tokio = { workspace = true, features = ["full", "rt-multi-thread"] }
 tower = { version = "0.4", features = ["util"] }
 tempfile = "3.10"

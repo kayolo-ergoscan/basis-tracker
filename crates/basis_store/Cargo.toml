@@ -52,3 +52,6 @@ harness = false
 [features]
 default = ["ergo_scanner"]
 ergo_scanner = ["reqwest"]  # Ergo scanner using /scan and /blockchain APIs
+# Round 8: test hooks for the server binary's tests (a raw reserve record); only
+# basis_server's dev-dependency turns it on, so release builds never have it.
+test-support = []

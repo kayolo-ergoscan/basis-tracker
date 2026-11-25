@@ -126,8 +126,12 @@ async fn main() {
         basis_store::reopen_guard::ReopenGuard::new(config.server.reserve_reopen_guard);
 
     // Create real scanner state with configured node URL and contract template
+    // Round 8 (operator: refuse to start): tracked reserves that do not load completely stop
+    // the start here, before the scanner, the tracker box updater or the HTTP server, and are
+    // never replaced by a scanner state without them (neither below nor in the fallback).
     let mut ergo_scanner = match ServerState::new(scanner_config, &data_dir) {
         Ok(scanner) => scanner,
+        Err(ScannerError::ReservesUnreadable(msg)) => refuse_start(&msg),
         Err(e) => {
             tracing::warn!("Failed to create Ergo scanner: {}", e);
             tracing::info!("Continuing without blockchain scanner...");
@@ -136,8 +140,11 @@ async fn main() {
                 node_url: "http://127.0.0.1:9053".to_string(), // Dummy URL that won't be used
                 ..Default::default()
             };
-            ServerState::new(minimal_config, &data_dir)
-                .unwrap_or_else(|_| panic!("Failed to create minimal scanner"))
+            match ServerState::new(minimal_config, &data_dir) {
+                Ok(scanner) => scanner,
+                Err(ScannerError::ReservesUnreadable(msg)) => refuse_start(&msg),
+                Err(_) => panic!("Failed to create minimal scanner"),
+            }
         }
     };
     ergo_scanner.reopen_guard = reopen_guard.clone();
@@ -1181,6 +1188,13 @@ async fn main() {
 /// secret value.
 fn exit_on_startup_error(msg: &str) -> ! {
     eprintln!("basis_server: {msg}");
+    tracing::error!("{}", msg);
+    std::process::exit(1)
+}
+
+/// Round 8 (operator: refuse to start): log `msg` as one ERROR line (tracing is up by then)
+/// and exit 1.
+fn refuse_start(msg: &str) -> ! {
     tracing::error!("{}", msg);
     std::process::exit(1)
 }

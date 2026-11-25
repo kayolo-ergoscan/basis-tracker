@@ -371,6 +371,67 @@ fn an_all_zero_tracker_nft_is_refused_at_startup() {
     assert!(!get_root(port), "nothing may listen");
 }
 
+/// Round 8 (operator: refuse to start): a tracked reserve record that does not decode stops
+/// the start with exit 1 and one ERROR line naming its key (not its contents) and the
+/// recovery, before anything listens or asks the node (no scan, no tracker box updater). With
+/// the record removed by hand, the same data directory starts and serves.
+#[test]
+fn an_undecodable_tracked_reserve_refuses_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let reserves = dir.path().join("data/reserves");
+    let bad = "5a".repeat(32);
+    let good = "11".repeat(32);
+    {
+        let storage = basis_store::persistence::ReserveStorage::open(&reserves).unwrap();
+        storage
+            .store_reserve(&basis_store::ExtendedReserveInfo {
+                base_info: basis_store::ReserveInfo {
+                    collateral_amount: 1_000_000_000,
+                    last_updated_height: 0,
+                    contract_address: "test_p2s".to_string(),
+                    tracker_nft_id: "11".repeat(32),
+                    refund_initiation_height: 0,
+                    reserve_token_id: String::new(),
+                },
+                total_debt: 0,
+                box_id: good.clone(),
+                owner_pubkey: "02".repeat(33),
+                last_updated_timestamp: 0,
+            })
+            .unwrap();
+        storage.insert_raw_reserve(bad.as_bytes(), br#"{"secret":"not a reserve"}"#);
+    }
+    let node = MockNode::start();
+    let port = free_port();
+    write_config(dir.path(), port, &node.url);
+    let (child, log) = spawn_server(dir.path());
+    let (status, log) = wait_for_startup_exit(child, &log);
+    assert_eq!(status.code(), Some(1), "{log}");
+    let errors: Vec<&str> = log.lines().filter(|line| line.contains("ERROR")).collect();
+    assert_eq!(errors.len(), 1, "{log}");
+    let error = errors[0];
+    assert!(
+        error.contains("Refusing to start: 1 tracked reserve record(s) in ")
+            && error.contains("data/reserves (partition \"reserves\") do not decode, keys: ")
+            && error.contains(&bad)
+            && error.contains("/var/backups/basis-tracker"),
+        "{error}"
+    );
+    assert!(!log.contains("not a reserve"), "{log}");
+    assert!(!log.contains("Continuing without blockchain scanner"), "{log}");
+    assert!(!get_root(port), "nothing may listen");
+    assert!(node.seen.lock().unwrap().is_empty(), "nothing may ask the node");
+
+    {
+        let storage = basis_store::persistence::ReserveStorage::open(&reserves).unwrap();
+        storage.remove_reserve(&bad).unwrap();
+    }
+    let mut server = Server::start(dir.path(), &node);
+    let log = server.log();
+    assert!(log.contains("Loaded 1 reserves from database"), "{log}");
+    server.stop();
+}
+
 /// An update interval of 0 used to panic the updater's timer after startup; the binary now
 /// refuses it before it serves anything.
 #[test]

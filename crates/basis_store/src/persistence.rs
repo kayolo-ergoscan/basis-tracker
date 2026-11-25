@@ -195,6 +195,29 @@ pub struct NftFacts {
     pub dropped: usize,
 }
 
+/// Round 8 (operator: refuse to start): why the tracked reserves did not load
+/// at start ([`ReserveStorage::tracked_reserves_at_start`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackedReservesUnreadable {
+    /// The partition could not be read.
+    Read(String),
+    /// The keys (printable, see [`printable_key`]) of the records that do not
+    /// decode.
+    Undecodable(Vec<String>),
+}
+
+/// A partition key for a log line: as it is when it is printable ASCII of at
+/// most 128 bytes (a box id), else `0x` and its hex (the first 64 bytes).
+pub fn printable_key(key: &[u8]) -> String {
+    if !key.is_empty() && key.len() <= 128 && key.iter().all(|b| (0x21..=0x7e).contains(b)) {
+        String::from_utf8_lossy(key).into_owned()
+    } else {
+        let shown = &key[..key.len().min(64)];
+        let more = if key.len() > 64 { "..." } else { "" };
+        format!("0x{}{} ({} bytes)", hex::encode(shown), more, key.len())
+    }
+}
+
 /// Whether `id` is a 32-byte id in lower-case hex (as the scanner keeps box
 /// and NFT ids).
 fn is_lower_hex_id(id: &str) -> bool {
@@ -1775,10 +1798,36 @@ impl ReserveStorage {
         Ok(facts)
     }
 
-    /// Test hook (round 8): write a raw tracked reserve record, a damaged one say.
-    #[cfg(test)]
-    pub(crate) fn insert_raw_reserve(&self, key: &[u8], value: &[u8]) {
+    /// Test hook (round 8): write a raw tracked reserve record, a damaged one
+    /// say. Also built with the `test-support` feature, for the binary's tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn insert_raw_reserve(&self, key: &[u8], value: &[u8]) {
         self.partition.insert(key, value).expect("raw reserve record");
+    }
+
+    /// Round 8 (operator: refuse to start): every tracked reserve record, for
+    /// the scanner's start, or why not. Unlike [`Self::get_all_reserves`] it
+    /// reads the whole partition and names every record that does not decode
+    /// (by its key only, never its contents).
+    pub fn tracked_reserves_at_start(
+        &self,
+    ) -> Result<Vec<ExtendedReserveInfo>, TrackedReservesUnreadable> {
+        let mut reserves = Vec::new();
+        let mut undecodable = Vec::new();
+        for item in self.partition.iter() {
+            let (key, value) =
+                item.map_err(|e| TrackedReservesUnreadable::Read(e.to_string()))?;
+            match serde_json::from_slice::<ExtendedReserveInfo>(&value) {
+                Ok(reserve) => reserves.push(reserve),
+                Err(_) => undecodable.push(printable_key(&key)),
+            }
+        }
+        if undecodable.is_empty() {
+            Ok(reserves)
+        } else {
+            Err(TrackedReservesUnreadable::Undecodable(undecodable))
+        }
     }
 
     /// Test hook (round 8): write a raw NFT fact, a damaged one say
