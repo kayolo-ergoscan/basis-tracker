@@ -1775,6 +1775,12 @@ impl ReserveStorage {
         Ok(facts)
     }
 
+    /// Test hook (round 8): write a raw tracked reserve record, a damaged one say.
+    #[cfg(test)]
+    pub(crate) fn insert_raw_reserve(&self, key: &[u8], value: &[u8]) {
+        self.partition.insert(key, value).expect("raw reserve record");
+    }
+
     /// Test hook (round 8): write a raw NFT fact, a damaged one say
     /// (`emissions`: the emission partition, else the box NFT one).
     #[cfg(test)]

@@ -228,9 +228,12 @@ memory: the reserve NFT of each tracked box (`reserve_box_nfts`, box id ->
 `{"nft": hex}`; a box id names one box, tokens included, so no reorganization changes
 it) and the singleton verdict of the NFTs of tracked boxes (`reserve_nft_emissions`,
 NFT id -> `{"emission": 1}`; only singletons, written when a tracked box holds the NFT,
-so root candidates' NFTs never fill it). A box's entry goes when the box is removed (its
-removed record keeps the NFT); at start, entries of boxes no longer tracked and
-emissions of NFTs no tracked or removed box holds are removed. An entry that does not
+so root candidates' NFTs never fill it). A box's entry goes when the box is removed, only once its removed
+record is written (review LOW-3; the record keeps the NFT); at start, entries of boxes no
+longer tracked and emissions of NFTs no tracked or removed box holds are removed, but only
+when the tracked reserves (for box entries) and also the removed reserves (for emissions)
+loaded without an error (review LOW-2: else they are kept as they are, with a warning).
+A write that fails is tried again the next time the box is seen (review LOW-4). An entry that does not
 read back is removed and the node is asked again; a store that cannot be read starts
 with an empty cache (as before round 8). A known NFT is not replaced by "none" (a box
 listed without its assets). So a restart asks the node nothing it knew already, and a

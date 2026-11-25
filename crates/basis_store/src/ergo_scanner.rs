@@ -628,27 +628,48 @@ impl ServerState {
         // Create reserve tracker and load existing reserves from database
         let reserve_tracker = ReserveTracker::new();
 
-        // Load existing reserves from database
-        if let Ok(existing_reserves) = reserve_storage.get_all_reserves() {
-            let reserves_count = existing_reserves.len();
-            for reserve in existing_reserves {
-                if let Err(e) = reserve_tracker.update_reserve(reserve) {
-                    warn!("Failed to load reserve from database: {}", e);
+        // Load existing reserves from database. Round 8 (review LOW-2): whether
+        // they all loaded decides whether stored NFT facts may be pruned.
+        let mut reserves_loaded = false;
+        match reserve_storage.get_all_reserves() {
+            Ok(existing_reserves) => {
+                reserves_loaded = true;
+                let reserves_count = existing_reserves.len();
+                for reserve in existing_reserves {
+                    if let Err(e) = reserve_tracker.update_reserve(reserve) {
+                        reserves_loaded = false;
+                        warn!("Failed to load reserve from database: {}", e);
+                    }
                 }
+                info!("Loaded {} reserves from database", reserves_count);
             }
-            info!("Loaded {} reserves from database", reserves_count);
+            Err(e) => error!(
+                "Failed to load the tracked reserves from the database ({:?}): the scanner starts with none",
+                e
+            ),
         }
         // Round 6f: the reserve boxes removed lately, so a restart keeps them.
         let mut nft_cache = NftCache::default();
-        match reserve_storage.removed_reserves() {
+        let removed_loaded = match reserve_storage.removed_reserves() {
             Ok(removed) => {
                 for entry in removed {
                     nft_cache.removed.insert(entry.record.box_id.clone(), entry);
                 }
+                true
             }
-            Err(e) => warn!("Failed to load removed reserves: {:?}", e),
-        }
-        load_nft_facts(&reserve_storage, &reserve_tracker, &mut nft_cache);
+            Err(e) => {
+                warn!("Failed to load removed reserves: {:?}", e);
+                false
+            }
+        };
+        let tracked = reserves_loaded.then(|| {
+            reserve_tracker
+                .get_all_reserves()
+                .into_iter()
+                .map(|reserve| reserve.box_id)
+                .collect()
+        });
+        load_nft_facts(&reserve_storage, tracked, removed_loaded, &mut nft_cache);
 
         // Create synchronized inner state
         let inner = Arc::new(Mutex::new(ServerStateInner {
@@ -2882,10 +2903,18 @@ impl ServerState {
 /// Round 8: load the NFT facts kept in the reserve store into `cache` at start.
 /// Only those of tracked reserves are kept: the NFT of a box the tracker does
 /// not track, and the emission of an NFT no tracked or removed box holds, are
-/// removed from the store. A damaged entry was removed by the store (the node is
-/// asked again); a store that cannot be read leaves the cache empty, as before
-/// round 8.
-fn load_nft_facts(storage: &ReserveStorage, tracker: &ReserveTracker, cache: &mut NftCache) {
+/// removed from the store. Review LOW-2: only when the input loaded cleanly:
+/// with `tracked` `None` (the tracked reserves did not all load) no box entry
+/// is removed or loaded, and without the removed reserves too
+/// (`removed_loaded` false) no emission is removed. A damaged entry was removed
+/// by the store (the node is asked again); a store that cannot be read leaves
+/// the cache empty, as before round 8.
+fn load_nft_facts(
+    storage: &ReserveStorage,
+    tracked: Option<std::collections::HashSet<String>>,
+    removed_loaded: bool,
+    cache: &mut NftCache,
+) {
     let facts = match storage.nft_facts() {
         Ok(facts) => facts,
         Err(e) => {
@@ -2896,22 +2925,25 @@ fn load_nft_facts(storage: &ReserveStorage, tracker: &ReserveTracker, cache: &mu
             return;
         }
     };
-    let tracked: std::collections::HashSet<String> = tracker
-        .get_all_reserves()
-        .into_iter()
-        .map(|reserve| reserve.box_id)
-        .collect();
     let mut pruned = 0usize;
-    for (box_id, nft) in facts.box_nft {
-        if tracked.contains(&box_id) {
-            cache.stored_box_nfts.insert(box_id.clone());
-            cache.box_nft.insert(box_id, Some(nft));
-        } else {
-            pruned += 1;
-            if let Err(e) = storage.forget_box_nft(&box_id) {
-                warn!("Failed to forget the NFT of reserve box {}: {:?}", box_id, e);
+    if let Some(tracked) = &tracked {
+        for (box_id, nft) in facts.box_nft {
+            if tracked.contains(&box_id) {
+                cache.stored_box_nfts.insert(box_id.clone());
+                cache.box_nft.insert(box_id, Some(nft));
+            } else {
+                pruned += 1;
+                if let Err(e) = storage.forget_box_nft(&box_id) {
+                    warn!("Failed to forget the NFT of reserve box {}: {:?}", box_id, e);
+                }
             }
         }
+    }
+    let prune_emissions = tracked.is_some() && removed_loaded;
+    if !prune_emissions {
+        warn!(
+            "Stored NFT facts are kept as they are: the tracked or removed reserves did not load"
+        );
     }
     let held: std::collections::HashSet<String> = cache
         .box_nft
@@ -2921,7 +2953,7 @@ fn load_nft_facts(storage: &ReserveStorage, tracker: &ReserveTracker, cache: &mu
         .chain(cache.removed.values().filter_map(|removed| removed.nft.clone()))
         .collect();
     for (nft, emission) in facts.emission {
-        if held.contains(&nft) {
+        if !prune_emissions || held.contains(&nft) {
             cache.singleton.insert(nft.clone(), emission == 1);
             if emission == 1 {
                 cache.stored_singletons.insert(nft);
@@ -8285,6 +8317,60 @@ mod tests {
         state.process_scan_boxes().await.unwrap();
         assert!(hits.lock().unwrap().contains_key("/blockchain/box/unspent/byAddress"));
         assert_eq!(state.nft_cache().index_height_seen, Some(1_003));
+    }
+
+    /// Round 8 (review LOW-2): when the tracked reserves do not all load at
+    /// start (here a damaged reserve record fails the whole load), the stored
+    /// NFT facts are kept as they are, not pruned as facts of untracked boxes;
+    /// once the reserves load again, so do the facts. Without the removed
+    /// reserves, emissions are not pruned either.
+    #[tokio::test]
+    async fn test_nft_facts_are_kept_when_the_reserves_do_not_load() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let t = "11".repeat(32);
+        let dir = restart_dir("nft_facts_unloaded");
+        let node = spawn_mock_node("[]".to_string(), Default::default()).await;
+        {
+            let state = open_at(&dir, node);
+            insert_tracked_reserve(&state, &t, owner);
+            state
+                .nft_cache()
+                .singleton
+                .insert(TEST_RESERVE_NFT.to_string(), true);
+            state.remember_nft(&t, Some(TEST_RESERVE_NFT.to_string()));
+            state.reserve_storage.insert_raw_reserve(b"zz", b"not a reserve");
+        }
+        let facts = |state: &ServerState| state.reserve_storage.nft_facts().unwrap();
+        let expected_boxes = HashMap::from([(t.clone(), TEST_RESERVE_NFT.to_string())]);
+        let expected_emissions = HashMap::from([(TEST_RESERVE_NFT.to_string(), 1)]);
+        {
+            let state = open_at(&dir, node);
+            assert!(state.reserve_tracker.get_all_reserves().is_empty());
+            assert!(state.nft_cache().box_nft.is_empty());
+            assert_eq!(facts(&state).box_nft, expected_boxes);
+            assert_eq!(facts(&state).emission, expected_emissions);
+            state.reserve_storage.remove_reserve("zz").unwrap();
+        }
+        let state = open_at(&dir, node);
+        assert!(state.reserve_tracker.get_reserve(&t).is_ok());
+        assert_eq!(
+            state.nft_cache().box_nft.get(&t),
+            Some(&Some(TEST_RESERVE_NFT.to_string()))
+        );
+        assert_eq!(facts(&state).box_nft, expected_boxes);
+        drop(state);
+
+        // The removed reserves did not load: an emission no box holds stays.
+        let storage = ReserveStorage::open(&dir.join("emissions_only")).unwrap();
+        let unheld = "78".repeat(32);
+        storage.store_nft_emission(&unheld, 1).unwrap();
+        let mut cache = NftCache::default();
+        load_nft_facts(&storage, Some(Default::default()), false, &mut cache);
+        assert_eq!(storage.nft_facts().unwrap().emission.len(), 1);
+        let mut cache = NftCache::default();
+        load_nft_facts(&storage, Some(Default::default()), true, &mut cache);
+        assert!(storage.nft_facts().unwrap().emission.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Round 8 (review LOW-4): a failed write of a tracked box's NFT, or of
