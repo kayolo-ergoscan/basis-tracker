@@ -211,12 +211,15 @@ is read (nothing is tracked, removed or quarantined, no clock starts or moves, n
 expires) and retried at the next block, with the lag skip's log line and count. Skipped:
 the request fails or times out (the client's 15 s), the status is not a success, the body
 is not JSON or lacks either height as a whole number, `indexedHeight` is above
-`fullHeight`, the index lags more than `MAX_INDEX_LAG` blocks, or `indexedHeight` is below
-the highest index height a cycle ran with since the start (a rollback, or a node that is
-behind: the cycles wait until the index is there again; the highest height is kept in
-memory only, so a restart forgets it). Removal depths are counted only in the cycle's
-index height, never in `/info` `fullHeight`. Heights near `u64::MAX` cannot overflow the
-checks. A node without the endpoint is therefore never scanned: the node must run with
+`fullHeight`, `indexedHeight` is more than `INFO_HEIGHT_MARGIN` (2) blocks above the
+`/info` `fullHeight` the scanner loop read just before the cycle (review LOW-1: one
+implausible answer neither runs a cycle nor raises the highest height below), the index
+lags more than `MAX_INDEX_LAG` blocks, or `indexedHeight` is below the highest index height
+a cycle ran with since the start (a rollback, or a node that is behind: the cycles wait
+until the index is there again; the highest height is kept in memory only, so a restart
+forgets it). Removal depths are counted only in the cycle's index height, never in `/info`
+`fullHeight`. Heights near `u64::MAX` cannot overflow the checks: the removal clocks
+saturate, and at `u64::MAX` itself they run out. A node without the endpoint is therefore never scanned: the node must run with
 `extraIndex = true` anyway.
 
 **Round 8: NFT facts in the store.** Two facts of the chain the scanner learns are kept in

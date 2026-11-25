@@ -138,7 +138,12 @@ const LAG_WARN_EVERY: u64 = 30;
 #[cfg(not(test))]
 const INDEX_HEIGHT_TIMEOUT: Duration = crate::http::REQUEST_TIMEOUT;
 #[cfg(test)]
-const INDEX_HEIGHT_TIMEOUT: Duration = Duration::from_millis(500);
+const INDEX_HEIGHT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Round 8 (review LOW-1): how far the index height may be above the node's
+/// `/info` height that the scanner loop read just before the cycle (blocks
+/// that arrived in between).
+const INFO_HEIGHT_MARGIN: u64 = 2;
 
 /// Wall-clock time the shared-lane checks of one scan cycle may take (round 6e,
 /// LOW-5); past it they give no verdict and are retried next cycle.
@@ -2331,6 +2336,18 @@ impl ServerState {
                 indexed, full
             )));
         }
+        // Round 8 (review LOW-1): nor above the node's own `/info` height,
+        // which the scanner loop read just before this cycle (0: not read, as
+        // when a test runs a cycle by hand), by more than INFO_HEIGHT_MARGIN.
+        // One implausible answer must neither run a cycle nor raise the mark
+        // that the went-back check below compares with.
+        let info_height = self.inner.lock().await.current_height;
+        if info_height != 0 && indexed > info_height.saturating_add(INFO_HEIGHT_MARGIN) {
+            return Err(unusable(format!(
+                "gave indexedHeight {} above height {} that /info gave just before (by more than {} blocks)",
+                indexed, info_height, INFO_HEIGHT_MARGIN
+            )));
+        }
         if full > indexed.saturating_add(MAX_INDEX_LAG) {
             return Err(ScannerError::NodeError(format!(
                 "the blockchain index is at height {} while the node is at {} (more than {} blocks behind)",
@@ -4369,7 +4386,7 @@ mod tests {
                     // Round 8: a route `MOCK_HANG` never answers, one
                     // starting with `!` answers its status (`!500 body`).
                     if txs.get(path).is_some_and(|body| body == MOCK_HANG) {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                         return;
                     }
                     // `txs` keys are transaction ids, or full paths for the
@@ -8191,5 +8208,64 @@ mod tests {
             drop(state);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Round 8 (review LOW-1): an index height above the node's `/info`
+    /// height, which the loop read just before the cycle, by more than
+    /// INFO_HEIGHT_MARGIN skips the cycle and leaves the went-back mark where
+    /// it was, so one implausible answer (here 10^9, or u64::MAX) does not
+    /// make every later cycle skip as "went back". Within the margin it runs.
+    #[tokio::test]
+    async fn test_an_index_above_the_info_height_skips_the_cycle() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let tracked_box = "11".repeat(32);
+        let listed = serde_json::json!([scanned_box_json(
+            &tracked_box,
+            "c0c0",
+            1_000_000_000,
+            &[(TEST_RESERVE_NFT, 1)],
+            None
+        )])
+        .to_string();
+        let mut state = mock_state(spawn_mock_node("[]".to_string(), Default::default()).await);
+        insert_tracked_reserve(&state, &tracked_box, owner);
+        state.inner.lock().await.current_height = 1_000;
+        for (indexed, full, runs, mark) in [
+            (1_000_000_000, 1_000_000_000, false, None),
+            (u64::MAX, u64::MAX, false, None),
+            (1_000, 1_000, true, Some(1_000)),
+            (1_003, 1_003, false, Some(1_000)),
+            (1_000_000_000, 1_000_000_000, false, Some(1_000)),
+            (1_002, 1_002, true, Some(1_002)),
+        ] {
+            let (addr, hits) = spawn_counting_mock_node(
+                listed.clone(),
+                std::sync::Arc::new(HashMap::from([indexed_route(indexed, full)])),
+            )
+            .await;
+            let skipped = state.skipped_cycles();
+            state = on_node_at(state, addr);
+            state.process_scan_boxes().await.unwrap();
+            let scanned = hits
+                .lock()
+                .unwrap()
+                .contains_key("/blockchain/box/unspent/byAddress");
+            assert_eq!(scanned, runs, "index {indexed}");
+            assert_eq!(state.skipped_cycles() - skipped, u64::from(!runs), "index {indexed}");
+            assert_eq!(state.nft_cache().index_height_seen, mark, "index {indexed}");
+            assert!(state.reserve_tracker.get_reserve(&tracked_box).is_ok());
+            assert!(state.nft_cache().unknown_since.is_empty());
+        }
+        // The next block: the node's /info moves on, and so may the index.
+        state.inner.lock().await.current_height = 1_001;
+        let (addr, hits) = spawn_counting_mock_node(
+            listed,
+            std::sync::Arc::new(HashMap::from([indexed_route(1_003, 1_003)])),
+        )
+        .await;
+        let state = on_node_at(state, addr);
+        state.process_scan_boxes().await.unwrap();
+        assert!(hits.lock().unwrap().contains_key("/blockchain/box/unspent/byAddress"));
+        assert_eq!(state.nft_cache().index_height_seen, Some(1_003));
     }
 }
