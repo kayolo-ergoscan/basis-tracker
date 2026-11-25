@@ -218,6 +218,27 @@ index height, never in `/info` `fullHeight`. Heights near `u64::MAX` cannot over
 checks. A node without the endpoint is therefore never scanned: the node must run with
 `extraIndex = true` anyway.
 
+**Round 8: NFT facts in the store.** Two facts of the chain the scanner learns are kept in
+the reserve database next to `removed_reserves`, loaded at start, and still cached in
+memory: the reserve NFT of each tracked box (`reserve_box_nfts`, box id ->
+`{"nft": hex}`; a box id names one box, tokens included, so no reorganization changes
+it) and the singleton verdict of the NFTs of tracked boxes (`reserve_nft_emissions`,
+NFT id -> `{"emission": 1}`; only singletons, written when a tracked box holds the NFT,
+so root candidates' NFTs never fill it). A box's entry goes when the box is removed (its
+removed record keeps the NFT); at start, entries of boxes no longer tracked and
+emissions of NFTs no tracked or removed box holds are removed. An entry that does not
+read back is removed and the node is asked again; a store that cannot be read starts
+with an empty cache (as before round 8). A known NFT is not replaced by "none" (a box
+listed without its assets). So a restart asks the node nothing it knew already, and a
+tracked box the index no longer knows after a restart (a reorganization) still anchors
+its successor by its NFT, instead of leaving after 10 blocks and its successor being
+judged as a root (quarantined when its R5 is used). Caveat: the emission of a token id
+could change only if a reorganization dropped its minting transaction and the owner of
+that input minted it anew; the in-memory cache trusted the verdict for the process's
+lifetime already, the store extends that across restarts, for tracked NFTs only. A
+data dir from round 7b opens with both partitions empty; round 7b opens a dir with them
+(the keyspace keeps partitions it does not open).
+
 **Operator release (round 6c).** `POST /reserves/quarantined/release` (Admin; body
 `box_id`, `note`) moves a quarantine record to a journal (`quarantine_releases`,
 listed by `GET /reserves/quarantined/releases`) in one batch. The release does not
@@ -423,13 +444,15 @@ backing up.
   - `is_lineage_successor` — the tracked box's spender first, then a bounded backwards
     walk over `/blockchain/transaction/byId` following the reserve NFT (round 6b), with
     the singleton fallback (round 6c).
-  - `tracked_nft` / `is_singleton_nft` — the NFT cache and the token index check.
+  - `tracked_nft` / `is_singleton_nft` — the NFT cache and the token index check;
+    `remember_nft` / `load_nft_facts` keep the facts in the store (round 8).
   - `has_owner_root` — the P2PK proof, with the NFT ancestry through top-ups (round 6c).
   - `ingest_scan_box` — parse + admit + track/persist + quarantine persistence.
   - `process_scan_boxes` — removal loop keeps boxes whose proof/lineage check is pending.
 - `crates/basis_store/src/persistence.rs` — `QuarantinedReserve`,
   `quarantined_reserves` partition on `ReserveStorage`; `RemovedReserve`,
-  `removed_reserves` partition (round 6f).
+  `removed_reserves` partition (round 6f); `reserve_box_nfts` and
+  `reserve_nft_emissions`, `ReserveStorage::nft_facts` (round 8).
 - `crates/basis_store/src/reopen_guard.rs` — `ReopenGuard`, `ReopenCheck`,
   `RESERVE_REOPEN_BLOCKED` (round 7); `TrackerStateManager::redeemed_reserve_pairs` /
   `attach_reopen_guard` in `crates/basis_store/src/lib.rs` publish the pairs.

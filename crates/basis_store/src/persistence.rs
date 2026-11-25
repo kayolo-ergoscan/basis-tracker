@@ -156,6 +156,46 @@ pub struct ReserveStorage {
     release_partition: fjall::Partition,
     /// Round 6f: reserve boxes removed lately, keyed by box id.
     removed_partition: fjall::Partition,
+    /// Round 8: the reserve NFT of each tracked reserve box, keyed by box id
+    /// ([`StoredBoxNft`]).
+    box_nft_partition: fjall::Partition,
+    /// Round 8: the emission of the NFTs of tracked reserves, keyed by NFT id
+    /// ([`StoredNftEmission`]); only singletons are kept.
+    nft_emission_partition: fjall::Partition,
+}
+
+/// Round 8: the reserve NFT a reserve box holds (its first token, held once).
+/// A box id names one box, tokens included, so this is a fact of the chain
+/// that no reorganization changes; the scanner reads it back after a restart
+/// instead of asking the node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredBoxNft {
+    /// The NFT id, 64 hex characters, lower case.
+    pub nft: String,
+}
+
+/// Round 8: the emission of a reserve NFT as the token index gave it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredNftEmission {
+    pub emission: u64,
+}
+
+/// Round 8: the NFT facts the scanner keeps ([`ReserveStorage::nft_facts`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct NftFacts {
+    /// Reserve box id -> its reserve NFT.
+    pub box_nft: std::collections::HashMap<String, String>,
+    /// NFT id -> its emission.
+    pub emission: std::collections::HashMap<String, u64>,
+    /// Entries that did not read back (a damaged key or value): removed, so
+    /// the scanner asks the node again.
+    pub dropped: usize,
+}
+
+/// Whether `id` is a 32-byte id in lower-case hex (as the scanner keeps box
+/// and NFT ids).
+fn is_lower_hex_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Database storage for tracker information
@@ -1585,13 +1625,137 @@ impl ReserveStorage {
                 NoteError::StorageError(format!("Failed to open removed reserve partition: {}", e))
             })?;
 
+        let box_nft_partition = keyspace
+            .open_partition("reserve_box_nfts", PartitionCreateOptions::default())
+            .map_err(|e| {
+                NoteError::StorageError(format!("Failed to open reserve box NFT partition: {}", e))
+            })?;
+
+        let nft_emission_partition = keyspace
+            .open_partition("reserve_nft_emissions", PartitionCreateOptions::default())
+            .map_err(|e| {
+                NoteError::StorageError(format!("Failed to open NFT emission partition: {}", e))
+            })?;
+
         Ok(Self {
             keyspace,
             partition,
             quarantine_partition,
             release_partition,
             removed_partition,
+            box_nft_partition,
+            nft_emission_partition,
         })
+    }
+
+    /// Round 8: remember the reserve NFT of reserve box `box_id`. Only
+    /// lower-case hex ids are kept (the scanner's normalized form).
+    pub fn store_box_nft(&self, box_id: &str, nft: &str) -> Result<(), NoteError> {
+        if !is_lower_hex_id(nft) {
+            return Err(NoteError::StorageError(format!(
+                "refusing to store {:?} as a reserve NFT id",
+                nft.chars().take(80).collect::<String>()
+            )));
+        }
+        let key = storable_key("reserve box id", box_id.as_bytes())?;
+        let value = serde_json::to_vec(&StoredBoxNft {
+            nft: nft.to_string(),
+        })
+        .map_err(|e| NoteError::StorageError(format!("Failed to serialize box NFT: {}", e)))?;
+        self.box_nft_partition
+            .insert(key, &value)
+            .map_err(|e| NoteError::StorageError(format!("Failed to store box NFT: {}", e)))
+    }
+
+    /// Round 8: forget the reserve NFT of reserve box `box_id`.
+    pub fn forget_box_nft(&self, box_id: &str) -> Result<(), NoteError> {
+        if !is_storable_key(box_id.as_bytes()) {
+            return Ok(());
+        }
+        self.box_nft_partition
+            .remove(box_id.as_bytes())
+            .map_err(|e| NoteError::StorageError(format!("Failed to forget box NFT: {}", e)))
+    }
+
+    /// Round 8: remember the emission of reserve NFT `nft`.
+    pub fn store_nft_emission(&self, nft: &str, emission: u64) -> Result<(), NoteError> {
+        if !is_lower_hex_id(nft) {
+            return Err(NoteError::StorageError(format!(
+                "refusing to store {:?} as a reserve NFT id",
+                nft.chars().take(80).collect::<String>()
+            )));
+        }
+        let value = serde_json::to_vec(&StoredNftEmission { emission }).map_err(|e| {
+            NoteError::StorageError(format!("Failed to serialize NFT emission: {}", e))
+        })?;
+        self.nft_emission_partition
+            .insert(nft.as_bytes(), &value)
+            .map_err(|e| NoteError::StorageError(format!("Failed to store NFT emission: {}", e)))
+    }
+
+    /// Round 8: forget the emission of reserve NFT `nft`.
+    pub fn forget_nft_emission(&self, nft: &str) -> Result<(), NoteError> {
+        if !is_storable_key(nft.as_bytes()) {
+            return Ok(());
+        }
+        self.nft_emission_partition
+            .remove(nft.as_bytes())
+            .map_err(|e| NoteError::StorageError(format!("Failed to forget NFT emission: {}", e)))
+    }
+
+    /// Round 8: the NFT facts remembered. An entry that does not read back (a
+    /// key or value that is not what [`Self::store_box_nft`] or
+    /// [`Self::store_nft_emission`] writes) is removed and counted in
+    /// `dropped`, so the scanner asks the node for it again; an error reading
+    /// the partitions is an error (the caller starts without the facts).
+    pub fn nft_facts(&self) -> Result<NftFacts, NoteError> {
+        let mut facts = NftFacts::default();
+        let mut damaged: Vec<(&fjall::Partition, Vec<u8>)> = Vec::new();
+        for item in self.box_nft_partition.iter() {
+            let (key, value) = item.map_err(|e| {
+                NoteError::StorageError(format!("Failed to iterate box NFTs: {}", e))
+            })?;
+            let box_id = std::str::from_utf8(&key).ok();
+            let stored = serde_json::from_slice::<StoredBoxNft>(&value).ok();
+            match (box_id, stored) {
+                (Some(box_id), Some(stored)) if is_lower_hex_id(&stored.nft) => {
+                    facts.box_nft.insert(box_id.to_string(), stored.nft);
+                }
+                _ => damaged.push((&self.box_nft_partition, key.to_vec())),
+            }
+        }
+        for item in self.nft_emission_partition.iter() {
+            let (key, value) = item.map_err(|e| {
+                NoteError::StorageError(format!("Failed to iterate NFT emissions: {}", e))
+            })?;
+            let nft = std::str::from_utf8(&key).ok().filter(|nft| is_lower_hex_id(nft));
+            let stored = serde_json::from_slice::<StoredNftEmission>(&value).ok();
+            match (nft, stored) {
+                (Some(nft), Some(stored)) => {
+                    facts.emission.insert(nft.to_string(), stored.emission);
+                }
+                _ => damaged.push((&self.nft_emission_partition, key.to_vec())),
+            }
+        }
+        facts.dropped = damaged.len();
+        for (partition, key) in damaged {
+            partition.remove(key).map_err(|e| {
+                NoteError::StorageError(format!("Failed to remove a damaged NFT fact: {}", e))
+            })?;
+        }
+        Ok(facts)
+    }
+
+    /// Test hook (round 8): write a raw NFT fact, a damaged one say
+    /// (`emissions`: the emission partition, else the box NFT one).
+    #[cfg(test)]
+    pub(crate) fn insert_raw_nft_fact(&self, emissions: bool, key: &[u8], value: &[u8]) {
+        let partition = if emissions {
+            &self.nft_emission_partition
+        } else {
+            &self.box_nft_partition
+        };
+        partition.insert(key, value).expect("raw NFT fact");
     }
 
     /// Remember a removed reserve box (round 6f).
@@ -2834,5 +2998,87 @@ mod removed_reserve_tests {
         assert_eq!(kept[0].record.box_id, "bb".repeat(32));
         assert_eq!(storage.get_all_reserves().unwrap().len(), 1);
         assert!(storage.get_all_quarantined().unwrap().is_empty());
+    }
+
+    /// Round 8: the NFT facts are kept across a reopen and forgotten one by
+    /// one; ids that are not lower-case 32-byte hex are refused; a damaged
+    /// entry is skipped, removed and counted; the reserves are untouched.
+    #[test]
+    fn nft_facts_survive_a_reopen_and_damage_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracked = removed(&"cc".repeat(32), 0).record;
+        {
+            let storage = ReserveStorage::open(dir.path()).unwrap();
+            assert_eq!(storage.nft_facts().unwrap(), NftFacts::default());
+            storage.store_reserve(&tracked).unwrap();
+            storage.store_box_nft(&"cc".repeat(32), &"4e".repeat(32)).unwrap();
+            storage.store_box_nft(&"dd".repeat(32), &"4f".repeat(32)).unwrap();
+            storage.store_nft_emission(&"4e".repeat(32), 1).unwrap();
+            assert!(storage.store_box_nft(&"ee".repeat(32), &"4E".repeat(32)).is_err());
+            assert!(storage.store_box_nft(&"ee".repeat(32), "4e").is_err());
+            assert!(storage.store_nft_emission("x", 1).is_err());
+            storage.insert_raw_nft_fact(false, b"ff", b"{\"nft\":1}");
+            storage.insert_raw_nft_fact(true, &[0xff; 64], b"{\"emission\":1}");
+            storage.insert_raw_nft_fact(true, "50".repeat(32).as_bytes(), b"{}");
+        }
+        let storage = ReserveStorage::open(dir.path()).unwrap();
+        let facts = storage.nft_facts().unwrap();
+        assert_eq!(facts.dropped, 3);
+        assert_eq!(
+            facts.box_nft,
+            std::collections::HashMap::from([
+                ("cc".repeat(32), "4e".repeat(32)),
+                ("dd".repeat(32), "4f".repeat(32)),
+            ])
+        );
+        assert_eq!(
+            facts.emission,
+            std::collections::HashMap::from([("4e".repeat(32), 1)])
+        );
+        assert_eq!(storage.nft_facts().unwrap().dropped, 0);
+        storage.forget_box_nft(&"dd".repeat(32)).unwrap();
+        storage.forget_box_nft("").unwrap();
+        storage.forget_nft_emission(&"4e".repeat(32)).unwrap();
+        let facts = storage.nft_facts().unwrap();
+        assert_eq!(facts.box_nft.len(), 1);
+        assert!(facts.emission.is_empty());
+        assert_eq!(storage.get_all_reserves().unwrap().len(), 1);
+    }
+
+    /// Round 8, rollback: a reserve dir with the two new partitions opens with
+    /// only the partitions round 7b opens (the keyspace keeps the others as
+    /// they are), and opens again with round 8 afterwards, facts intact.
+    #[test]
+    fn a_dir_with_the_nft_partitions_opens_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracked = removed(&"cc".repeat(32), 0).record;
+        {
+            let storage = ReserveStorage::open(dir.path()).unwrap();
+            storage.store_reserve(&tracked).unwrap();
+            storage.store_removed(&removed(&"aa".repeat(32), 1)).unwrap();
+            storage.store_box_nft(&"cc".repeat(32), &"4e".repeat(32)).unwrap();
+            storage.store_nft_emission(&"4e".repeat(32), 1).unwrap();
+        }
+        {
+            // What `ReserveStorage::open` of round 7b opens.
+            let keyspace = Config::new(dir.path()).open().unwrap();
+            let reserves = keyspace
+                .open_partition("reserves", PartitionCreateOptions::default())
+                .unwrap();
+            for name in ["quarantined_reserves", "quarantine_releases", "removed_reserves"] {
+                keyspace
+                    .open_partition(name, PartitionCreateOptions::default())
+                    .unwrap();
+            }
+            assert_eq!(reserves.iter().count(), 1);
+            reserves.insert("dd".repeat(32), b"{}").unwrap();
+            reserves.remove("dd".repeat(32)).unwrap();
+        }
+        let storage = ReserveStorage::open(dir.path()).unwrap();
+        assert_eq!(storage.get_all_reserves().unwrap().len(), 1);
+        assert_eq!(storage.removed_reserves().unwrap().len(), 1);
+        let facts = storage.nft_facts().unwrap();
+        assert_eq!(facts.box_nft.len(), 1);
+        assert_eq!(facts.emission.len(), 1);
     }
 }

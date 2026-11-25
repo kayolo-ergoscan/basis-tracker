@@ -155,14 +155,18 @@ const REFUND_DELAY_BLOCKS: u64 = 43_200;
 /// tracked box instead of being judged as a root.
 const REMEMBER_REMOVED_BLOCKS: u64 = 720;
 
-/// What the scanner knows about reserve NFTs (round 6c, P1-2), in memory only:
-/// it is read back from the node after a restart.
+/// What the scanner knows about reserve NFTs (round 6c, P1-2). Round 8: the
+/// facts of the chain in it (the NFT of a tracked box, the singleton verdict of
+/// a tracked NFT) are also kept in the reserve store and loaded at start, so a
+/// restart does not ask the node for them again; this map stays the cache.
 #[derive(Debug, Default)]
 pub struct NftCache {
     /// Reserve box id -> its reserve NFT (`None`: it holds none).
     box_nft: std::collections::HashMap<String, Option<String>>,
     /// NFT id -> whether its emission is 1.
     singleton: std::collections::HashMap<String, bool>,
+    /// Round 8: the NFTs whose singleton verdict is in the store.
+    stored_singletons: std::collections::HashSet<String>,
     /// Round 6d (P2-3): removed reserve box id -> its record, its NFT, when
     /// (ms) and, round 6f-2, at which index height. Round 6e: the record
     /// anchors the lineage of a box holding its NFT, so the successor of a
@@ -636,6 +640,7 @@ impl ServerState {
             }
             Err(e) => warn!("Failed to load removed reserves: {:?}", e),
         }
+        load_nft_facts(&reserve_storage, &reserve_tracker, &mut nft_cache);
 
         // Create synchronized inner state
         let inner = Arc::new(Mutex::new(ServerStateInner {
@@ -1388,9 +1393,22 @@ impl ServerState {
             )));
         };
         let singleton = emission == 1;
-        self.nft_cache()
-            .singleton
-            .insert(nft.to_string(), singleton);
+        let store = {
+            let mut cache = self.nft_cache();
+            cache.singleton.insert(nft.to_string(), singleton);
+            // Round 8: stored when a tracked box holds it (else once one does,
+            // `remember_nft`), so the store keeps the NFTs of tracked reserves
+            // only, not those of every root candidate.
+            singleton
+                && cache
+                    .box_nft
+                    .values()
+                    .any(|held| held.as_deref() == Some(nft))
+                && cache.stored_singletons.insert(nft.to_string())
+        };
+        if store {
+            self.store_singleton(nft);
+        }
         Ok(singleton)
     }
 
@@ -1406,8 +1424,41 @@ impl ServerState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Remember the reserve NFT of tracked box `box_id` (round 6c). Round 8: a
+    /// new NFT is also stored, and so is its singleton verdict when known. A
+    /// box id names one box, so a known NFT is kept when an answer shows none
+    /// (a box listed without its assets, say).
     fn remember_nft(&self, box_id: &str, nft: Option<String>) {
-        self.nft_cache().box_nft.insert(box_id.to_string(), nft);
+        let (store_nft, store_singleton) = {
+            let mut cache = self.nft_cache();
+            if nft.is_none() && matches!(cache.box_nft.get(box_id), Some(Some(_))) {
+                return;
+            }
+            let before = cache.box_nft.insert(box_id.to_string(), nft.clone());
+            let Some(nft) = nft else {
+                return;
+            };
+            let store_nft = before.as_ref() != Some(&Some(nft.clone()));
+            let store_singleton = cache.singleton.get(&nft) == Some(&true)
+                && cache.stored_singletons.insert(nft.clone());
+            (store_nft.then(|| nft.clone()), store_singleton.then_some(nft))
+        };
+        if let Some(nft) = store_nft {
+            if let Err(e) = self.reserve_storage.store_box_nft(box_id, &nft) {
+                warn!("Failed to store the NFT of reserve box {}: {:?}", box_id, e);
+            }
+        }
+        if let Some(nft) = store_singleton {
+            self.store_singleton(&nft);
+        }
+    }
+
+    /// Round 8: store that `nft` is a singleton (emission 1).
+    fn store_singleton(&self, nft: &str) {
+        if let Err(e) = self.reserve_storage.store_nft_emission(nft, 1) {
+            warn!("Failed to store the emission of NFT {}: {:?}", nft, e);
+            self.nft_cache().stored_singletons.remove(nft);
+        }
     }
 
     /// Count one node request of the lineage checks against this cycle's
@@ -2759,6 +2810,13 @@ impl ServerState {
                     .removed
                     .insert(reserve.box_id.clone(), removed.clone());
                 drop(cache);
+                // Round 8: the removed record keeps the NFT from now on.
+                if let Err(e) = self.reserve_storage.forget_box_nft(&reserve.box_id) {
+                    warn!(
+                        "Failed to forget the NFT of removed reserve {}: {:?}",
+                        reserve.box_id, e
+                    );
+                }
                 if let Err(e) = self.reserve_storage.store_removed(&removed) {
                     warn!(
                         "Failed to remember removed reserve {}: {:?}",
@@ -2785,6 +2843,73 @@ impl ServerState {
 
         Ok(())
     }
+}
+
+/// Round 8: load the NFT facts kept in the reserve store into `cache` at start.
+/// Only those of tracked reserves are kept: the NFT of a box the tracker does
+/// not track, and the emission of an NFT no tracked or removed box holds, are
+/// removed from the store. A damaged entry was removed by the store (the node is
+/// asked again); a store that cannot be read leaves the cache empty, as before
+/// round 8.
+fn load_nft_facts(storage: &ReserveStorage, tracker: &ReserveTracker, cache: &mut NftCache) {
+    let facts = match storage.nft_facts() {
+        Ok(facts) => facts,
+        Err(e) => {
+            warn!(
+                "Failed to load the stored NFT facts ({:?}); they are read from the node again",
+                e
+            );
+            return;
+        }
+    };
+    let tracked: std::collections::HashSet<String> = tracker
+        .get_all_reserves()
+        .into_iter()
+        .map(|reserve| reserve.box_id)
+        .collect();
+    let mut pruned = 0usize;
+    for (box_id, nft) in facts.box_nft {
+        if tracked.contains(&box_id) {
+            cache.box_nft.insert(box_id, Some(nft));
+        } else {
+            pruned += 1;
+            if let Err(e) = storage.forget_box_nft(&box_id) {
+                warn!("Failed to forget the NFT of reserve box {}: {:?}", box_id, e);
+            }
+        }
+    }
+    let held: std::collections::HashSet<String> = cache
+        .box_nft
+        .values()
+        .flatten()
+        .cloned()
+        .chain(cache.removed.values().filter_map(|removed| removed.nft.clone()))
+        .collect();
+    for (nft, emission) in facts.emission {
+        if held.contains(&nft) {
+            cache.singleton.insert(nft.clone(), emission == 1);
+            if emission == 1 {
+                cache.stored_singletons.insert(nft);
+            }
+        } else {
+            pruned += 1;
+            if let Err(e) = storage.forget_nft_emission(&nft) {
+                warn!("Failed to forget the emission of NFT {}: {:?}", nft, e);
+            }
+        }
+    }
+    if facts.dropped > 0 {
+        warn!(
+            "{} stored NFT fact(s) did not read back and were removed; the node is asked for them again",
+            facts.dropped
+        );
+    }
+    info!(
+        "Loaded the NFTs of {} tracked reserve box(es) and {} singleton verdict(s) from the store ({} no longer needed)",
+        cache.box_nft.len(),
+        cache.singleton.len(),
+        pruned
+    );
 }
 
 /// Start the reserve scanner loop in the background.
@@ -7745,5 +7870,326 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A fresh data dir for a restart test.
+    fn restart_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "basis_scanner_{}_{}_{}",
+            name,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        ))
+    }
+
+    /// A scanner process on `data_dir` and the node at `addr`.
+    fn open_at(data_dir: &std::path::Path, addr: std::net::SocketAddr) -> ServerState {
+        ServerState::new(
+            NodeConfig {
+                node_url: format!("http://{}", addr),
+                reserve_contract_p2s: Some("test_p2s".to_string()),
+                ..Default::default()
+            },
+            data_dir,
+        )
+        .unwrap()
+    }
+
+    /// Round 8 (item 2): the NFT facts survive a restart. T was followed by
+    /// S (cycle 1, which read the token index once); then S is spent into S2.
+    /// The cycle that follows S2 asks the node exactly the same after a
+    /// restart as in the process that never stopped: the NFT of S and the
+    /// singleton verdict of its NFT come from the store. Without them (a store
+    /// from before round 8, or entries that no longer read back) the cycle
+    /// asks the token index once more and follows S2 all the same; a damaged
+    /// entry is removed, and the facts are stored again.
+    #[tokio::test]
+    async fn test_known_nft_facts_survive_a_restart() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let t = "11".repeat(32);
+        let s1 = "55".repeat(32);
+        let s2 = "56".repeat(32);
+        let tx1 = "e1".repeat(32);
+        let tx2 = "e2".repeat(32);
+        let token_path = format!("/blockchain/token/byId/{}", TEST_RESERVE_NFT);
+        let first_cycle = |data_dir: std::path::PathBuf| {
+            let (t, s1, tx1, token_path) =
+                (t.clone(), s1.clone(), tx1.clone(), token_path.clone());
+            async move {
+                let routes = HashMap::from([
+                    tracked_box_route(&t, &[(TEST_RESERVE_NFT, 1)], Some(&tx1)),
+                    spend_tx_route(&tx1),
+                    indexed_route(1_000, 1_000),
+                ]);
+                let listed = serde_json::json!([scanned_box_json(
+                    &s1,
+                    &tx1,
+                    1_100_000_000,
+                    &[(TEST_RESERVE_NFT, 1)],
+                    None
+                )]);
+                let (addr, hits) =
+                    spawn_counting_mock_node(listed.to_string(), std::sync::Arc::new(routes)).await;
+                let state = open_at(&data_dir, addr);
+                insert_tracked_reserve(&state, &t, owner);
+                state.process_scan_boxes().await.unwrap();
+                assert!(state.reserve_tracker.get_reserve(&s1).is_ok());
+                assert!(state.reserve_tracker.get_reserve(&t).is_err());
+                assert_eq!(hits.lock().unwrap().get(&token_path).copied(), Some(1));
+                state
+            }
+        };
+        let second_node = || async {
+            let routes = HashMap::from([
+                tracked_box_route(&s1, &[(TEST_RESERVE_NFT, 1)], Some(&tx2)),
+                spend_tx_route(&tx2),
+                indexed_route(1_001, 1_001),
+            ]);
+            let listed = serde_json::json!([scanned_box_json(
+                &s2,
+                &tx2,
+                1_200_000_000,
+                &[(TEST_RESERVE_NFT, 1)],
+                None
+            )]);
+            spawn_counting_mock_node(listed.to_string(), std::sync::Arc::new(routes)).await
+        };
+        let second_cycle = |state: ServerState, hits: Hits| {
+            let (s1, s2) = (s1.clone(), s2.clone());
+            async move {
+                state.process_scan_boxes().await.unwrap();
+                assert!(state.reserve_tracker.get_reserve(&s2).is_ok());
+                assert!(state.reserve_tracker.get_reserve(&s1).is_err());
+                assert!(state.reserve_storage.get_all_quarantined().unwrap().is_empty());
+                let hits = hits.lock().unwrap().clone();
+                (state, hits)
+            }
+        };
+
+        // A: the process never stops.
+        let dir_a = restart_dir("nft_facts_a");
+        let state = first_cycle(dir_a.clone()).await;
+        let (addr, hits) = second_node().await;
+        let (_, hits_a) = second_cycle(on_node_at(state, addr), hits).await;
+        assert_eq!(hits_a.get(&token_path), None, "{hits_a:?}");
+
+        // B: a restart between the two cycles.
+        let dir_b = restart_dir("nft_facts_b");
+        drop(first_cycle(dir_b.clone()).await);
+        let (addr, hits) = second_node().await;
+        let restarted = open_at(&dir_b, addr);
+        assert_eq!(
+            restarted.nft_cache().box_nft.get(&s1),
+            Some(&Some(TEST_RESERVE_NFT.to_string()))
+        );
+        assert_eq!(restarted.nft_cache().singleton.get(TEST_RESERVE_NFT), Some(&true));
+        let (_, hits_b) = second_cycle(restarted, hits).await;
+        assert_eq!(hits_b, hits_a, "a warm restart asks the node nothing more");
+
+        // C: no stored facts; D: damaged ones.
+        for damaged in [false, true] {
+            let dir = restart_dir("nft_facts_cd");
+            let state = first_cycle(dir.clone()).await;
+            state.reserve_storage.forget_box_nft(&s1).unwrap();
+            state.reserve_storage.forget_nft_emission(TEST_RESERVE_NFT).unwrap();
+            if damaged {
+                state
+                    .reserve_storage
+                    .insert_raw_nft_fact(false, s1.as_bytes(), b"{\"nft\":\"not hex\"}");
+                state
+                    .reserve_storage
+                    .insert_raw_nft_fact(true, TEST_RESERVE_NFT.as_bytes(), b"\xff");
+                state
+                    .reserve_storage
+                    .insert_raw_nft_fact(true, b"not an id", b"{\"emission\":1}");
+            }
+            drop(state);
+            let (addr, hits) = second_node().await;
+            let restarted = open_at(&dir, addr);
+            assert!(restarted.nft_cache().box_nft.is_empty(), "damaged {damaged}");
+            assert!(restarted.nft_cache().singleton.is_empty(), "damaged {damaged}");
+            assert_eq!(
+                restarted.reserve_storage.nft_facts().unwrap(),
+                crate::persistence::NftFacts::default(),
+                "damaged entries are removed"
+            );
+            let (state, hits_c) = second_cycle(restarted, hits).await;
+            let mut expected = hits_a.clone();
+            expected.insert(token_path.clone(), 1);
+            assert_eq!(hits_c, expected, "damaged {damaged}");
+            let facts = state.reserve_storage.nft_facts().unwrap();
+            assert_eq!(
+                facts.box_nft,
+                HashMap::from([(s2.clone(), TEST_RESERVE_NFT.to_string())]),
+                "damaged {damaged}"
+            );
+            assert_eq!(
+                facts.emission,
+                HashMap::from([(TEST_RESERVE_NFT.to_string(), 1)]),
+                "damaged {damaged}"
+            );
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// Round 8 (item 2): only the facts of tracked reserves are kept. At start
+    /// the NFT of a box that is not tracked any more and the emission of an NFT
+    /// no tracked or removed box holds leave the store; a removed box's NFT
+    /// lives on in its removed record (and keeps its emission), not in the box
+    /// NFT partition.
+    #[tokio::test]
+    async fn test_stored_nft_facts_follow_the_tracked_reserves() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let t = "11".repeat(32);
+        let s1 = "55".repeat(32);
+        let tx1 = "e1".repeat(32);
+        let dir = restart_dir("nft_facts_prune");
+        {
+            let routes = HashMap::from([
+                tracked_box_route(&t, &[(TEST_RESERVE_NFT, 1)], Some(&tx1)),
+                spend_tx_route(&tx1),
+                indexed_route(1_000, 1_000),
+            ]);
+            let listed = serde_json::json!([scanned_box_json(
+                &s1,
+                &tx1,
+                1_100_000_000,
+                &[(TEST_RESERVE_NFT, 1)],
+                None
+            )]);
+            let state = open_at(
+                &dir,
+                spawn_mock_node(listed.to_string(), std::sync::Arc::new(routes)).await,
+            );
+            insert_tracked_reserve(&state, &t, owner);
+            state.remember_nft(&t, Some(TEST_RESERVE_NFT.to_string()));
+            assert_eq!(state.reserve_storage.nft_facts().unwrap().box_nft.len(), 1);
+            state.process_scan_boxes().await.unwrap();
+            assert!(state.reserve_tracker.get_reserve(&s1).is_ok());
+            let facts = state.reserve_storage.nft_facts().unwrap();
+            // T was removed: its NFT is in its removed record now.
+            assert_eq!(
+                facts.box_nft,
+                HashMap::from([(s1.clone(), TEST_RESERVE_NFT.to_string())])
+            );
+            assert_eq!(
+                state.nft_cache().removed[&t].nft.as_deref(),
+                Some(TEST_RESERVE_NFT)
+            );
+            // Facts of boxes nobody tracks (a failed store, an older process).
+            state
+                .reserve_storage
+                .store_box_nft(&"77".repeat(32), &"78".repeat(32))
+                .unwrap();
+            state
+                .reserve_storage
+                .store_nft_emission(&"78".repeat(32), 1)
+                .unwrap();
+        }
+        let state = open_at(&dir, spawn_mock_node("[]".to_string(), Default::default()).await);
+        let facts = state.reserve_storage.nft_facts().unwrap();
+        assert_eq!(
+            facts.box_nft,
+            HashMap::from([(s1.clone(), TEST_RESERVE_NFT.to_string())])
+        );
+        assert_eq!(
+            facts.emission,
+            HashMap::from([(TEST_RESERVE_NFT.to_string(), 1)])
+        );
+        assert!(!state.nft_cache().box_nft.contains_key(&"77".repeat(32)));
+        // A known NFT is not forgotten for an answer that lists no assets.
+        state.remember_nft(&s1, None);
+        assert_eq!(
+            state.nft_cache().box_nft.get(&s1),
+            Some(&Some(TEST_RESERVE_NFT.to_string()))
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round 8 (item 2): fork A had T0 -> T (tracked); the reorg to fork B
+    /// has a redemption T0 -> X (a used R5), and the tracker restarted. The
+    /// index does not know T. With T's NFT in the store, X is followed as
+    /// T's successor (the walk reaches no box of the lineage, the singleton
+    /// NFT decides) and T leaves. Without it (a store from before round 8,
+    /// where T's NFT was in memory only), nothing anchors X: it waits while T
+    /// is kept, T leaves once it has been unknown for 10 index blocks, and X
+    /// is then judged as a root and quarantined for its used R5.
+    #[tokio::test]
+    async fn test_a_restart_keeps_the_nft_of_a_tracked_box_the_index_lost() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let t0 = "10".repeat(32);
+        let t = "11".repeat(32);
+        let x = "12".repeat(32);
+        let redeem_tx = "e2".repeat(32);
+        let mut x_json =
+            scanned_box_json(&x, &redeem_tx, 900_000_000, &[(TEST_RESERVE_NFT, 1)], None);
+        x_json["additionalRegisters"]["R5"] = serde_json::Value::from(used_tree_register());
+        let fork_b = |height: u64| {
+            HashMap::from([
+                (
+                    redeem_tx.clone(),
+                    tx_json_inputs(
+                        &redeem_tx,
+                        vec![reserve_input(&t0, "c0c0", &[(TEST_RESERVE_NFT, 1)])],
+                    ),
+                ),
+                indexed_route(height, height),
+            ])
+        };
+        for warm in [true, false] {
+            let dir = restart_dir("nft_facts_reorg");
+            {
+                // Fork A: T is tracked and listed.
+                let t_json =
+                    scanned_box_json(&t, "c0c0", 1_000_000_000, &[(TEST_RESERVE_NFT, 1)], None);
+                let state = open_at(
+                    &dir,
+                    spawn_mock_node(
+                        serde_json::json!([t_json]).to_string(),
+                        std::sync::Arc::new(HashMap::from([indexed_route(990, 990)])),
+                    )
+                    .await,
+                );
+                insert_tracked_reserve(&state, &t, owner);
+                if warm {
+                    state.process_scan_boxes().await.unwrap();
+                }
+                assert!(state.reserve_tracker.get_reserve(&t).is_ok());
+            }
+            let mut state =
+                open_at(&dir, spawn_mock_node("[]".to_string(), Default::default()).await);
+            for height in [1_000, 1_000 + SPENT_REMOVAL_DEPTH, 1_001 + SPENT_REMOVAL_DEPTH] {
+                state = on_node(state, serde_json::json!([x_json.clone()]).to_string(), fork_b(height))
+                    .await
+                    .0;
+                state.process_scan_boxes().await.unwrap();
+                let quarantined = state.reserve_storage.get_all_quarantined().unwrap();
+                if warm {
+                    assert!(state.reserve_tracker.get_reserve(&x).is_ok(), "height {height}");
+                    assert!(state.reserve_tracker.get_reserve(&t).is_err(), "height {height}");
+                    assert!(quarantined.is_empty(), "height {height}");
+                } else if height == 1_000 {
+                    assert!(state.reserve_tracker.get_reserve(&x).is_err());
+                    assert!(state.reserve_tracker.get_reserve(&t).is_ok());
+                    assert!(quarantined.is_empty());
+                } else if height == 1_000 + SPENT_REMOVAL_DEPTH {
+                    assert!(state.reserve_tracker.get_reserve(&t).is_err());
+                    assert!(quarantined.is_empty());
+                } else {
+                    assert!(state.reserve_tracker.get_reserve(&x).is_err());
+                    assert_eq!(quarantined.len(), 1);
+                    assert_eq!(quarantined[0].box_id, x);
+                }
+            }
+            drop(state);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
