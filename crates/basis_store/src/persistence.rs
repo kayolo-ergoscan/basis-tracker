@@ -1782,18 +1782,35 @@ impl ReserveStorage {
     }
 
     /// The removed reserve boxes remembered (round 6f).
+    ///
+    /// Round 8: a record that does not decode is skipped (and logged), not the
+    /// whole load: before, one damaged record left the scanner with no removed
+    /// reserves after a restart, so none anchored a missed successor. The record
+    /// stays in the partition for an operator to look at.
     pub fn removed_reserves(&self) -> Result<Vec<RemovedReserve>, NoteError> {
+        let mut removed = Vec::new();
+        for item in self.removed_partition.iter() {
+            let (key, value) = item.map_err(|e| {
+                NoteError::StorageError(format!("Failed to iterate removed reserves: {}", e))
+            })?;
+            match serde_json::from_slice(&value) {
+                Ok(record) => removed.push(record),
+                Err(e) => tracing::warn!(
+                    "Removed reserve record {:?} does not decode ({}); skipped",
+                    String::from_utf8_lossy(&key).chars().take(80).collect::<String>(),
+                    e
+                ),
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Test hook (round 8): write a raw removed reserve record, a damaged one say.
+    #[cfg(test)]
+    pub(crate) fn insert_raw_removed(&self, key: &[u8], value: &[u8]) {
         self.removed_partition
-            .iter()
-            .map(|item| {
-                let (_key, value) = item.map_err(|e| {
-                    NoteError::StorageError(format!("Failed to iterate removed reserves: {}", e))
-                })?;
-                serde_json::from_slice(&value).map_err(|e| {
-                    NoteError::StorageError(format!("Failed to deserialize removed reserve: {}", e))
-                })
-            })
-            .collect()
+            .insert(key, value)
+            .expect("raw removed record");
     }
 
     /// Store a reserve in the database
@@ -2986,6 +3003,8 @@ mod removed_reserve_tests {
                 .unwrap();
         }
         let storage = ReserveStorage::open(dir.path()).unwrap();
+        // Round 8: a damaged record is skipped, the others load.
+        storage.insert_raw_removed("ab".repeat(32).as_bytes(), b"{\"record\":1}");
         let kept = storage.removed_reserves().unwrap();
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].record.box_id, "aa".repeat(32));

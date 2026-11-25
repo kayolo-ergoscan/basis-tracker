@@ -179,7 +179,8 @@ to the scan, it is restored as the tracked box instead of being judged as a root
 
 **Round 6f.** The removed boxes are kept in the `removed_reserves` partition (box id ->
 record, NFT, time), so they survive a restart; nothing else in the reserve database
-changes. A tracked box the index does not know (its block orphaned, its input
+changes. (Round 8: a record that does not decode is skipped with a warning at start, not
+the whole partition.) A tracked box the index does not know (its block orphaned, its input
 double-spent on the winning fork, so it never exists and nothing holds its NFT) is
 removed once the index is `SPENT_REMOVAL_DEPTH` blocks past the height where it was
 first unknown, and at once when another box of its owner and denomination is tracked
