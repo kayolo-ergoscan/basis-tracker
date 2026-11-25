@@ -172,6 +172,9 @@ pub struct NftCache {
     singleton: std::collections::HashMap<String, bool>,
     /// Round 8: the NFTs whose singleton verdict is in the store.
     stored_singletons: std::collections::HashSet<String>,
+    /// Round 8 (review LOW-4): the tracked boxes whose NFT is in the store; a
+    /// box missing here is written again at its next sight.
+    stored_box_nfts: std::collections::HashSet<String>,
     /// Round 6d (P2-3): removed reserve box id -> its record, its NFT, when
     /// (ms) and, round 6f-2, at which index height. Round 6e: the record
     /// anchors the lineage of a box holding its NFT, so the successor of a
@@ -1443,14 +1446,22 @@ impl ServerState {
             let Some(nft) = nft else {
                 return;
             };
-            let store_nft = before.as_ref() != Some(&Some(nft.clone()));
+            let store_nft = before.as_ref() != Some(&Some(nft.clone()))
+                || !cache.stored_box_nfts.contains(box_id);
             let store_singleton = cache.singleton.get(&nft) == Some(&true)
                 && cache.stored_singletons.insert(nft.clone());
             (store_nft.then(|| nft.clone()), store_singleton.then_some(nft))
         };
         if let Some(nft) = store_nft {
-            if let Err(e) = self.reserve_storage.store_box_nft(box_id, &nft) {
-                warn!("Failed to store the NFT of reserve box {}: {:?}", box_id, e);
+            match self.reserve_storage.store_box_nft(box_id, &nft) {
+                Ok(()) => {
+                    self.nft_cache().stored_box_nfts.insert(box_id.to_string());
+                }
+                // Review LOW-4: tried again the next time the box is seen.
+                Err(e) => {
+                    self.nft_cache().stored_box_nfts.remove(box_id);
+                    warn!("Failed to store the NFT of reserve box {}: {:?}", box_id, e);
+                }
             }
         }
         if let Some(nft) = store_singleton {
@@ -2823,22 +2834,28 @@ impl ServerState {
                     removed_at,
                     removed_height,
                 };
+                cache.stored_box_nfts.remove(&reserve.box_id);
                 cache
                     .removed
                     .insert(reserve.box_id.clone(), removed.clone());
                 drop(cache);
-                // Round 8: the removed record keeps the NFT from now on.
-                if let Err(e) = self.reserve_storage.forget_box_nft(&reserve.box_id) {
-                    warn!(
-                        "Failed to forget the NFT of removed reserve {}: {:?}",
-                        reserve.box_id, e
-                    );
-                }
-                if let Err(e) = self.reserve_storage.store_removed(&removed) {
-                    warn!(
+                // Round 8: the removed record keeps the NFT from now on. Review
+                // LOW-3: the box NFT entry goes only once the removed record is
+                // written, so a crash in between never leaves the box with
+                // neither.
+                match self.reserve_storage.store_removed(&removed) {
+                    Ok(()) => {
+                        if let Err(e) = self.reserve_storage.forget_box_nft(&reserve.box_id) {
+                            warn!(
+                                "Failed to forget the NFT of removed reserve {}: {:?}",
+                                reserve.box_id, e
+                            );
+                        }
+                    }
+                    Err(e) => warn!(
                         "Failed to remember removed reserve {}: {:?}",
                         reserve.box_id, e
-                    );
+                    ),
                 }
                 // Remove from database
                 if let Err(e) = self.reserve_storage.remove_reserve(&reserve.box_id) {
@@ -2887,6 +2904,7 @@ fn load_nft_facts(storage: &ReserveStorage, tracker: &ReserveTracker, cache: &mu
     let mut pruned = 0usize;
     for (box_id, nft) in facts.box_nft {
         if tracked.contains(&box_id) {
+            cache.stored_box_nfts.insert(box_id.clone());
             cache.box_nft.insert(box_id, Some(nft));
         } else {
             pruned += 1;
@@ -8267,5 +8285,43 @@ mod tests {
         state.process_scan_boxes().await.unwrap();
         assert!(hits.lock().unwrap().contains_key("/blockchain/box/unspent/byAddress"));
         assert_eq!(state.nft_cache().index_height_seen, Some(1_003));
+    }
+
+    /// Round 8 (review LOW-4): a failed write of a tracked box's NFT, or of
+    /// its singleton verdict, is tried again the next time the box is seen
+    /// (each cycle that lists it), not only when the value changes.
+    #[tokio::test]
+    async fn test_a_failed_nft_fact_write_is_tried_again() {
+        let owner = &VALID_PREFIXED_PUBKEY[2..];
+        let t = "11".repeat(32);
+        let listed = serde_json::json!([scanned_box_json(
+            &t,
+            "c0c0",
+            1_000_000_000,
+            &[(TEST_RESERVE_NFT, 1)],
+            None
+        )])
+        .to_string();
+        let mut state = mock_state(spawn_mock_node("[]".to_string(), Default::default()).await);
+        insert_tracked_reserve(&state, &t, owner);
+        state
+            .nft_cache()
+            .singleton
+            .insert(TEST_RESERVE_NFT.to_string(), true);
+        state.reserve_storage.fail_nft_fact_writes(true);
+        for (height, failing) in [(1_000, true), (1_001, true), (1_002, false)] {
+            state.reserve_storage.fail_nft_fact_writes(failing);
+            let routes = HashMap::from([indexed_route(height, height)]);
+            state = on_node(state, listed.clone(), routes).await.0;
+            state.process_scan_boxes().await.unwrap();
+            assert!(state.reserve_tracker.get_reserve(&t).is_ok());
+            let facts = state.reserve_storage.nft_facts().unwrap();
+            assert_eq!(facts.box_nft.is_empty(), failing, "height {height}");
+            assert_eq!(facts.emission.is_empty(), failing, "height {height}");
+        }
+        assert_eq!(
+            state.reserve_storage.nft_facts().unwrap().box_nft,
+            HashMap::from([(t.clone(), TEST_RESERVE_NFT.to_string())])
+        );
     }
 }

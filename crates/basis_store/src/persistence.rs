@@ -162,6 +162,9 @@ pub struct ReserveStorage {
     /// Round 8: the emission of the NFTs of tracked reserves, keyed by NFT id
     /// ([`StoredNftEmission`]); only singletons are kept.
     nft_emission_partition: fjall::Partition,
+    /// Test hook (round 8): NFT fact writes fail while set.
+    #[cfg(test)]
+    fail_nft_fact_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Round 8: the reserve NFT a reserve box holds (its first token, held once).
@@ -1645,12 +1648,36 @@ impl ReserveStorage {
             removed_partition,
             box_nft_partition,
             nft_emission_partition,
+            #[cfg(test)]
+            fail_nft_fact_writes: Default::default(),
         })
+    }
+
+    /// Test hook (round 8): make NFT fact writes fail (or work again).
+    #[cfg(test)]
+    pub(crate) fn fail_nft_fact_writes(&self, fail: bool) {
+        self.fail_nft_fact_writes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn nft_fact_writes_fail(&self) -> Result<(), NoteError> {
+        if self
+            .fail_nft_fact_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(NoteError::StorageError(
+                "test: NFT fact writes fail".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Round 8: remember the reserve NFT of reserve box `box_id`. Only
     /// lower-case hex ids are kept (the scanner's normalized form).
     pub fn store_box_nft(&self, box_id: &str, nft: &str) -> Result<(), NoteError> {
+        #[cfg(test)]
+        self.nft_fact_writes_fail()?;
         if !is_lower_hex_id(nft) {
             return Err(NoteError::StorageError(format!(
                 "refusing to store {:?} as a reserve NFT id",
@@ -1679,6 +1706,8 @@ impl ReserveStorage {
 
     /// Round 8: remember the emission of reserve NFT `nft`.
     pub fn store_nft_emission(&self, nft: &str, emission: u64) -> Result<(), NoteError> {
+        #[cfg(test)]
+        self.nft_fact_writes_fail()?;
         if !is_lower_hex_id(nft) {
             return Err(NoteError::StorageError(format!(
                 "refusing to store {:?} as a reserve NFT id",
