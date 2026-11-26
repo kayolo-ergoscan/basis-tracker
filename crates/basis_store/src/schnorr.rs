@@ -47,6 +47,13 @@ pub fn build_request_message(
     )
 }
 
+/// Message the recipient signs to read its own note list (`GET /notes/recipient/{pubkey}`):
+/// `"basis-inbox-v1" || recipient(33) || validUntil(8 BE, unix seconds)`, always 55 bytes.
+/// See [`basis_core::types::inbox_request_message`].
+pub fn inbox_request_message(recipient_key: &PubKey, valid_until_secs: u64) -> Vec<u8> {
+    basis_core::types::inbox_request_message(recipient_key, valid_until_secs)
+}
+
 /// Validate that a public key is a valid compressed secp256k1 point
 pub fn validate_public_key(pubkey: &PubKey) -> Result<(), NoteError> {
     match basis_core::impls::validate_public_key(pubkey) {
