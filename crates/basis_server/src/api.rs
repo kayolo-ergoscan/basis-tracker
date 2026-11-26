@@ -1057,11 +1057,15 @@ pub async fn get_notes_by_issuer(
     }
 }
 
-// Get notes by recipient public key
+// Get notes by recipient public key. Only the recipient may read this list: a caller below Admin
+// must send the recipient's inbox signature (`X-Basis-Inbox-Until`, `X-Basis-Inbox-Sig`, see
+// `crate::inbox`); 401 otherwise.
 #[axum::debug_handler]
 pub async fn get_notes_by_recipient(
     State(state): State<AppState>,
     axum::extract::Path(pubkey_hex): axum::extract::Path<String>,
+    auth: Option<axum::Extension<crate::auth_middleware::AuthContext>>,
+    headers: axum::http::HeaderMap,
 ) -> (StatusCode, Json<ApiResponse<Vec<SerializableIouNote>>>) {
     tracing::debug!("Getting notes for recipient: {}", pubkey_hex);
 
@@ -1090,6 +1094,33 @@ pub async fn get_notes_by_recipient(
             )
         }
     };
+
+    // The list says who pays this key: only its holder reads it (an Admin reads `/notes` anyway).
+    let admin =
+        matches!(&auth, Some(axum::Extension(ctx)) if ctx.role == crate::config::ClientRole::Admin);
+    if !admin {
+        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        if let Err(refusal) = crate::inbox::verify_inbox_request(
+            &recipient_pubkey,
+            header(crate::inbox::INBOX_UNTIL_HEADER),
+            header(crate::inbox::INBOX_SIG_HEADER),
+            crate::inbox::now_secs(),
+        ) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(crate::models::error_response(refusal.message().to_string())),
+            );
+        }
+        if !crate::inbox::inbox_rate_limiter().try_hit(&recipient_pubkey, std::time::Instant::now())
+        {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(crate::models::error_response(
+                    "too many inbox reads for this key, try again in a few minutes".to_string(),
+                )),
+            );
+        }
+    }
 
     // Send command to tracker thread
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();

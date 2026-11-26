@@ -41,8 +41,12 @@ pub async fn status(
             Ok(response) => {
                 report.line(format!("GET {path}: HTTP {}", response.status));
                 report.line(response.pretty());
-                // 404 is an answer here: no note or no reserve yet.
-                if !(200..300).contains(&response.status) && response.status != 404 {
+                // 404 is an answer here: no note or no reserve yet. So is 401 for the
+                // recipient's list: it needs that key's own inbox signature, which `status`
+                // (a public key only) cannot make.
+                let answer = response.status == 404
+                    || (response.status == 401 && path.starts_with("/notes/recipient/"));
+                if !(200..300).contains(&response.status) && !answer {
                     failed.push(path);
                 }
             }

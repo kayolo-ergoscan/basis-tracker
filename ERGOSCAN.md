@@ -35,6 +35,9 @@ commits. Round 7 adds three commits of upstream PR #27: N15 (`ab75d2d`, crates.i
 
 **Notes:**
 - `GET /notes` and the event list need the Admin role;
+- `GET /notes/recipient/{pubkey}` answers below Admin only with that key's inbox signature (headers
+  `X-Basis-Inbox-Until`, `X-Basis-Inbox-Sig` over `"basis-inbox-v1" ‖ key ‖ valid_until`, at most 24 h ahead), 401
+  otherwise, and caps verified reads per recipient;
 - `POST /notes` needs the issuer's reserve under this tracker (`notes_require_reserve`);
 - three note caps per issuer (HTTP 429), including new edges per hour;
 - notes no longer rebuild the live tree one by one.

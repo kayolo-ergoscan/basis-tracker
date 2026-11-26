@@ -56,6 +56,13 @@ fn spawn_tracker_thread() -> tokio::sync::mpsc::Sender<TrackerCommand> {
                 TrackerCommand::GetNotes { response_tx } => {
                     let _ = response_tx.send(tracker.get_all_notes_with_issuer());
                 }
+                TrackerCommand::GetNotesByRecipientWithIssuer {
+                    recipient_pubkey,
+                    response_tx,
+                } => {
+                    let _ = response_tx
+                        .send(tracker.get_recipient_notes_with_issuer(&recipient_pubkey));
+                }
                 TrackerCommand::Shutdown => break,
                 _ => {}
             }
@@ -702,4 +709,149 @@ async fn reserves_report_the_notes_outstanding_debt_and_ratio() {
     .await;
     let one = body.0.data.unwrap().unwrap();
     assert_eq!((one.total_debt, one.pending_redemption_amount), (500_000_000, 100_000_000));
+}
+
+/// `GET /notes/recipient/{pk}` through the auth and authorization layers, called the way the
+/// front calls it (the Write key): only with the recipient's inbox signature. The operator's
+/// Admin key needs none.
+#[tokio::test]
+async fn the_recipient_list_needs_the_recipients_inbox_signature() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::middleware::{from_fn, from_fn_with_state};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    const WRITE_KEY: &str = "inbox-route-test-write-key-5c21";
+    const ADMIN_KEY: &str = "inbox-route-test-admin-key-9e04";
+    let state = state(DEFAULT_CAPS);
+    let auth = crate::auth_middleware::AuthState::new(crate::config::AuthConfig {
+        mode: crate::config::AuthMode::ApiKey,
+        api_key: Some(WRITE_KEY.to_string()),
+        admin_api_key: Some(ADMIN_KEY.to_string()),
+        ..crate::config::AuthConfig::default()
+    });
+    let app = axum::Router::new()
+        .route(
+            "/notes/recipient/{pubkey}",
+            get(crate::api::get_notes_by_recipient),
+        )
+        .with_state(state.clone())
+        .layer(from_fn(crate::authorization::authorization_middleware))
+        .layer(from_fn_with_state(
+            std::sync::Arc::new(auth),
+            crate::auth_middleware::auth_middleware,
+        ));
+
+    // Two issuers pay one recipient; a third key gets nothing.
+    let (to_secret, to) = basis_store::schnorr::generate_keypair();
+    let ts = now_ms() - 10_000;
+    for (n, box_id) in [(1u64, "box-1"), (2, "box-2")] {
+        let a = issuer();
+        add_reserve(&state, &a.key, box_id, None, TRACKER_NFT, 0).await;
+        let (status, error) =
+            post(&state, note_request(&a, &to, n * 1_000, ts, DenomKey::Erg)).await;
+        assert_eq!(status, StatusCode::CREATED, "{error}");
+    }
+
+    let until = crate::inbox::now_secs() + 3_600;
+    let sign = |secret: &[u8; 32], key: &PubKey, until: u64| {
+        hex::encode(
+            basis_store::schnorr::schnorr_sign(
+                &basis_store::schnorr::inbox_request_message(key, until),
+                secret,
+                key,
+            )
+            .unwrap(),
+        )
+    };
+    let good = sign(&to_secret, &to, until);
+    let call = |key: String, headers: Vec<(&'static str, String)>| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .method("GET")
+                .uri(format!("/notes/recipient/{}", hex::encode(to)))
+                .header("Authorization", format!("Bearer {key}"));
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            (status, body)
+        }
+    };
+    let headers = |until: u64, sig: &str| {
+        vec![
+            ("X-Basis-Inbox-Until", until.to_string()),
+            ("X-Basis-Inbox-Sig", sig.to_string()),
+        ]
+    };
+
+    // The front's Write key alone: 401, nothing listed.
+    let (status, body) = call(WRITE_KEY.to_string(), vec![]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(body["data"].is_null(), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("X-Basis-Inbox-Sig"),
+        "{body}"
+    );
+
+    // With the recipient's signature: both notes.
+    let (status, body) = call(WRITE_KEY.to_string(), headers(until, &good)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let notes = body["data"].as_array().unwrap();
+    assert_eq!(notes.len(), 2, "{body}");
+    let mut amounts: Vec<u64> = notes
+        .iter()
+        .map(|n| n["amount_collected"].as_u64().unwrap())
+        .collect();
+    amounts.sort();
+    assert_eq!(amounts, vec![1_000, 2_000]);
+    // ... and again: the token may be used until it expires.
+    let (status, _) = call(WRITE_KEY.to_string(), headers(until, &good)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Another key's signature, a changed time, an expired or too distant time: 401.
+    let (other_secret, other) = basis_store::schnorr::generate_keypair();
+    for (until, sig) in [
+        (until, sign(&other_secret, &other, until)),
+        (until + 1, good.clone()),
+        (until - 7_200, sign(&to_secret, &to, until - 7_200)),
+        (until + 86_400, sign(&to_secret, &to, until + 86_400)),
+    ] {
+        let (status, body) = call(WRITE_KEY.to_string(), headers(until, &sig)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(body["data"].is_null(), "{body}");
+    }
+    let (status, _) = call(WRITE_KEY.to_string(), headers(until, "zz")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A wrong API key never reaches the handler; the Admin key reads without a token.
+    let (status, _) = call("wrong".to_string(), headers(until, &good)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = call(ADMIN_KEY.to_string(), vec![]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+
+    // The per-recipient cap: verified reads only (two so far, the refusals did not count).
+    for _ in 2..crate::inbox::INBOX_MAX_PER_RECIPIENT {
+        let (status, _) = call(WRITE_KEY.to_string(), headers(until, &good)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, body) = call(WRITE_KEY.to_string(), headers(until, &good)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    // The operator is not capped.
+    let (status, _) = call(ADMIN_KEY.to_string(), vec![]).await;
+    assert_eq!(status, StatusCode::OK);
 }

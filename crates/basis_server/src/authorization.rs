@@ -87,7 +87,9 @@ fn required_role(path: &str, method: &str) -> ClientRole {
         },
         "GET" => match path {
             // Every note of every issuer and recipient in one response: operator-only. The
-            // per-key note endpoints (`/notes/issuer/...`, `/notes/recipient/...`) stay Read.
+            // per-key note endpoints (`/notes/issuer/...`, `/notes/recipient/...`) stay Read;
+            // below Admin, `/notes/recipient/...` also needs the recipient's own inbox
+            // signature, which its handler checks (`crate::inbox`).
             // The event log names the issuer, recipient and amount of every note update, so it
             // reveals the same note graph.
             "/notes" | "/events" | "/events/paginated" => ClientRole::Admin,

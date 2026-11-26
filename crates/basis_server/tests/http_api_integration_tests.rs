@@ -478,9 +478,28 @@ mod http_api_tests {
         // Create a valid public key (33 bytes hex encoded)
         let valid_pubkey = "020202020202020202020202020202020202020202020202020202020202020202";
 
+        // Without the recipient's inbox signature (and below Admin) the list is refused.
+        let response = get_notes_by_recipient(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(valid_pubkey.to_string()),
+            None,
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::UNAUTHORIZED);
+        assert!(response.1.data.is_none());
+
+        // The operator (Admin) reads it without one.
+        let admin = basis_server::auth_middleware::AuthContext {
+            pubkey: None,
+            role: basis_server::config::ClientRole::Admin,
+            auth_mode: basis_server::config::AuthMode::ApiKey,
+        };
         let response = get_notes_by_recipient(
             axum::extract::State(state),
             axum::extract::Path(valid_pubkey.to_string()),
+            Some(axum::Extension(admin)),
+            axum::http::HeaderMap::new(),
         )
         .await;
 

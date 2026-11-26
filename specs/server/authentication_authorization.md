@@ -140,7 +140,7 @@ Every authenticated request receives an effective role. Routes require the follo
 |---|---|---|
 | `/` | `GET` | public (Read context inserted) |
 | `GET` endpoints | `GET` | `Read` |
-| `/notes` | `GET` | `Admin` (every note of every pair; per-key `/notes/issuer/...` and `/notes/recipient/...` stay `Read`) |
+| `/notes` | `GET` | `Admin` (every note of every pair; per-key `/notes/issuer/...` and `/notes/recipient/...` stay `Read`; below `Admin`, `/notes/recipient/...` also needs the recipient's inbox signature, `X-Basis-Inbox-Until` and `X-Basis-Inbox-Sig`) |
 | `/events`, `/events/paginated` | `GET` | `Admin` (the event log names the issuer, recipient and amount of every note update) |
 | `/notes` | `POST` | `Write` |
 | `/redeem` | `POST` | `Write` |
