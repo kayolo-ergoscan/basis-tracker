@@ -346,16 +346,20 @@ paths:
 
   /notes/recipient/{pubkey}:
     get:
-      summary: Get notes by recipient (the recipient only)
+      summary: Get notes by recipient in one call (the key's holder only)
       description: >-
-        Retrieve all IOU notes where the specified public key is the recipient.
-        The list says who pays this key, so a caller below Admin must prove it
-        holds the key: X-Basis-Inbox-Until carries valid_until (unix seconds,
-        in the future and at most 24 h ahead) and X-Basis-Inbox-Sig the
-        recipient's Basis Schnorr signature (65 bytes, hex) over the 55-byte
-        message "basis-inbox-v1" (14 bytes ASCII) || recipient key (33) ||
-        valid_until (u64 big-endian). A token may be used again until it
-        expires. Verified reads are capped per recipient (30 per 10 minutes).
+        Retrieve all IOU notes where the specified public key is the recipient,
+        in one call. Below Admin the caller must prove it holds the key, so
+        nobody lists other keys' notes in bulk; a single pair's note stays
+        readable by whoever knows both keys (GET
+        /notes/issuer/{issuer_pubkey}/recipient/{recipient_pubkey}).
+        X-Basis-Inbox-Until carries valid_until (unix seconds, in the future
+        and at most 24 h ahead) and X-Basis-Inbox-Sig the recipient's Basis
+        Schnorr signature (65 bytes, hex) over the 87-byte message
+        "basis-inbox-v1" (14 bytes ASCII) || tracker NFT id (32) || recipient
+        key (33) || valid_until (u64 big-endian). The tracker verifies it over
+        its own NFT id. A token may be used again until it expires. Verified
+        reads are capped per recipient (30 per 10 minutes).
       operationId: getNotesByRecipient
       tags:
         - Notes
@@ -396,7 +400,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiResponseError'
         '401':
-          description: The inbox signature is missing, malformed, expired, more than 24 h ahead or not by this key
+          description: The inbox signature is missing, malformed, expired, more than 24 h ahead, not by this key or not for this tracker
           content:
             application/json:
               schema:

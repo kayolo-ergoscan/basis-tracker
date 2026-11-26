@@ -217,23 +217,30 @@ pub fn build_request_message(
 /// Domain tag that starts every inbox request message (`GET /notes/recipient/{pubkey}`).
 pub const INBOX_REQUEST_DOMAIN: &[u8] = b"basis-inbox-v1";
 
-/// Length of every inbox request message: domain tag (14) + recipient key (33) + valid_until (8).
-pub const INBOX_REQUEST_MESSAGE_LEN: usize = 55;
+/// Length of every inbox request message: domain tag (14) + tracker NFT id (32) + recipient key
+/// (33) + valid_until (8).
+pub const INBOX_REQUEST_MESSAGE_LEN: usize = 87;
 
-/// Message the RECIPIENT signs to read its own note list (`GET /notes/recipient/{pubkey}`).
+/// Message the RECIPIENT signs to have its note list in one call (`GET /notes/recipient/{pubkey}`).
 ///
-/// message = "basis-inbox-v1" (14 bytes ASCII) || recipient key (33) || validUntil (8 BE, unix
-///           seconds)
+/// message = "basis-inbox-v1" (14 bytes ASCII) || trackerNftId (32) || recipient key (33)
+///           || validUntil (8 BE, unix seconds)
 ///
-/// It is signed with the same Basis Schnorr scheme as notes. Every field has a fixed width, so
-/// the message is always exactly [`INBOX_REQUEST_MESSAGE_LEN`] (55) bytes. It can never be a
-/// note or redemption message (always 80 bytes, starting with a debt-tree key, a hash output) or
-/// a build request (`"basis-build-v1"` prefix, 131 or 198 bytes): the lengths differ and the
-/// domain tags differ at byte 6 (`i` against `b`). The signature only lets its holder read; it
-/// moves nothing.
-pub fn inbox_request_message(recipient_key: &PubKey, valid_until_secs: u64) -> Vec<u8> {
+/// The tracker NFT id binds the signature to one tracker: another tracker (whose NFT differs)
+/// refuses it. It is signed with the same Basis Schnorr scheme as notes. Every field has a fixed
+/// width, so the message is always exactly [`INBOX_REQUEST_MESSAGE_LEN`] (87) bytes. It can never
+/// be a note, redemption or exchange message (always 80 bytes, starting with a debt-tree key, a
+/// hash output) or a build request (`"basis-build-v1"` prefix, 131 or 198 bytes): the lengths
+/// differ and the domain tags differ at byte 6 (`i` against `b`). The signature only opens a
+/// read; it moves nothing.
+pub fn inbox_request_message(
+    tracker_nft_id: &[u8; 32],
+    recipient_key: &PubKey,
+    valid_until_secs: u64,
+) -> Vec<u8> {
     let mut message = Vec::with_capacity(INBOX_REQUEST_MESSAGE_LEN);
     message.extend_from_slice(INBOX_REQUEST_DOMAIN);
+    message.extend_from_slice(tracker_nft_id);
     message.extend_from_slice(recipient_key);
     message.extend_from_slice(&valid_until_secs.to_be_bytes());
     message
@@ -244,7 +251,8 @@ mod tests {
     use super::*;
 
     /// Inbox: the exact bytes for fixed inputs, for clients (the web wallet's test checks the
-    /// same hex). Recipient 2G; valid until 2026-11-23T00:00:00Z (1795392000 s).
+    /// same hex). Tracker NFT 0x5a * 32; recipient 2G; valid until 2026-11-23T00:00:00Z
+    /// (1795392000 s).
     #[test]
     fn worked_example_of_the_inbox_message() {
         let recipient: PubKey =
@@ -252,23 +260,27 @@ mod tests {
                 .unwrap()
                 .try_into()
                 .unwrap();
-        let message = inbox_request_message(&recipient, 1_795_392_000);
+        let nft = [0x5a; 32];
+        let message = inbox_request_message(&nft, &recipient, 1_795_392_000);
         assert_eq!(message.len(), INBOX_REQUEST_MESSAGE_LEN);
         assert_eq!(
             hex::encode(&message),
             concat!(
                 "62617369732d696e626f782d7631",
+                "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
                 "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
                 "000000006b038200"
             )
         );
         assert_eq!(&message[..14], b"basis-inbox-v1");
-        assert_eq!(&message[14..47], &recipient);
-        assert_eq!(&message[47..], &1_795_392_000u64.to_be_bytes());
+        assert_eq!(&message[14..46], &nft);
+        assert_eq!(&message[46..79], &recipient);
+        assert_eq!(&message[79..], &1_795_392_000u64.to_be_bytes());
     }
 
-    /// The inbox message never equals any other message a key signs here: a note or redemption
-    /// message (80 bytes for every input), a build request (131 or 198 bytes, its own tag).
+    /// The inbox message never equals any other message a key signs here: a note, redemption or
+    /// exchange message (80 bytes for every input), a build request (131 or 198 bytes, its own
+    /// tag), nor an inbox message for another tracker.
     #[test]
     fn inbox_message_never_equals_a_note_or_build_request() {
         assert_eq!(INBOX_REQUEST_DOMAIN.len(), BUILD_REQUEST_DOMAIN.len());
@@ -276,29 +288,38 @@ mod tests {
         // The tags agree on "basis-" and differ from byte 6 on.
         assert_eq!(&INBOX_REQUEST_DOMAIN[..6], &BUILD_REQUEST_DOMAIN[..6]);
         assert_ne!(INBOX_REQUEST_DOMAIN[6], BUILD_REQUEST_DOMAIN[6]);
+        assert!(![80usize, 131, 198].contains(&INBOX_REQUEST_MESSAGE_LEN));
 
         let keys: [PubKey; 3] = [[0x02; 33], [0x03; 33], {
             let mut k = [0xffu8; 33];
             k[0] = 0x02;
             k
         }];
-        let nft = [0x5a; 32];
+        let nfts = [[0x5a; 32], [0x00; 32], [0xff; 32]];
         let denominations = [DenomKey::Erg, DenomKey::Token([0x7c; 32])];
-        for key in &keys {
-            for until in [0u64, 1, 1_795_392_000, u64::MAX] {
-                let inbox = inbox_request_message(key, until);
-                assert_eq!(inbox.len(), INBOX_REQUEST_MESSAGE_LEN);
-                assert_eq!(&inbox[..14], INBOX_REQUEST_DOMAIN);
-                for other in &keys {
-                    for denomination in &denominations {
-                        for (a, b) in [(0u64, 0u64), (until, until), (u64::MAX, 1)] {
-                            let note = signing_message(key, other, denomination, a, b, &nft);
-                            assert_eq!(note.len(), 80);
-                            assert_ne!(note, inbox);
-                            let build = build_request_message(&nft, other, key, denomination, a, b);
-                            assert!(build.len() == 131 || build.len() == 198);
-                            assert_eq!(&build[..14], BUILD_REQUEST_DOMAIN);
-                            assert_ne!(build, inbox);
+        for nft in &nfts {
+            for key in &keys {
+                for until in [0u64, 1, 1_795_392_000, u64::MAX] {
+                    let inbox = inbox_request_message(nft, key, until);
+                    assert_eq!(inbox.len(), INBOX_REQUEST_MESSAGE_LEN);
+                    assert_eq!(&inbox[..14], INBOX_REQUEST_DOMAIN);
+                    for other_nft in &nfts {
+                        if other_nft != nft {
+                            assert_ne!(inbox_request_message(other_nft, key, until), inbox);
+                        }
+                    }
+                    for other in &keys {
+                        for denomination in &denominations {
+                            for (a, b) in [(0u64, 0u64), (until, until), (u64::MAX, 1)] {
+                                let note = signing_message(key, other, denomination, a, b, nft);
+                                assert_eq!(note.len(), 80);
+                                assert_ne!(note, inbox);
+                                let build =
+                                    build_request_message(nft, other, key, denomination, a, b);
+                                assert!(build.len() == 131 || build.len() == 198);
+                                assert_eq!(&build[..14], BUILD_REQUEST_DOMAIN);
+                                assert_ne!(build, inbox);
+                            }
                         }
                     }
                 }

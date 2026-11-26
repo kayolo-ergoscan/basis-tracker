@@ -35,9 +35,11 @@ commits. Round 7 adds three commits of upstream PR #27: N15 (`ab75d2d`, crates.i
 
 **Notes:**
 - `GET /notes` and the event list need the Admin role;
-- `GET /notes/recipient/{pubkey}` answers below Admin only with that key's inbox signature (headers
-  `X-Basis-Inbox-Until`, `X-Basis-Inbox-Sig` over `"basis-inbox-v1" ‖ key ‖ valid_until`, at most 24 h ahead), 401
-  otherwise, and caps verified reads per recipient;
+- `GET /notes/recipient/{pubkey}` (every note to one key in one call) answers below Admin only with that key's inbox
+  signature (headers `X-Basis-Inbox-Until`, `X-Basis-Inbox-Sig` over `"basis-inbox-v1" ‖ tracker NFT ‖ key ‖
+  valid_until`, at most 24 h ahead), 401 otherwise, and caps verified reads per recipient. It stops bulk listing, it
+  hides nothing: a pair's note stays readable by whoever knows both keys. `basis_cli`'s recipient listing (`note list
+  --recipient`) gets 401 now, since it does not sign the inbox request;
 - `POST /notes` needs the issuer's reserve under this tracker (`notes_require_reserve`);
 - three note caps per issuer (HTTP 429), including new edges per hour;
 - notes no longer rebuild the live tree one by one.

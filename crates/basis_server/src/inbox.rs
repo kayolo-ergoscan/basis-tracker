@@ -1,12 +1,16 @@
-//! `GET /notes/recipient/{pubkey}` for the recipient only (the inbox).
+//! `GET /notes/recipient/{pubkey}` in one call, for the key's holder only (the inbox).
 //!
-//! The list of every note paid to one key says who pays whom, so the route answers only a caller
-//! that proves it holds that key. The request carries two headers:
+//! The route lists every note paid to one key in one call. It answers only a caller that proves
+//! it holds that key, so nobody lists other keys' notes in bulk. It keeps no secret: a pair's
+//! note stays readable by whoever knows both keys (`GET /notes/issuer/{i}/recipient/{r}`, which
+//! receipts and payments rely on), and the reserve list names every issuer. The gate only keeps
+//! the one-call list to the key's holder. The request carries two headers:
 //!
 //! * `X-Basis-Inbox-Until`: `valid_until`, unix seconds in decimal;
 //! * `X-Basis-Inbox-Sig`: the recipient's Basis Schnorr signature (130 hex) over
-//!   [`basis_store::schnorr::inbox_request_message`]`(recipient, valid_until)` =
-//!   `"basis-inbox-v1" || recipient (33) || valid_until (8 BE)`, 55 bytes.
+//!   [`basis_store::schnorr::inbox_request_message`]`(tracker NFT, recipient, valid_until)` =
+//!   `"basis-inbox-v1" || tracker NFT id (32) || recipient (33) || valid_until (8 BE)`, 87 bytes.
+//!   The tracker verifies it over its own NFT id, so a token for another tracker is refused.
 //!
 //! The tracker answers 401 when a header is missing or malformed, when `valid_until` is not in
 //! the future or lies more than [`INBOX_MAX_AHEAD_SECS`] (24 h) ahead, or when the signature does
@@ -69,15 +73,16 @@ impl InboxRefusal {
             Self::TooFarAhead => "X-Basis-Inbox-Until is more than 24 hours ahead",
             Self::BadSignatureEncoding => "X-Basis-Inbox-Sig must be 130 hex characters",
             Self::BadSignature => {
-                "the inbox signature does not verify under this key (message \"basis-inbox-v1\" || key || valid_until u64 BE)"
+                "the inbox signature does not verify under this key for this tracker (message \"basis-inbox-v1\" || tracker NFT id || key || valid_until u64 BE)"
             }
         }
     }
 }
 
-/// Checks an inbox token for `recipient` at `now_secs` (unix seconds) and returns its
-/// `valid_until`. Cheap checks run first; the signature is verified last.
+/// Checks an inbox token for `recipient` on the tracker of `tracker_nft_id` at `now_secs` (unix
+/// seconds) and returns its `valid_until`. Cheap checks run first; the signature is verified last.
 pub fn verify_inbox_request(
+    tracker_nft_id: &[u8; 32],
     recipient: &PubKey,
     until_header: Option<&str>,
     sig_header: Option<&str>,
@@ -105,7 +110,8 @@ pub fn verify_inbox_request(
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or(InboxRefusal::BadSignatureEncoding)?;
-    let message = basis_store::schnorr::inbox_request_message(recipient, valid_until);
+    let message =
+        basis_store::schnorr::inbox_request_message(tracker_nft_id, recipient, valid_until);
     basis_store::schnorr::schnorr_verify(&signature, &message, recipient)
         .map_err(|_| InboxRefusal::BadSignature)?;
     Ok(valid_until)
@@ -186,6 +192,7 @@ mod tests {
     use basis_store::DenomKey;
 
     const NOW: u64 = 1_795_305_600; // 2026-11-22T00:00:00Z
+    const NFT: [u8; 32] = [0x5a; 32];
 
     fn key(byte: u8) -> ([u8; 32], PubKey) {
         let secp = secp256k1::Secp256k1::new();
@@ -195,11 +202,11 @@ mod tests {
     }
 
     fn token(secret: &[u8; 32], pk: &PubKey, until: u64) -> String {
-        hex::encode(schnorr_sign(&inbox_request_message(pk, until), secret, pk).unwrap())
+        hex::encode(schnorr_sign(&inbox_request_message(&NFT, pk, until), secret, pk).unwrap())
     }
 
     fn check(pk: &PubKey, until: &str, sig: &str) -> Result<u64, InboxRefusal> {
-        verify_inbox_request(pk, Some(until), Some(sig), NOW)
+        verify_inbox_request(&NFT, pk, Some(until), Some(sig), NOW)
     }
 
     #[test]
@@ -239,10 +246,34 @@ mod tests {
         );
         // Signed by the other key over THIS key's message: still not this key's signature.
         let sig = hex::encode(
-            schnorr_sign(&inbox_request_message(&pk, until), &other_sk, &other_pk).unwrap(),
+            schnorr_sign(
+                &inbox_request_message(&NFT, &pk, until),
+                &other_sk,
+                &other_pk,
+            )
+            .unwrap(),
         );
         assert_eq!(
             check(&pk, &until.to_string(), &sig),
+            Err(InboxRefusal::BadSignature)
+        );
+    }
+
+    /// The token names the tracker: one signed for another tracker's NFT is refused here.
+    #[test]
+    fn a_token_for_another_tracker_is_refused() {
+        let (sk, pk) = key(7);
+        let until = NOW + 3600;
+        let elsewhere = hex::encode(
+            schnorr_sign(&inbox_request_message(&[0x5b; 32], &pk, until), &sk, &pk).unwrap(),
+        );
+        assert_eq!(
+            check(&pk, &until.to_string(), &elsewhere),
+            Err(InboxRefusal::BadSignature)
+        );
+        let sig = token(&sk, &pk, until);
+        assert_eq!(
+            verify_inbox_request(&[0x5b; 32], &pk, Some(&until.to_string()), Some(&sig), NOW),
             Err(InboxRefusal::BadSignature)
         );
     }
@@ -283,6 +314,7 @@ mod tests {
         // and the (empty) signature is what fails.
         assert_eq!(
             verify_inbox_request(
+                &NFT,
                 &pk,
                 Some(&u64::MAX.to_string()),
                 Some(&"00".repeat(65)),
@@ -298,11 +330,11 @@ mod tests {
         let until = NOW + 3600;
         let sig = token(&sk, &pk, until);
         assert_eq!(
-            verify_inbox_request(&pk, None, Some(&sig), NOW),
+            verify_inbox_request(&NFT, &pk, None, Some(&sig), NOW),
             Err(InboxRefusal::MissingHeaders)
         );
         assert_eq!(
-            verify_inbox_request(&pk, Some(&until.to_string()), None, NOW),
+            verify_inbox_request(&NFT, &pk, Some(&until.to_string()), None, NOW),
             Err(InboxRefusal::MissingHeaders)
         );
         for bad in [
@@ -359,7 +391,7 @@ mod tests {
                 Err(InboxRefusal::BadSignature)
             );
         }
-        let inbox = schnorr_sign(&inbox_request_message(&pk, until), &sk, &pk).unwrap();
+        let inbox = schnorr_sign(&inbox_request_message(&nft, &pk, until), &sk, &pk).unwrap();
         for message in [&note, &build] {
             assert!(basis_store::schnorr::schnorr_verify(&inbox, message, &pk).is_err());
         }
@@ -373,7 +405,7 @@ mod tests {
         for seed in [7u8, 8, 9] {
             let (_, pk) = key(seed);
             for until in [0u64, NOW, u64::MAX] {
-                let message = inbox_request_message(&pk, until);
+                let message = inbox_request_message(&NFT, &pk, until);
                 assert!(serde_json::from_slice::<serde_json::Value>(&message).is_err());
                 let text = String::from_utf8_lossy(&message);
                 assert!(

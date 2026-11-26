@@ -47,11 +47,15 @@ pub fn build_request_message(
     )
 }
 
-/// Message the recipient signs to read its own note list (`GET /notes/recipient/{pubkey}`):
-/// `"basis-inbox-v1" || recipient(33) || validUntil(8 BE, unix seconds)`, always 55 bytes.
-/// See [`basis_core::types::inbox_request_message`].
-pub fn inbox_request_message(recipient_key: &PubKey, valid_until_secs: u64) -> Vec<u8> {
-    basis_core::types::inbox_request_message(recipient_key, valid_until_secs)
+/// Message the recipient signs to have its note list in one call (`GET /notes/recipient/{pubkey}`):
+/// `"basis-inbox-v1" || trackerNftId(32) || recipient(33) || validUntil(8 BE, unix seconds)`,
+/// always 87 bytes. See [`basis_core::types::inbox_request_message`].
+pub fn inbox_request_message(
+    tracker_nft_id: &[u8; 32],
+    recipient_key: &PubKey,
+    valid_until_secs: u64,
+) -> Vec<u8> {
+    basis_core::types::inbox_request_message(tracker_nft_id, recipient_key, valid_until_secs)
 }
 
 /// Validate that a public key is a valid compressed secp256k1 point

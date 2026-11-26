@@ -758,7 +758,7 @@ async fn the_recipient_list_needs_the_recipients_inbox_signature() {
     let sign = |secret: &[u8; 32], key: &PubKey, until: u64| {
         hex::encode(
             basis_store::schnorr::schnorr_sign(
-                &basis_store::schnorr::inbox_request_message(key, until),
+                &basis_store::schnorr::inbox_request_message(&TRACKER_NFT, key, until),
                 secret,
                 key,
             )
@@ -836,6 +836,17 @@ async fn the_recipient_list_needs_the_recipients_inbox_signature() {
     }
     let (status, _) = call(WRITE_KEY.to_string(), headers(until, "zz")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The recipient's own signature, made for another tracker: 401 here.
+    let elsewhere = hex::encode(
+        basis_store::schnorr::schnorr_sign(
+            &basis_store::schnorr::inbox_request_message(&[0x5b; 32], &to, until),
+            &to_secret,
+            &to,
+        )
+        .unwrap(),
+    );
+    let (status, body) = call(WRITE_KEY.to_string(), headers(until, &elsewhere)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
     // A wrong API key never reaches the handler; the Admin key reads without a token.
     let (status, _) = call("wrong".to_string(), headers(until, &good)).await;

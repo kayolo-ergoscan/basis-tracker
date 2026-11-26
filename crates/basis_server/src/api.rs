@@ -1095,12 +1095,30 @@ pub async fn get_notes_by_recipient(
         }
     };
 
-    // The list says who pays this key: only its holder reads it (an Admin reads `/notes` anyway).
+    // The whole list in one call goes only to the key's holder, signed for this tracker, so
+    // nobody lists other keys' notes in bulk (an Admin reads `/notes` anyway).
     let admin =
         matches!(&auth, Some(axum::Extension(ctx)) if ctx.role == crate::config::ClientRole::Admin);
     if !admin {
+        let tracker_nft: [u8; 32] = match state
+            .config
+            .tracker_nft_bytes()
+            .ok()
+            .and_then(|b| b.try_into().ok())
+        {
+            Some(nft) => nft,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(crate::models::error_response(
+                        "tracker NFT id not configured".to_string(),
+                    )),
+                )
+            }
+        };
         let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         if let Err(refusal) = crate::inbox::verify_inbox_request(
+            &tracker_nft,
             &recipient_pubkey,
             header(crate::inbox::INBOX_UNTIL_HEADER),
             header(crate::inbox::INBOX_SIG_HEADER),
